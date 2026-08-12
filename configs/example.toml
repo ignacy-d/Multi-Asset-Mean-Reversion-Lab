@@ -1,0 +1,12 @@
+instrument = "EURUSD"
+timeframe = "M15"
+session = "london"
+strategy = "deviation_reversion"
+feature_model = "session_vwap_zscore"
+cost_model = "baseline_fx"
+
+[entry]
+threshold_sigma = 2.0
+
+[exit]
+holding_minutes = 60
