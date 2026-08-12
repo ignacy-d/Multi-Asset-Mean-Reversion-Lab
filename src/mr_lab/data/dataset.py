@@ -9,6 +9,7 @@ from mr_lab.data.models import (
     DatasetMetadata,
     PriceBasis,
     Timeframe,
+    _require_utc,
 )
 
 
@@ -62,13 +63,13 @@ def validate_dataset(
     observations = tuple(bars)
     if any(not isinstance(bar, Bar) for bar in observations):
         raise DatasetValidationError("all observations must be canonical Bar instances")
+    if metadata is not None and not isinstance(metadata, DatasetMetadata):
+        raise DatasetValidationError("metadata must be DatasetMetadata")
     if not observations:
         return DatasetValidationReport((), ())
 
     first = observations[0]
     if metadata is not None:
-        if not isinstance(metadata, DatasetMetadata):
-            raise DatasetValidationError("metadata must be DatasetMetadata")
         expected = (
             metadata.instrument,
             metadata.price_basis,
@@ -116,5 +117,5 @@ def available_bars(
     bars: list[Bar] | tuple[Bar, ...], research_time: datetime
 ) -> tuple[Bar, ...]:
     """Return only bars whose explicit availability is at or before research time."""
-    # Bar performs the shared Stage 0B UTC validation, including UTC-equivalent tzinfo.
-    return tuple(bar for bar in bars if bar.is_available_at(research_time))
+    _require_utc("research_time", research_time)
+    return tuple(bar for bar in bars if bar.available_at <= research_time)

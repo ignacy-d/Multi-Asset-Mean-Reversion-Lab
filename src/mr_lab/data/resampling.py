@@ -60,10 +60,7 @@ def resample_bars(
 
     output: list[Bar] = []
     incomplete: list[IncompleteWindow] = []
-    window_open = min(grouped)
-    final_open = max(grouped)
-    while window_open <= final_open:
-        components = grouped.get(window_open, [])
+    for window_open, components in grouped.items():
         window_close = window_open + target_duration
         contiguous = all(
             bar.open_time == window_open + index * source_duration
@@ -99,5 +96,4 @@ def resample_bars(
                     volume_semantics=first.volume_semantics,
                 )
             )
-        window_open = window_close
     return ResamplingResult(tuple(output), tuple(incomplete))

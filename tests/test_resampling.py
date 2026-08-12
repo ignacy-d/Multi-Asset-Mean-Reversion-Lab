@@ -125,6 +125,17 @@ def test_incomplete_windows_are_skipped_and_reported() -> None:
     assert result.incomplete_windows[0].observed_components == 2
 
 
+def test_fully_absent_target_windows_across_large_gap_are_not_synthesized() -> None:
+    friday = datetime(2025, 1, 3, 21, 0, tzinfo=UTC)
+    monday = datetime(2025, 1, 6, 9, 0, tzinfo=UTC)
+    source = bars(3, start=friday) + bars(3, start=monday)
+
+    result = resample_bars(source, Timeframe("15m"))
+
+    assert [bar.open_time for bar in result.bars] == [friday, monday]
+    assert result.incomplete_windows == ()
+
+
 def test_delayed_component_propagates_output_availability() -> None:
     source = bars(3)
     last = source[-1]

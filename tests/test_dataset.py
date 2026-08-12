@@ -5,6 +5,8 @@ import pytest
 
 from mr_lab.data import (
     Bar,
+    DataContractError,
+    DatasetMetadata,
     DatasetValidationError,
     PriceBasis,
     Timeframe,
@@ -102,5 +104,35 @@ def test_available_view_uses_available_at_and_accepts_equivalent_utc() -> None:
 
     assert available_bars([delayed, prompt], research_time) == ()
     assert available_bars([delayed, prompt], START + timedelta(minutes=6)) == (delayed,)
-    with pytest.raises(Exception, match="timezone-aware UTC"):
+    with pytest.raises(DataContractError, match="timezone-aware UTC"):
         available_bars([delayed], datetime(2025, 1, 2, 10, 6))
+
+
+@pytest.mark.parametrize(
+    "research_time",
+    [
+        datetime(2025, 1, 2, 10, 6),
+        datetime(2025, 1, 2, 11, 6, tzinfo=ZoneInfo("Europe/Paris")),
+    ],
+)
+def test_empty_available_view_still_validates_research_time(
+    research_time: datetime,
+) -> None:
+    with pytest.raises(DataContractError, match="UTC"):
+        available_bars([], research_time)
+
+
+def test_empty_dataset_still_validates_supplied_metadata_type() -> None:
+    with pytest.raises(DatasetValidationError, match="metadata must be"):
+        validate_dataset([], metadata="not metadata")  # type: ignore[arg-type]
+
+    metadata = DatasetMetadata(
+        source="synthetic",
+        instrument="EURUSD",
+        price_basis=PriceBasis.MID,
+        volume_semantics=VolumeSemantics.TICK,
+        schema_version="0C-v1",
+        dataset_id="empty-dataset",
+        native_timeframe=Timeframe("5m"),
+    )
+    assert validate_dataset([], metadata=metadata).bars == ()
