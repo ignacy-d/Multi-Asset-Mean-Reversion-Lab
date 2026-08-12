@@ -5,12 +5,36 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 0A — foundation
+## Current stage: 0B — canonical market data contract
 
-This repository currently provides only a typed, validated experiment
-configuration contract and the project/tooling skeleton. **No trading strategy,
-feature, signal, session classifier, data integration, or backtest has been
-implemented.**
+The Stage 0A typed experiment configuration remains intact. Stage 0B adds a
+small, immutable semantic contract for provider-neutral completed OHLC bars and
+their dataset metadata. **No data acquisition, strategy, feature, signal,
+session classifier, resampling, or backtest has been implemented.**
+
+## Canonical market data
+
+`mr_lab.data.Bar` defines one completed observation interval. `open_time` is the
+interval beginning, `close_time` is its end, and `available_at` is the earliest
+instant at which the complete bar may safely be used. All three timestamps must
+be timezone-aware and use canonical UTC; a bar is point-in-time usable at
+research time `T` only when `available_at <= T`. In particular, a completed
+candle is never fully known at its open.
+
+Each bar explicitly records whether its OHLC values are bid, ask, mid, trade,
+other, or unknown prices. Volume is optional and separately identifies traded,
+tick, quote-activity, unknown, or no-volume semantics. Tick volume is therefore
+not implicitly treated as centralized traded volume.
+
+`Timeframe` accepts explicit lowercase fixed-duration notation such as `15m`
+and `1h`, not provider aliases such as `M15`. Stage 0A experiment timeframes
+remain intentionally opaque identifiers (including `"M15"`); converting that
+boundary to canonical `"15m"` belongs to Stage 0C and is not implemented here.
+
+The per-row model establishes semantics only. It is neutral about providers and
+future storage layout: large datasets need not be represented as collections of
+Python `Bar` objects. Dataset metadata records source and semantic provenance,
+but Stage 0B does not provide adapters or generate dataset fingerprints.
 
 ## Research philosophy
 
@@ -47,7 +71,8 @@ Python 3.12 or newer and [uv](https://docs.astral.sh/uv/) are required.
 uv sync --dev
 ```
 
-The checked-in `uv.lock` pins the complete Stage 0A environment.
+The checked-in `uv.lock` pins the complete Stage 0B environment. Stage 0B adds
+no runtime or development dependencies.
 
 ## Checks
 
