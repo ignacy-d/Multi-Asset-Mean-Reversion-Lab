@@ -6,6 +6,8 @@
   periods, and costs configurable rather than hardcoded.
 - Enforce point-in-time semantics: never use information after time `t` to
   produce a value at `t`, and add tests for this and other important invariants.
+- Preserve prefix invariance: transforming inputs available by time `t` must
+  match the by-`t` outputs obtained from transforming the complete history.
 - Use timezone-aware UTC timestamps internally. Session-local time and DST
   conversion belong at explicit boundaries.
 - Keep the data layer provider-agnostic, raw inputs immutable, and derived data
