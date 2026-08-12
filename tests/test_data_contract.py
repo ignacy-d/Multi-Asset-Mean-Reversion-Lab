@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -42,6 +43,14 @@ def test_bar_rejects_non_utc_timestamp() -> None:
     non_utc = timezone(timedelta(hours=1))
     with pytest.raises(DataContractError, match="canonical UTC"):
         make_bar(open_time=datetime(2025, 1, 2, 11, 0, tzinfo=non_utc))
+
+
+def test_bar_accepts_utc_equivalent_zoneinfo_timestamp() -> None:
+    utc_zoneinfo = ZoneInfo("UTC")
+
+    bar = make_bar(open_time=datetime(2025, 1, 2, 10, 0, tzinfo=utc_zoneinfo))
+
+    assert bar.open_time.tzinfo is utc_zoneinfo
 
 
 def test_bar_time_order_and_completion_are_validated() -> None:

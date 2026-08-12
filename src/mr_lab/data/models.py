@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from enum import Enum
 from math import isfinite
 
@@ -80,7 +80,7 @@ def _require_enum(name: str, value: object, enum_type: type[Enum]) -> None:
 def _require_utc(name: str, value: object) -> None:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise DataContractError(f"{name} must be a timezone-aware UTC datetime")
-    if value.utcoffset() != timedelta(0) or value.tzinfo is not UTC:
+    if value.utcoffset() != timedelta(0):
         raise DataContractError(f"{name} must use the canonical UTC timezone")
 
 
