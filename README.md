@@ -5,12 +5,13 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 0B — canonical market data contract
+## Current stage: 0C — dataset semantics and fixed-duration resampling
 
-The Stage 0A typed experiment configuration remains intact. Stage 0B adds a
-small, immutable semantic contract for provider-neutral completed OHLC bars and
-their dataset metadata. **No data acquisition, strategy, feature, signal,
-session classifier, resampling, or backtest has been implemented.**
+The Stage 0A typed experiment configuration and Stage 0B immutable canonical
+bar contract remain intact. Stage 0C adds storage-neutral collection validation,
+point-in-time views, an explicit experiment-timeframe boundary, and conservative
+fixed-duration resampling. **No data acquisition, provider adapter, strategy,
+feature, signal, session classifier, or backtest has been implemented.**
 
 ## Canonical market data
 
@@ -27,14 +28,34 @@ tick, quote-activity, unknown, or no-volume semantics. Tick volume is therefore
 not implicitly treated as centralized traded volume.
 
 `Timeframe` accepts explicit lowercase fixed-duration notation such as `15m`
-and `1h`, not provider aliases such as `M15`. Stage 0A experiment timeframes
-remain intentionally opaque identifiers (including `"M15"`); converting that
-boundary to canonical `"15m"` belongs to Stage 0C and is not implemented here.
+and `1h`, not provider aliases. Stage 0A experiment timeframes remain opaque
+identifiers; `normalize_timeframe` is the explicit boundary that maps supported
+identifiers (`M5`, `M15`, and `H1`) to canonical data-layer timeframes. Canonical
+inputs are also accepted, while provider notation does not enter resampling.
 
-The per-row model establishes semantics only. It is neutral about providers and
-future storage layout: large datasets need not be represented as collections of
-Python `Bar` objects. Dataset metadata records source and semantic provenance,
-but Stage 0B does not provide adapters or generate dataset fingerprints.
+The collection validator requires canonical bars with one instrument, timeframe,
+price basis, and volume meaning, in deterministic chronological order. Duplicate
+observations, duplicate intervals, overlaps, and malformed durations are
+structural errors. Gaps are reported separately as information: they are legal,
+are not forward-filled, and may represent closures, illiquidity, or missing data.
+Observation identity includes the logical dataset ID, instrument, timeframe,
+open time, and price basis. `available_bars` selects solely by
+`available_at <= research_time`, including delayed observations.
+
+Resampling supports only larger fixed durations that are integer multiples of
+the homogeneous source duration. Target windows are aligned by flooring UTC
+time to duration boundaries anchored at the Unix epoch; there is no session or
+calendar anchoring. Complete windows use first open, maximum high, minimum low,
+final close, and compatible-volume summation (or preserve absent volume).
+Incomplete windows are skipped and explicitly reported rather than synthesized.
+Output availability is the later of the target close and every component's
+availability. Tests enforce prefix invariance: transforming the by-time prefix
+matches the already-available outputs selected from the full transformation.
+
+These APIs operate on small tuples/lists without prescribing future storage:
+large datasets need not be represented as collections of Python `Bar` objects.
+Dataset metadata continues to record source and semantic provenance; no adapter
+or dataset fingerprint generator is included.
 
 ## Research philosophy
 
@@ -71,8 +92,8 @@ Python 3.12 or newer and [uv](https://docs.astral.sh/uv/) are required.
 uv sync --dev
 ```
 
-The checked-in `uv.lock` pins the complete Stage 0B environment. Stage 0B adds
-no runtime or development dependencies.
+The checked-in `uv.lock` pins the complete environment. Stage 0C adds no runtime
+or development dependencies.
 
 ## Checks
 
