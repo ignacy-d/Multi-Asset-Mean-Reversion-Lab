@@ -1,0 +1,32 @@
+name: Acquire historical sample
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Acquire frozen EURUSD M1 BID sample
+        run: >-
+          uv run python -m mr_lab.providers.dukascopy
+          --date 2024-01-02
+          --output-dir data/raw/stage-1a-r
+      - name: Upload immutable raw snapshot and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: dukascopy-eurusd-m1-bid-2024-01-02
+          path: data/raw/stage-1a-r/
+          if-no-files-found: error
+          retention-days: 14
