@@ -22,6 +22,10 @@ class AcquisitionError(RuntimeError):
     """Raised when a provider response cannot be accepted as raw market data."""
 
 
+class ProviderNoData(AcquisitionError):
+    """Raised only when the provider explicitly reports that a day is absent."""
+
+
 def build_url(instrument: str, day: date) -> str:
     """Build the public M1 BID candle URL (provider months are zero based)."""
     normalized = instrument.strip().upper()
@@ -106,6 +110,10 @@ def acquire(
                 raise HTTPError(url, status, "unexpected HTTP status", {}, None)
             break
         except HTTPError as error:
+            if error.code == 404:
+                raise ProviderNoData(
+                    f"Dukascopy has no daily file for {requested_day.isoformat()}"
+                ) from error
             if error.code not in _TRANSIENT_STATUS or attempt == retries:
                 raise AcquisitionError(
                     f"Dukascopy GET failed: HTTP {error.code}"

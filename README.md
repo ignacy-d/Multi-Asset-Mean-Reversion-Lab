@@ -5,15 +5,85 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 1C — historical session and trading-window semantics
+## Current stage: 1D — reproducible historical research corpus
 
 The earlier typed configuration, immutable canonical bar contract, collection
 validation, conservative resampling, Stage 1A daily parser, and Stage 1B
-multi-day assembly remain intact. Stage 1C adds provider-independent,
-historically DST-aware classification of canonical UTC bar open times into
-major research sessions, their actual overlaps, and configurable named research
-windows. **No strategy, feature, signal, backtest, generic provider protocol,
-broker calendar, or execution integration has been implemented.**
+multi-day assembly remain intact, as do the separate Stage 1C historical session
+semantics. Stage 1D adds a bounded, explicit-date acquisition boundary and a
+deterministic corpus-request audit. **No strategy, feature, signal, backtest,
+generic provider protocol, broker calendar, or execution integration has been
+implemented.**
+
+## Frozen first research split
+
+The initial EURUSD research pipeline pre-registers these inclusive UTC calendar
+periods:
+
+| Role | Start | End | Stage 1D treatment |
+| --- | --- | --- | --- |
+| Discovery | 2024-01-01 | 2024-12-31 | Default acquisition range |
+| Future OOS holdout | 2025-01-01 | 2025-12-31 | Untouched; do not acquire, inspect, summarize, or analyze yet |
+
+The 2025 holdout is deliberately reserved until strategy families and research
+methodology have been frozen. Stage 1D acquires only the 2024 discovery period
+by default and never combines discovery and holdout automatically. This is the
+first frozen discovery period for the initial EURUSD pipeline, not necessarily
+the final discovery corpus for the whole project. Neither period, nor selecting
+them in advance, implies that an edge exists.
+
+## Stage 1D corpus boundary
+
+```text
+explicit historical date range
+    ↓
+GitHub Actions external acquisition
+    ↓
+immutable successful daily BI5 payloads + provenance
+    ↓
+Stage 1A canonicalization
+    ↓
+Stage 1B multi-day assembly
+    ↓
+deterministic corpus manifest
+    ↓
+future research engine
+```
+
+`enumerate_dates` requires explicit inclusive dates, returns deterministic
+ascending dates, rejects reverse ranges, and limits one request to 370 calendar
+days. `acquire_range` downloads sequentially with a small configurable delay;
+it does not infer dates from the clock or filesystem ordering. The supported
+scope remains Dukascopy EURUSD native M1 BID, canonical UTC, with
+`QUOTE_ACTIVITY` volume. The verified Stage 1A decoder is reused unchanged and
+is not generalized to other instruments.
+
+An HTTP 404 for the exact Dukascopy daily-file URL is the only response treated
+as confirmed provider absence. It is recorded and acquisition continues.
+Timeouts, DNS/transport failures, every other unexpected HTTP response
+(including server errors), empty/HTML/corrupt/malformed payloads, parsing
+failures, and canonical validation failures abort the run. No exchange calendar
+is consulted, and absent dates and missing intervals are never synthesized or
+forward-filled. This narrow 404 rule reflects an explicit missing resource; the
+repository does not claim that every weekend or holiday must return 404.
+
+Each successful component retains its raw BI5 file and Stage 1A acquisition
+provenance, raw SHA-256, requested date, and daily dataset ID. Stage 1B's
+`assemble_daily_payloads` creates the logical market dataset and its existing
+assembled dataset ID. The corpus manifest separately binds the requested range,
+successful dates, confirmed absent dates, component identities, assembled
+identity, canonical time span, M1/gap counts, and complete/incomplete M5, M15,
+and H1 counts.
+
+The corpus ID is SHA-256 over canonical sorted compact JSON. Paths, retrieval
+times, workflow IDs, current time, host timezone, machine names, and randomness
+are excluded. Reacquiring byte-identical successful payloads with the same
+request and absent dates produces the same ID; changing a raw payload or the
+requested range changes it. Daily dataset IDs, the assembled market dataset ID,
+and corpus request ID remain conceptually distinct. Stage 1C's
+`session_spec_id` is not included in any of them; later experiments will record
+the market `dataset_id`, `session_spec_id`, and research specification
+separately.
 
 ## Historical session semantics
 
@@ -198,14 +268,15 @@ or development dependencies.
 
 ## External historical-data acquisition bridge
 
-The manually triggered **Acquire historical sample** GitHub Actions workflow
-downloads the frozen Dukascopy EURUSD M1 BID sample for 2024-01-02. External
-acquisition is intentionally delegated to a GitHub-hosted runner because Codex
-Cloud is not the acquisition environment. The workflow uses a public HTTPS GET,
-checks its frozen SHA-256, parses and canonically validates all M1 bars, uses the
-generic resampler for M5, M15, and H1, then uploads the immutable raw payload,
-acquisition provenance, and a deterministic canonicalization audit as a
-short-lived artifact.
+The manually triggered **Acquire historical corpus** GitHub Actions workflow
+accepts required `start_date` and `end_date` inputs. Their defaults are the
+discovery-only range `2024-01-01` and `2024-12-31`. It installs the locked
+environment, performs bounded sequential public HTTPS acquisition, validates
+each successful day through Stage 1A, assembles through Stage 1B, writes the
+corpus manifest, and uploads successful BI5 files, per-day provenance, and the
+manifest as a 14-day artifact. Any genuine acquisition or corruption error
+fails the job. Its 180-minute timeout is intended for the bounded year-long
+sequential run. No credentials are required.
 
 The established boundary is:
 
@@ -242,7 +313,8 @@ including zero, are retained.
 
 Raw datasets remain ignored under `data/raw/` and are never committed; the tiny
 four-record test fixture only freezes the observed binary schema and is not a
-research dataset. Trigger
+research dataset. For the frozen Stage 1A smoke path, override both workflow
+inputs to `2024-01-02`. Trigger
 `.github/workflows/acquire-historical-sample.yml` manually from GitHub's Actions
 tab and download the named run artifact for inspection. Acquisition and parsing
 stay separate, canonical research logic remains provider-neutral, and no generic
