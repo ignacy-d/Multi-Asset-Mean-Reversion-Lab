@@ -7,6 +7,7 @@ import pytest
 
 from mr_lab.providers.dukascopy import (
     AcquisitionError,
+    ProviderNoData,
     acquire,
     build_url,
     make_provenance,
@@ -100,3 +101,21 @@ def test_acquire_refuses_to_overwrite_raw_snapshot(tmp_path: Path) -> None:
     acquire(tmp_path, date(2024, 1, 2), getter=getter)
     with pytest.raises(AcquisitionError, match="overwrite"):
         acquire(tmp_path, date(2024, 1, 2), getter=getter)
+
+
+def test_only_http_404_is_confirmed_provider_absence(tmp_path: Path) -> None:
+    def getter(_url: str, _timeout: float) -> tuple[int, bytes]:
+        return 404, b""
+
+    with pytest.raises(ProviderNoData, match="no daily file"):
+        acquire(tmp_path, date(2024, 1, 6), retries=0, getter=getter)
+
+
+def test_server_failure_is_not_provider_absence(tmp_path: Path) -> None:
+    def getter(_url: str, _timeout: float) -> tuple[int, bytes]:
+        return 500, b""
+
+    with pytest.raises(AcquisitionError, match="HTTP 500") as caught:
+        acquire(tmp_path, date(2024, 1, 6), retries=0, getter=getter)
+
+    assert not isinstance(caught.value, ProviderNoData)

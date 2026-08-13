@@ -1,7 +1,18 @@
-name: Acquire historical sample
+name: Acquire historical corpus
 
 on:
   workflow_dispatch:
+    inputs:
+      start_date:
+        description: Inclusive UTC start date (YYYY-MM-DD)
+        required: true
+        default: "2024-01-01"
+        type: string
+      end_date:
+        description: Inclusive UTC end date (YYYY-MM-DD)
+        required: true
+        default: "2024-12-31"
+        type: string
 
 permissions:
   contents: read
@@ -9,7 +20,7 @@ permissions:
 jobs:
   acquire:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -18,23 +29,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Acquire frozen EURUSD M1 BID sample
+      - name: Install locked development environment
+        run: uv sync --locked --dev
+      - name: Acquire, validate, assemble, and audit EURUSD M1 BID range
         run: >-
-          uv run python -m mr_lab.providers.dukascopy
-          --date 2024-01-02
-          --output-dir data/raw/stage-1a-r
-      - name: Parse, validate, resample, and audit frozen sample
-        run: >-
-          uv run python -m mr_lab.providers.dukascopy_bi5
-          --input data/raw/stage-1a-r/EURUSD-2024-01-02-M1-BID.bi5
-          --date 2024-01-02
-          --expected-sha256
-          9b2d2b718f9ca123b58dce4b4512d4e1bd35c692e23e1beafebdd700072cf546
-          --audit-output data/raw/stage-1a-r/EURUSD-2024-01-02-canonicalization-audit.json
-      - name: Upload immutable raw snapshot, provenance, and canonicalization audit
+          uv run python -m mr_lab.providers.dukascopy_range
+          --start-date "${{ inputs.start_date }}"
+          --end-date "${{ inputs.end_date }}"
+          --output-dir data/raw/stage-1d-corpus
+      - name: Upload immutable raw snapshots, provenance, and corpus audit
         uses: actions/upload-artifact@v4
         with:
-          name: dukascopy-eurusd-m1-bid-2024-01-02
-          path: data/raw/stage-1a-r/
+          name: dukascopy-eurusd-m1-bid-${{ inputs.start_date }}-${{ inputs.end_date }}
+          path: data/raw/stage-1d-corpus/
           if-no-files-found: error
           retention-days: 14
