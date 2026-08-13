@@ -5,13 +5,14 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 0C — dataset semantics and fixed-duration resampling
+## Current stage: 1A-P — real BI5 parsing and canonicalization
 
-The Stage 0A typed experiment configuration and Stage 0B immutable canonical
-bar contract remain intact. Stage 0C adds storage-neutral collection validation,
-point-in-time views, an explicit experiment-timeframe boundary, and conservative
-fixed-duration resampling. **No data acquisition, provider adapter, strategy,
-feature, signal, session classifier, or backtest has been implemented.**
+The earlier typed configuration, immutable canonical bar contract, collection
+validation, and conservative resampling remain intact. Stage 1A-P adds one
+narrow provider-local parser for the observed Dukascopy EURUSD M1 BID BI5
+candle representation. **No strategy, feature, signal, session classifier,
+backtest, generic provider protocol, or execution integration has been
+implemented.**
 
 ## Canonical market data
 
@@ -54,8 +55,10 @@ matches the already-available outputs selected from the full transformation.
 
 These APIs operate on small tuples/lists without prescribing future storage:
 large datasets need not be represented as collections of Python `Bar` objects.
-Dataset metadata continues to record source and semantic provenance; no adapter
-or dataset fingerprint generator is included.
+Dataset metadata records source and semantic provenance. The Dukascopy parser's
+dataset ID hashes canonical JSON containing stable provider, instrument,
+timeframe, price side, requested day, raw SHA-256, parser version, and canonical
+schema version. Retrieval time and other operational details are excluded.
 
 ## Research philosophy
 
@@ -101,16 +104,50 @@ The manually triggered **Acquire historical sample** GitHub Actions workflow
 downloads the frozen Dukascopy EURUSD M1 BID sample for 2024-01-02. External
 acquisition is intentionally delegated to a GitHub-hosted runner because Codex
 Cloud is not the acquisition environment. The workflow uses a public HTTPS GET,
-validates that the raw provider artifact is non-empty and LZMA-decodable, and
-uploads it plus JSON SHA-256 provenance as a short-lived workflow artifact. The
-internal binary record schema is deliberately left uninterpreted pending
-inspection of the real acquired artifact.
+checks its frozen SHA-256, parses and canonically validates all M1 bars, uses the
+generic resampler for M5, M15, and H1, then uploads the immutable raw payload,
+acquisition provenance, and a deterministic canonicalization audit as a
+short-lived artifact.
 
-Raw datasets remain ignored under `data/raw/` and are never committed. Trigger
+The established boundary is:
+
+```text
+Dukascopy
+    ↓
+GitHub Actions acquisition
+    ↓
+immutable raw BI5 + raw SHA
+    ↓
+provider-local BI5 parser
+    ↓
+canonical Bar + DatasetMetadata
+    ↓
+validate_dataset()
+    ↓
+generic resample_bars()
+```
+
+The parser is explicitly limited to the verified EURUSD M1 BID daily candle
+format: big-endian `>5if` records containing seconds from the requested UTC day,
+open, close, low, high integer prices, and volume. EURUSD prices use the observed
+`integer / 100000` scale. Bars represent completed intervals, use BID prices,
+and become available at interval close. Gaps remain gaps; zero-volume bars are
+retained.
+
+Official JForex [`IBar`](https://www.dukascopy.com/client/javadoc/com/dukascopy/api/IBar.html)
+documentation names bar time and OHLC accessors, but describes `getVolume()`
+only as the bar's volume. That description does not establish centralized
+executed FX volume or precisely document quote-volume aggregation. The parser
+therefore conservatively uses `VolumeSemantics.UNKNOWN`; numeric values,
+including zero, must not be interpreted as centralized traded volume.
+
+Raw datasets remain ignored under `data/raw/` and are never committed; the tiny
+four-record test fixture only freezes the observed binary schema and is not a
+research dataset. Trigger
 `.github/workflows/acquire-historical-sample.yml` manually from GitHub's Actions
-tab and download the named run artifact for inspection. Canonical research logic
-remains provider-neutral; Stage 1A canonical parsing and validation are not yet
-complete and must follow inspection of the real artifact.
+tab and download the named run artifact for inspection. Acquisition and parsing
+stay separate, canonical research logic remains provider-neutral, and no generic
+data-source protocol has been introduced.
 
 ## Checks
 

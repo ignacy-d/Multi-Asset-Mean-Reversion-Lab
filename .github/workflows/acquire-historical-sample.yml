@@ -23,7 +23,15 @@ jobs:
           uv run python -m mr_lab.providers.dukascopy
           --date 2024-01-02
           --output-dir data/raw/stage-1a-r
-      - name: Upload immutable raw snapshot and provenance
+      - name: Parse, validate, resample, and audit frozen sample
+        run: >-
+          uv run python -m mr_lab.providers.dukascopy_bi5
+          --input data/raw/stage-1a-r/EURUSD-2024-01-02-M1-BID.bi5
+          --date 2024-01-02
+          --expected-sha256
+          9b2d2b718f9ca123b58dce4b4512d4e1bd35c692e23e1beafebdd700072cf546
+          --audit-output data/raw/stage-1a-r/EURUSD-2024-01-02-canonicalization-audit.json
+      - name: Upload immutable raw snapshot, provenance, and canonicalization audit
         uses: actions/upload-artifact@v4
         with:
           name: dukascopy-eurusd-m1-bid-2024-01-02
