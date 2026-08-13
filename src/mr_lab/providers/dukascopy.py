@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 HOST = "datafeed.dukascopy.com"
 PROVIDER = "Dukascopy"
 _TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
+_MAX_BACKOFF_SECONDS = 30.0
 
 
 class AcquisitionError(RuntimeError):
@@ -96,14 +97,17 @@ def acquire(
     requested_day: date,
     *,
     timeout: float = 30.0,
-    retries: int = 2,
+    retries: int = 6,
     getter: Callable[[str, float], tuple[int, bytes]] = _get,
+    sleeper: Callable[[float], None] = time.sleep,
+    logger: Callable[[str], None] = print,
 ) -> tuple[Path, Path]:
     """GET one frozen day and write its payload and provenance."""
     if retries < 0:
         raise ValueError("retries must be non-negative")
     url = build_url("EURUSD", requested_day)
-    for attempt in range(retries + 1):
+    total_attempts = retries + 1
+    for attempt in range(total_attempts):
         try:
             status, payload = getter(url, timeout)
             if status != 200:
@@ -114,14 +118,30 @@ def acquire(
                 raise ProviderNoData(
                     f"Dukascopy has no daily file for {requested_day.isoformat()}"
                 ) from error
-            if error.code not in _TRANSIENT_STATUS or attempt == retries:
+            if error.code not in _TRANSIENT_STATUS:
                 raise AcquisitionError(
-                    f"Dukascopy GET failed: HTTP {error.code}"
+                    f"Dukascopy GET failed for {requested_day.isoformat()}: "
+                    f"HTTP {error.code} on attempt {attempt + 1}"
                 ) from error
+            if attempt == retries:
+                raise AcquisitionError(
+                    f"Dukascopy GET failed for {requested_day.isoformat()}: "
+                    f"HTTP {error.code}; exhausted {total_attempts} attempts"
+                ) from error
+            failure = f"HTTP {error.code}"
         except (TimeoutError, URLError) as error:
             if attempt == retries:
-                raise AcquisitionError(f"Dukascopy GET failed: {error}") from error
-        time.sleep(2**attempt)
+                raise AcquisitionError(
+                    f"Dukascopy GET failed for {requested_day.isoformat()}: "
+                    f"transport error {error}; exhausted {total_attempts} attempts"
+                ) from error
+            failure = f"transport error {error}"
+        backoff = min(float(2**attempt), _MAX_BACKOFF_SECONDS)
+        logger(
+            f"retry date={requested_day.isoformat()} error={failure} "
+            f"attempt={attempt + 1}/{total_attempts} sleep={backoff:g}s"
+        )
+        sleeper(backoff)
 
     decoded_byte_length = validate_payload(payload)
     metadata = make_provenance(

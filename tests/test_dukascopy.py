@@ -2,6 +2,7 @@ import json
 import lzma
 from datetime import date
 from pathlib import Path
+from urllib.error import URLError
 
 import pytest
 
@@ -119,3 +120,95 @@ def test_server_failure_is_not_provider_absence(tmp_path: Path) -> None:
         acquire(tmp_path, date(2024, 1, 6), retries=0, getter=getter)
 
     assert not isinstance(caught.value, ProviderNoData)
+
+
+def test_http_503_twice_then_success_retries_with_bounded_backoff(
+    tmp_path: Path,
+) -> None:
+    payload = lzma_payload()
+    responses = iter([(503, b""), (503, b""), (200, payload)])
+    sleeps: list[float] = []
+
+    raw, _ = acquire(
+        tmp_path,
+        date(2024, 2, 11),
+        getter=lambda _url, _timeout: next(responses),
+        sleeper=sleeps.append,
+        logger=lambda _message: None,
+    )
+
+    assert raw.read_bytes() == payload
+    assert sleeps == [1.0, 2.0]
+
+
+def test_transient_http_exhaustion_is_fatal_and_names_date(tmp_path: Path) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def getter(_url: str, _timeout: float) -> tuple[int, bytes]:
+        nonlocal calls
+        calls += 1
+        return 503, b""
+
+    with pytest.raises(
+        AcquisitionError, match=r"2024-02-11.*HTTP 503.*exhausted 7 attempts"
+    ):
+        acquire(
+            tmp_path,
+            date(2024, 2, 11),
+            getter=getter,
+            sleeper=sleeps.append,
+            logger=lambda _message: None,
+        )
+
+    assert calls == 7
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+
+
+def test_http_404_is_not_retried(tmp_path: Path) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def getter(_url: str, _timeout: float) -> tuple[int, bytes]:
+        nonlocal calls
+        calls += 1
+        return 404, b""
+
+    with pytest.raises(ProviderNoData):
+        acquire(
+            tmp_path,
+            date(2024, 2, 11),
+            getter=getter,
+            sleeper=sleeps.append,
+        )
+
+    assert calls == 1
+    assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    "failure", [TimeoutError("timed out"), URLError("temporary DNS failure")]
+)
+def test_transport_failure_can_recover_without_real_sleep(
+    tmp_path: Path, failure: Exception
+) -> None:
+    payload = lzma_payload()
+    responses: list[Exception | tuple[int, bytes]] = [failure, (200, payload)]
+    sleeps: list[float] = []
+
+    def getter(_url: str, _timeout: float) -> tuple[int, bytes]:
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    raw, _ = acquire(
+        tmp_path,
+        date(2024, 2, 11),
+        getter=getter,
+        sleeper=sleeps.append,
+        logger=lambda _message: None,
+    )
+
+    assert raw.read_bytes() == payload
+    assert sleeps == [1.0]
