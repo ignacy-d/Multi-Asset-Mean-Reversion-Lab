@@ -5,14 +5,14 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 1A-P — real BI5 parsing and canonicalization
+## Current stage: 1B — multi-day canonical research datasets
 
 The earlier typed configuration, immutable canonical bar contract, collection
-validation, and conservative resampling remain intact. Stage 1A-P adds one
-narrow provider-local parser for the observed Dukascopy EURUSD M1 BID BI5
-candle representation. **No strategy, feature, signal, session classifier,
-backtest, generic provider protocol, or execution integration has been
-implemented.**
+validation, conservative resampling, and Stage 1A daily parser remain intact.
+Stage 1B adds a narrow logical assembly API for multiple already-acquired,
+explicitly dated Dukascopy EURUSD M1 BID daily BI5 payloads. **No strategy,
+feature, signal, session classifier, backtest, generic provider protocol, or
+execution integration has been implemented.**
 
 ## Canonical market data
 
@@ -59,6 +59,22 @@ Dataset metadata records source and semantic provenance. The Dukascopy parser's
 dataset ID hashes canonical JSON containing stable provider, instrument,
 timeframe, price side, requested day, raw SHA-256, parser version, and canonical
 schema version. Retrieval time and other operational details are excluded.
+
+`assemble_daily_payloads` accepts immutable `DailyPayload` values that pair raw
+bytes with their requested UTC dates. It reuses Stage 1A canonicalization,
+rejects duplicate dates and malformed components, sorts by date, validates the
+combined bars, and never fills missing intervals or calendar days. Its stable
+assembled identity hashes canonical sorted compact JSON containing the fixed
+semantics and the ordered component dates, raw SHA-256 values, and daily dataset
+IDs. Input enumeration order, paths, retrieval timestamps, workflow state, and
+machine state cannot affect that identity.
+
+The serializable multi-day manifest exposes the covered dates and per-day raw
+and canonical identities, the combined time range and M1 count, gaps, and
+M5/M15/H1 complete and incomplete-window counts. It is a logical audit, not a
+large-scale storage format. Generic resampling remains fixed-duration,
+UTC-epoch-aligned, availability-aware, and prefix-invariant across day
+boundaries.
 
 ## Research philosophy
 
@@ -118,9 +134,11 @@ GitHub Actions acquisition
     ↓
 immutable raw BI5 + raw SHA
     ↓
-provider-local BI5 parser
+Stage 1A provider-local daily BI5 canonicalization
     ↓
-canonical Bar + DatasetMetadata
+ordered Stage 1B multi-day assembly
+    ↓
+deterministic dataset manifest / identity
     ↓
 validate_dataset()
     ↓
