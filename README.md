@@ -101,8 +101,10 @@ The manually triggered **Acquire historical sample** GitHub Actions workflow
 downloads the frozen Dukascopy EURUSD M1 BID sample for 2024-01-02. External
 acquisition is intentionally delegated to a GitHub-hosted runner because Codex
 Cloud is not the acquisition environment. The workflow uses a public HTTPS GET,
-validates the LZMA/BI5 container structure, and uploads the immutable raw payload
-plus JSON SHA-256 provenance as a short-lived workflow artifact.
+validates that the raw provider artifact is non-empty and LZMA-decodable, and
+uploads it plus JSON SHA-256 provenance as a short-lived workflow artifact. The
+internal binary record schema is deliberately left uninterpreted pending
+inspection of the real acquired artifact.
 
 Raw datasets remain ignored under `data/raw/` and are never committed. Trigger
 `.github/workflows/acquire-historical-sample.yml` manually from GitHub's Actions

@@ -15,7 +15,6 @@ from urllib.request import Request, urlopen
 
 HOST = "datafeed.dukascopy.com"
 PROVIDER = "Dukascopy"
-_RECORD_BYTES = 24
 _TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
 
 
@@ -40,7 +39,7 @@ def payload_sha256(payload: bytes) -> str:
 
 
 def validate_payload(payload: bytes) -> int:
-    """Reject empty, HTML, corrupt, and structurally implausible BI5 payloads."""
+    """Return decoded size after validating a non-empty LZMA provider payload."""
     if not payload:
         raise AcquisitionError("provider returned an empty payload")
     prefix = payload[:256].lstrip().lower()
@@ -52,15 +51,18 @@ def validate_payload(payload: bytes) -> int:
         raise AcquisitionError(
             "payload is not valid LZMA-compressed BI5 data"
         ) from error
-    if not decoded or len(decoded) % _RECORD_BYTES:
-        raise AcquisitionError(
-            "decoded BI5 payload is empty or not composed of 24-byte records"
-        )
-    return len(decoded) // _RECORD_BYTES
+    if not decoded:
+        raise AcquisitionError("decoded BI5 payload is empty")
+    return len(decoded)
 
 
 def make_provenance(
-    *, payload: bytes, requested_day: date, url: str, http_status: int, row_count: int
+    *,
+    payload: bytes,
+    requested_day: date,
+    url: str,
+    http_status: int,
+    decoded_byte_length: int,
 ) -> dict[str, object]:
     """Build audit metadata; retrieval time is provenance, not the SHA-256."""
     return {
@@ -73,8 +75,8 @@ def make_provenance(
         "requested_date": requested_day.isoformat(),
         "retrieved_at": datetime.now(UTC).isoformat(),
         "http_status": http_status,
-        "byte_length": len(payload),
-        "decoded_record_count": row_count,
+        "compressed_byte_length": len(payload),
+        "decoded_byte_length": decoded_byte_length,
         "sha256": payload_sha256(payload),
     }
 
@@ -113,13 +115,13 @@ def acquire(
                 raise AcquisitionError(f"Dukascopy GET failed: {error}") from error
         time.sleep(2**attempt)
 
-    row_count = validate_payload(payload)
+    decoded_byte_length = validate_payload(payload)
     metadata = make_provenance(
         payload=payload,
         requested_day=requested_day,
         url=url,
         http_status=status,
-        row_count=row_count,
+        decoded_byte_length=decoded_byte_length,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"EURUSD-{requested_day.isoformat()}-M1-BID"
