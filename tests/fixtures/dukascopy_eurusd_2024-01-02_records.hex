@@ -1,0 +1,6 @@
+# Tiny schema fixture derived from the real 2024-01-02 EURUSD M1 BID artifact.
+# These four records are not a research dataset. The final record is non-contiguous.
+000000000001af1e0001af260001af1e0001af2842ccbd71
+0000003c0001af230001af270001af200001af274295199a
+000000780001af260001af260001af230001af2741eb5c29
+000151440001ab630001ab680001ab630001ab6b41db999a
