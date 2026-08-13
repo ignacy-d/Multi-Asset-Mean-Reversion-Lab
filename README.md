@@ -5,14 +5,96 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 1B — multi-day canonical research datasets
+## Current stage: 1C — historical session and trading-window semantics
 
 The earlier typed configuration, immutable canonical bar contract, collection
-validation, conservative resampling, and Stage 1A daily parser remain intact.
-Stage 1B adds a narrow logical assembly API for multiple already-acquired,
-explicitly dated Dukascopy EURUSD M1 BID daily BI5 payloads. **No strategy,
-feature, signal, session classifier, backtest, generic provider protocol, or
-execution integration has been implemented.**
+validation, conservative resampling, Stage 1A daily parser, and Stage 1B
+multi-day assembly remain intact. Stage 1C adds provider-independent,
+historically DST-aware classification of canonical UTC bar open times into
+major research sessions, their actual overlaps, and configurable named research
+windows. **No strategy, feature, signal, backtest, generic provider protocol,
+broker calendar, or execution integration has been implemented.**
+
+## Historical session semantics
+
+The explicit Stage 1C boundary is:
+
+```text
+canonical UTC bars
+    ↓
+historical IANA timezone conversion (zoneinfo)
+    ↓
+independent major-session membership
+    ↓
+derived overlap / session-only regime
+    ↓
+named research windows / killzone candidates
+```
+
+`classify_bar` classifies a completed bar by its canonical UTC `open_time`.
+Thus an M15 bar opening at a session's local 08:00 is in that session, while
+the preceding 07:45 bar is not. Every interval is half-open `[start, end)` and
+cross-midnight intervals are supported. Classification is a pure function of
+the timestamp and immutable `SessionSpec`; it neither mutates bars nor examines
+prices, later bars, or eventual daily statistics. `classify_bars` labels only
+observations supplied by the caller and therefore does not invent missing bars.
+
+The versioned `DEFAULT_SESSION_SPEC` contains configurable **research**
+definitions, not claims about a centralized official spot-FX exchange:
+
+| Major session | IANA timezone | Local half-open window |
+| --- | --- | --- |
+| `asia` | `Asia/Tokyo` | 09:00–18:00 |
+| `london` | `Europe/London` | 08:00–17:00 |
+| `new_york` | `America/New_York` | 08:00–17:00 |
+
+Membership booleans are independent. Regimes such as `london_only` and
+`london_new_york_overlap` are derived from the sessions simultaneously active
+on the historical date; UTC overlap hours are never hardcoded. Any number of
+sessions, including a future three-way overlap, is represented generically.
+
+The same specification also ships the following initial **hypothesis windows**.
+All use `America/New_York`, so their UTC placement follows historical EST/EDT:
+
+| Candidate | Local half-open window |
+| --- | --- |
+| `asian_kz_20_00_et` | 20:00–00:00 |
+| `london_kz_02_05_et` | 02:00–05:00 |
+| `london_core_02_04_et` | 02:00–04:00 |
+| `new_york_kz_07_10_et` | 07:00–10:00 |
+| `new_york_kz_0830_1100_et` | 08:30–11:00 |
+| `london_close_10_12_et` | 10:00–12:00 |
+| `new_york_lunch_11_13_et` | 11:00–13:00 |
+
+These names and boundaries are configurations to test empirically, not assumed
+alpha or proven market truths. Multiple candidates deliberately coexist and
+may overlap rather than allowing the implementation to select the most
+attractive result after the fact. Optional active weekdays use the window's
+local date; for a cross-midnight window, this means the date on which it starts.
+
+`SessionSpec.to_json()` sorts semantically unordered definitions and emits
+canonical compact JSON. `session_spec_id` hashes that JSON independently of
+machine state, paths, current date, display timezone, and the market
+`dataset_id`. Experiments can consequently record both identities without a
+change of session hypotheses pretending to be a change of underlying data.
+
+The timezone roles remain deliberately separate:
+
+- **source timezone** belongs to provider-local canonicalization;
+- **canonical UTC** is the immutable internal timestamp carried by `Bar`;
+- **session timezone** is an IANA civil timezone used only to interpret a local
+  research window on each historical date;
+- **researcher/display timezone** is optional presentation after labeling; and
+- **future broker/server timezone** will belong to a separate execution and
+  symbol-hours boundary.
+
+Stage 1C never reinterprets canonical timestamps using `source_timezone` and
+never reads the machine's local offset. A researcher's current Polish local
+time—or London, New York, or any other display time—has zero influence on a
+historical label. Likewise, whatever timezone a future broker chart displays
+cannot change market-session semantics. A later broker architecture may map
+canonical UTC to broker server time and symbol trading hours, but this stage has
+no broker dependency.
 
 ## Canonical market data
 
