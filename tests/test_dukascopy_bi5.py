@@ -77,7 +77,7 @@ def test_canonical_semantics_and_zero_volume_are_preserved() -> None:
     assert bar.instrument == "EURUSD"
     assert bar.timeframe == Timeframe("1m")
     assert bar.price_basis is PriceBasis.BID
-    assert bar.volume_semantics is VolumeSemantics.UNKNOWN
+    assert bar.volume_semantics is VolumeSemantics.QUOTE_ACTIVITY
     assert bar.volume == 0.0
     assert bar.open_time == datetime(2024, 1, 2, tzinfo=UTC)
     assert bar.available_at == bar.close_time == datetime(2024, 1, 2, 0, 1, tzinfo=UTC)
@@ -117,10 +117,26 @@ def test_price_scaling_and_dataset_identity_are_deterministic() -> None:
     payload = compressed(record())
     first = build_dataset_metadata(payload, DAY)
     second = build_dataset_metadata(payload, DAY)
+    identity_inputs = {
+        "canonical_schema_version": "bar-v1",
+        "instrument": "EURUSD",
+        "parser_schema_version": "dukascopy-bi5-eurusd-m1-bid-v1",
+        "price_basis": "bid",
+        "provider": "Dukascopy",
+        "raw_sha256": hashlib.sha256(payload).hexdigest(),
+        "requested_day": "2024-01-02",
+        "source_timezone": "UTC",
+        "timeframe": "1m",
+        "volume_semantics": "quote_activity",
+    }
+    identity_json = json.dumps(
+        identity_inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    expected_dataset_id = f"sha256:{hashlib.sha256(identity_json).hexdigest()}"
 
     assert parse_m1_bid_bars(payload, DAY)[0].open == 1.10366
     assert first == second
-    assert first.dataset_id.startswith("sha256:")
+    assert first.dataset_id == expected_dataset_id
     assert (
         first.dataset_id
         != build_dataset_metadata(compressed(record(60)), DAY).dataset_id
@@ -128,6 +144,7 @@ def test_price_scaling_and_dataset_identity_are_deterministic() -> None:
     assert first.source == "Dukascopy"
     assert first.source_timezone == "UTC"
     assert first.native_timeframe == Timeframe("1m")
+    assert first.volume_semantics is VolumeSemantics.QUOTE_ACTIVITY
 
 
 def test_parsing_is_prefix_invariant() -> None:
@@ -178,4 +195,6 @@ def test_audit_is_stable_json_and_contains_content_hash() -> None:
 
     assert audit == json.loads(json.dumps(audit, sort_keys=True))
     assert audit["raw_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert audit["volume_semantics"] == "quote_activity"
+    assert audit["source_timezone"] == "UTC"
     assert "retrieved_at" not in audit

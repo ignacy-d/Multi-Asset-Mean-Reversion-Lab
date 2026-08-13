@@ -31,6 +31,7 @@ INSTRUMENT = "EURUSD"
 PARSER_SCHEMA_VERSION = "dukascopy-bi5-eurusd-m1-bid-v1"
 CANONICAL_SCHEMA_VERSION = "bar-v1"
 SOURCE_TIMEZONE = "UTC"
+VOLUME_SEMANTICS = VolumeSemantics.QUOTE_ACTIVITY
 RECORD = struct.Struct(">5if")
 PRICE_SCALE = 100_000
 M1 = Timeframe("1m")
@@ -110,9 +111,10 @@ def parse_decoded_m1_bid_bars(decoded: bytes, requested_day: date) -> tuple[Bar,
                 close=close_price,
                 price_basis=PriceBasis.BID,
                 volume=float(volume),
-                # JForex IBar documents only "volume of the bar"; it does not
-                # establish centralized trades or a precise quote aggregation.
-                volume_semantics=VolumeSemantics.UNKNOWN,
+                # JForex IBar defines volume as the sum of best-price volumes
+                # for each tick, which is quote activity rather than executed
+                # centralized FX trade volume.
+                volume_semantics=VOLUME_SEMANTICS,
             )
         )
         previous_offset = offset
@@ -135,7 +137,9 @@ def build_dataset_metadata(payload: bytes, requested_day: date) -> DatasetMetada
         "provider": PROVIDER,
         "raw_sha256": raw_sha256,
         "requested_day": requested_day.isoformat(),
+        "source_timezone": SOURCE_TIMEZONE,
         "timeframe": M1.value,
+        "volume_semantics": VOLUME_SEMANTICS.value,
     }
     serialized = json.dumps(
         identity_inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -145,7 +149,7 @@ def build_dataset_metadata(payload: bytes, requested_day: date) -> DatasetMetada
         source=PROVIDER,
         instrument=INSTRUMENT,
         price_basis=PriceBasis.BID,
-        volume_semantics=VolumeSemantics.UNKNOWN,
+        volume_semantics=VOLUME_SEMANTICS,
         schema_version=CANONICAL_SCHEMA_VERSION,
         dataset_id=dataset_id,
         native_timeframe=M1,

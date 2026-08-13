@@ -134,12 +134,11 @@ open, close, low, high integer prices, and volume. EURUSD prices use the observe
 and become available at interval close. Gaps remain gaps; zero-volume bars are
 retained.
 
-Official JForex [`IBar`](https://www.dukascopy.com/client/javadoc/com/dukascopy/api/IBar.html)
-documentation names bar time and OHLC accessors, but describes `getVolume()`
-only as the bar's volume. That description does not establish centralized
-executed FX volume or precisely document quote-volume aggregation. The parser
-therefore conservatively uses `VolumeSemantics.UNKNOWN`; numeric values,
-including zero, must not be interpreted as centralized traded volume.
+Official JForex [`IBar.getVolume()`](https://www.dukascopy.com/client/javadoc/com/dukascopy/api/IBar.html#getVolume--)
+documentation defines volume as the sum of best-price volumes for every tick in
+the bar. The parser therefore uses `VolumeSemantics.QUOTE_ACTIVITY`; this is
+quote-side activity, not centralized executed FX traded volume. Numeric values,
+including zero, are retained.
 
 Raw datasets remain ignored under `data/raw/` and are never committed; the tiny
 four-record test fixture only freezes the observed binary schema and is not a
