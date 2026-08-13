@@ -95,6 +95,21 @@ uv sync --dev
 The checked-in `uv.lock` pins the complete environment. Stage 0C adds no runtime
 or development dependencies.
 
+## External historical-data acquisition bridge
+
+The manually triggered **Acquire historical sample** GitHub Actions workflow
+downloads the frozen Dukascopy EURUSD M1 BID sample for 2024-01-02. External
+acquisition is intentionally delegated to a GitHub-hosted runner because Codex
+Cloud is not the acquisition environment. The workflow uses a public HTTPS GET,
+validates the LZMA/BI5 container structure, and uploads the immutable raw payload
+plus JSON SHA-256 provenance as a short-lived workflow artifact.
+
+Raw datasets remain ignored under `data/raw/` and are never committed. Trigger
+`.github/workflows/acquire-historical-sample.yml` manually from GitHub's Actions
+tab and download the named run artifact for inspection. Canonical research logic
+remains provider-neutral; Stage 1A canonical parsing and validation are not yet
+complete and must follow inspection of the real artifact.
+
 ## Checks
 
 ```bash
