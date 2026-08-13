@@ -106,9 +106,9 @@ class SessionSpec:
                 isinstance(window, TimeWindow) for window in windows
             ):
                 raise SessionSpecError(f"{field} must be a tuple of TimeWindow values")
-            names = [window.name for window in windows]
-            if len(names) != len(set(names)):
-                raise SessionSpecError(f"{field} names must be unique")
+        names = [window.name for window in (*self.major_sessions, *self.named_windows)]
+        if len(names) != len(set(names)):
+            raise SessionSpecError("window names must be globally unique")
 
     def as_dict(self) -> dict[str, object]:
         """Return canonical, declaration-order-independent semantic data."""

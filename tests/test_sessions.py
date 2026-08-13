@@ -162,14 +162,26 @@ def test_weekdays_use_local_start_date_for_cross_midnight_window() -> None:
     monday_only = SessionSpec(
         "test-v1",
         (),
-        (TimeWindow("overnight", "America/New_York", time(20), time(0), (0,)),),
+        (TimeWindow("overnight", "America/New_York", time(22), time(2), (0,)),),
     )
 
-    monday_evening = classify_timestamp(at(2024, 1, 9, 1), monday_only)
-    tuesday_end = classify_timestamp(at(2024, 1, 9, 5), monday_only)
+    monday_start = classify_timestamp(at(2024, 1, 9, 3), monday_only)
+    tuesday_carryover = classify_timestamp(at(2024, 1, 9, 6), monday_only)
+    tuesday_end = classify_timestamp(at(2024, 1, 9, 7), monday_only)
+    tuesday_start = classify_timestamp(at(2024, 1, 10, 3), monday_only)
 
-    assert monday_evening.active_named_windows == ("overnight",)
+    assert monday_start.active_named_windows == ("overnight",)
+    assert tuesday_carryover.active_named_windows == ("overnight",)
     assert tuesday_end.active_named_windows == ()
+    assert tuesday_start.active_named_windows == ()
+
+
+def test_window_names_must_be_unique_across_entire_specification() -> None:
+    london = TimeWindow("london", "Europe/London", time(8), time(17))
+    duplicate_named_window = TimeWindow("london", "America/New_York", time(2), time(5))
+
+    with pytest.raises(SessionSpecError, match="globally unique"):
+        SessionSpec("test-v1", (london,), (duplicate_named_window,))
 
 
 def test_spec_identity_is_stable_and_declaration_order_independent() -> None:
