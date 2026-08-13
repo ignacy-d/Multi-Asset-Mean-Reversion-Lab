@@ -52,7 +52,8 @@ future research engine
 
 `enumerate_dates` requires explicit inclusive dates, returns deterministic
 ascending dates, rejects reverse ranges, and limits one request to 370 calendar
-days. `acquire_range` downloads sequentially with a small configurable delay;
+days. `acquire_range` downloads sequentially with a configurable one-second
+default delay and logs progress for every requested day;
 it does not infer dates from the clock or filesystem ordering. The supported
 scope remains Dukascopy EURUSD native M1 BID, canonical UTC, with
 `QUOTE_ACTIVITY` volume. The verified Stage 1A decoder is reused unchanged and
@@ -66,6 +67,8 @@ failures, and canonical validation failures abort the run. No exchange calendar
 is consulted, and absent dates and missing intervals are never synthesized or
 forward-filled. This narrow 404 rule reflects an explicit missing resource; the
 repository does not claim that every weekend or holiday must return 404.
+Transient HTTP and transport failures use six retries after the initial request
+with bounded 1, 2, 4, 8, 16, and 30 second backoffs. HTTP 404 is never retried.
 
 Each successful component retains its raw BI5 file and Stage 1A acquisition
 provenance, raw SHA-256, requested date, and daily dataset ID. Stage 1B's

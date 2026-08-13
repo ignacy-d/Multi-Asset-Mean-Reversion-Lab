@@ -162,10 +162,11 @@ def acquire_range(
     end_date: date,
     *,
     timeout: float = 30.0,
-    retries: int = 2,
-    delay_seconds: float = 0.25,
+    retries: int = 6,
+    delay_seconds: float = 1.0,
     acquire_day: Callable[..., tuple[Path, Path]] = acquire,
     sleeper: Callable[[float], None] = time.sleep,
+    logger: Callable[[str], None] = print,
 ) -> RangeAcquisitionResult:
     """Sequentially acquire, validate, assemble, and audit an inclusive range.
 
@@ -181,12 +182,15 @@ def acquire_range(
     payloads: list[DailyPayload] = []
     absent: list[date] = []
     for index, day in enumerate(days):
+        progress = f"[{index + 1}/{len(days)}]"
+        logger(f"{progress} acquiring {day.isoformat()}")
         try:
             raw_path, provenance_path = acquire_day(
                 output_dir, day, timeout=timeout, retries=retries
             )
         except ProviderNoData:
             absent.append(day)
+            logger(f"{progress} absent {day.isoformat()}")
         else:
             raw_paths.append(raw_path)
             provenance_paths.append(provenance_path)
@@ -213,7 +217,7 @@ def main() -> None:
     parser.add_argument("--start-date", type=date.fromisoformat, required=True)
     parser.add_argument("--end-date", type=date.fromisoformat, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--delay-seconds", type=float, default=0.25)
+    parser.add_argument("--delay-seconds", type=float, default=1.0)
     args = parser.parse_args()
     result = acquire_range(
         args.output_dir,

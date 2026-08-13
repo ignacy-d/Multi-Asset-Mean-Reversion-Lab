@@ -144,6 +144,67 @@ def test_multiple_days_and_confirmed_absence_are_recorded_without_filling(
         assert component["daily_dataset_id"].startswith("sha256:")
 
 
+def test_range_progress_preserves_absence_and_uses_default_polite_delay(
+    tmp_path: Path,
+) -> None:
+    start, absent, end = date(2024, 1, 5), date(2024, 1, 6), date(2024, 1, 7)
+    messages: list[str] = []
+    sleeps: list[float] = []
+
+    result = acquire_range(
+        tmp_path,
+        start,
+        end,
+        acquire_day=writer(
+            {start: payload(), absent: ProviderNoData("404"), end: payload(100)}, []
+        ),
+        sleeper=sleeps.append,
+        logger=messages.append,
+    )
+
+    assert result.manifest.confirmed_absent_dates == (absent,)
+    assert sleeps == [1.0, 1.0]
+    assert messages == [
+        "[1/3] acquiring 2024-01-05",
+        "[2/3] acquiring 2024-01-06",
+        "[2/3] absent 2024-01-06",
+        "[3/3] acquiring 2024-01-07",
+    ]
+
+
+def test_retry_history_does_not_change_daily_dataset_or_corpus_identity(
+    tmp_path: Path,
+) -> None:
+    day = date(2024, 1, 2)
+    raw_payload = payload()
+    direct_dir, retried_dir = tmp_path / "direct", tmp_path / "retried"
+    direct_raw, _ = range_module.acquire(
+        direct_dir,
+        day,
+        getter=lambda _url, _timeout: (200, raw_payload),
+        sleeper=lambda _seconds: None,
+        logger=lambda _message: None,
+    )
+    responses = iter([(503, b""), (200, raw_payload)])
+    retried_raw, _ = range_module.acquire(
+        retried_dir,
+        day,
+        getter=lambda _url, _timeout: next(responses),
+        sleeper=lambda _seconds: None,
+        logger=lambda _message: None,
+    )
+
+    direct = build_corpus_manifest(
+        day, day, [DailyPayload(day, direct_raw.read_bytes())], []
+    )
+    retried = build_corpus_manifest(
+        day, day, [DailyPayload(day, retried_raw.read_bytes())], []
+    )
+
+    assert direct.dataset.metadata.dataset_id == retried.dataset.metadata.dataset_id
+    assert direct.corpus_id == retried.corpus_id
+
+
 def test_network_or_server_failure_is_not_converted_to_absence(tmp_path: Path) -> None:
     day = date(2024, 1, 2)
     failure = AcquisitionError("HTTP 503")
