@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.scripts]
+mr-lab-vwap-benchmark = "mr_lab.vwap_benchmark:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.3,<9",
