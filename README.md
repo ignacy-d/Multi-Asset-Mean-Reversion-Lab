@@ -5,15 +5,48 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 1D — reproducible historical research corpus
+## Current stage: 2A — minimal point-in-time research/event engine
 
-The earlier typed configuration, immutable canonical bar contract, collection
-validation, conservative resampling, Stage 1A daily parser, and Stage 1B
-multi-day assembly remain intact, as do the separate Stage 1C historical session
-semantics. Stage 1D adds a bounded, explicit-date acquisition boundary and a
-deterministic corpus-request audit. **No strategy, feature, signal, backtest,
-generic provider protocol, broker calendar, or execution integration has been
-implemented.**
+Stages 0 through 1D remain intact. Stage 2A adds immutable research observations,
+a current-bar-only provider-activity semantic, and exact elapsed-clock forward
+labels. It deliberately adds no strategy or executable PnL assumptions: VWAP
+and Bollinger hypotheses remain future work.
+
+## Stage 2A research semantics
+
+`is_no_activity_flat_bar` is true exactly when `volume == 0` and
+`open == high == low == close`. It reads only the current canonical bar. This is
+a provider-observation classification, not a claim that the global FX market
+was officially closed. Such a bar is not initially research-active, but remains
+in the canonical sequence with its original timestamps. Zero volume with price
+movement and nonzero volume with flat OHLC both remain active.
+
+`build_research_observations` preserves one observation per supplied bar and
+reuses Stage 1C `classify_bar`; it does not duplicate session logic. A completed
+bar becomes observable only at its existing `available_at`. M5, M15, and H1 are
+handled as ordinary canonical fixed-duration bars.
+
+Forward horizons are positive elapsed `timedelta` values. For a source available
+at `t`, the target must have `available_at == t + horizon` exactly. Missing and
+inactive exact targets make the label unavailable; the engine never selects the
+next active bar, deletes inactive time, or compresses gaps. The sole Stage 2A
+return is the same-price-basis close-to-close arithmetic label
+`target_close / source_close - 1`. It is statistical BID-data research output,
+not executable long/short PnL. `Direction.LONG` and `Direction.SHORT` only sign a
+label supplied to them and do not generate signals.
+
+`ResearchSpec` sorts and deduplicates its horizon set and hashes canonical
+compact sorted JSON with SHA-256. Its inputs are the research schema version,
+activity-rule version, horizons in whole seconds, and return definition.
+`research_spec_id` deliberately excludes both market `dataset_id` and
+`session_spec_id`, so all three identities can be recorded independently.
+
+`load_offline_corpus` is the narrow no-network bridge from a saved Stage 1D
+directory. It reads successful dates declared by `corpus-manifest.json`, never
+discovers days by directory enumeration, verifies each conventional BI5 file
+against its provenance and manifest SHA-256, reconstructs through the existing
+Stage 1B assembler, and requires the resulting dataset identity to equal the
+stored assembled identity. Missing, corrupt, or mismatched components fail.
 
 ## Frozen first research split
 
@@ -243,6 +276,21 @@ boundaries.
   execution systems outside research logic.
 - Prefer objective variables and reproducible experiments over discretionary
   labels or attractive backtest results.
+
+## Roadmap
+
+- **Stage 1D:** reproducible discovery corpus.
+- **Stage 2A:** point-in-time research observations, provider no-activity
+  semantics, and fixed clock-time forward outcomes.
+- **Stage 2B:** VWAP-deviation mean-reversion benchmark.
+- **Stage 2C:** Bollinger-deviation mean-reversion benchmark.
+- **Stage 3:** realistic transaction-cost and execution assumptions.
+- **Stage 4:** broader universe plus out-of-sample and walk-forward evaluation.
+- **Later:** consider OU models only after simple benchmark families justify
+  further complexity.
+
+The split remains frozen: **2024 is discovery; 2025 is the untouched future OOS
+holdout.** Stage 2A neither inspects nor acquires 2025.
 
 ## Foundation and future architecture
 

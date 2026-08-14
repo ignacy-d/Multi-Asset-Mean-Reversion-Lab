@@ -39,6 +39,61 @@ class RangeAcquisitionError(ValueError):
     """Raised when a range request or its acquired components are invalid."""
 
 
+def load_offline_corpus(corpus_dir: Path) -> MultiDayDataset:
+    """Reconstruct a Stage 1B dataset from manifest-declared Stage 1D dates only."""
+    manifest_path = corpus_dir / "corpus-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        dates = tuple(
+            date.fromisoformat(value)
+            for value in manifest["successful_component_dates"]
+        )
+        components = manifest["components"]
+        expected_dataset_id = manifest["assembled_dataset_id"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise RangeAcquisitionError(
+            "invalid or missing offline corpus manifest"
+        ) from error
+    if dates != tuple(sorted(set(dates))) or len(components) != len(dates):
+        raise RangeAcquisitionError(
+            "manifest component dates must be unique and ordered"
+        )
+    declared = {
+        item.get("requested_day"): item for item in components if isinstance(item, dict)
+    }
+    payloads = []
+    for day in dates:
+        stem = f"EURUSD-{day.isoformat()}-M1-BID"
+        try:
+            raw = (corpus_dir / f"{stem}.bi5").read_bytes()
+            provenance = json.loads(
+                (corpus_dir / f"{stem}.json").read_text(encoding="utf-8")
+            )
+            component = declared[day.isoformat()]
+        except (OSError, json.JSONDecodeError, KeyError) as error:
+            raise RangeAcquisitionError(
+                f"missing or corrupt offline component for {day}"
+            ) from error
+        digest = hashlib.sha256(raw).hexdigest()
+        if (
+            provenance.get("requested_date") != day.isoformat()
+            or provenance.get("sha256") != digest
+        ):
+            raise RangeAcquisitionError(f"provenance mismatch for {day}")
+        if component.get("raw_sha256") != digest:
+            raise RangeAcquisitionError(f"manifest payload hash mismatch for {day}")
+        payloads.append(DailyPayload(day, raw))
+    try:
+        dataset = assemble_daily_payloads(payloads)
+    except (OSError, ValueError) as error:
+        raise RangeAcquisitionError("offline corpus canonicalization failed") from error
+    if dataset.metadata.dataset_id != expected_dataset_id:
+        raise RangeAcquisitionError(
+            "reconstructed dataset identity does not match manifest"
+        )
+    return dataset
+
+
 def enumerate_dates(start_date: date, end_date: date) -> tuple[date, ...]:
     """Return an explicit inclusive range in ascending calendar-date order."""
     if any(
