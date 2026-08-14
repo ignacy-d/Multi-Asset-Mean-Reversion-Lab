@@ -97,6 +97,14 @@ class ResearchSpec:
                 or not getattr(self, name).strip()
             ):
                 raise ResearchError(f"{name} must be a non-empty string")
+        if self.schema_version != RESEARCH_SCHEMA_VERSION:
+            raise ResearchError(
+                f"Stage 2A supports only {RESEARCH_SCHEMA_VERSION!r} schemas"
+            )
+        if self.activity_rule_version != ACTIVITY_RULE_VERSION:
+            raise ResearchError(
+                f"Stage 2A supports only {ACTIVITY_RULE_VERSION!r} activity rules"
+            )
         if self.return_definition != RETURN_DEFINITION:
             raise ResearchError(f"Stage 2A supports only {RETURN_DEFINITION!r} returns")
         object.__setattr__(self, "horizons", tuple(sorted(set(self.horizons))))

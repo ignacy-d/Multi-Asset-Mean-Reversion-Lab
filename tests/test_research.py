@@ -1,4 +1,3 @@
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -6,6 +5,7 @@ import pytest
 from mr_lab.data import Bar, PriceBasis, Timeframe, VolumeSemantics
 from mr_lab.research import (
     Direction,
+    ResearchError,
     ResearchSpec,
     build_forward_outcomes,
     build_research_observations,
@@ -109,7 +109,7 @@ def test_future_target_enables_return_without_changing_source_semantics() -> Non
 def test_research_spec_is_canonical_separate_and_method_sensitive() -> None:
     forward = ResearchSpec((timedelta(hours=1), timedelta(minutes=15)))
     reverse = ResearchSpec((timedelta(minutes=15), timedelta(hours=1)))
-    changed = replace(forward, activity_rule_version="future-rule-v2")
+    changed = ResearchSpec((timedelta(hours=2), timedelta(minutes=15)))
 
     assert forward.to_json() == reverse.to_json()
     assert forward.research_spec_id == reverse.research_spec_id
@@ -117,3 +117,17 @@ def test_research_spec_is_canonical_separate_and_method_sensitive() -> None:
     assert "dataset_id" not in forward.to_json()
     assert "session_spec_id" not in forward.to_json()
     assert forward.research_spec_id.startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"activity_rule_version": "future-rule-v2"},
+        {"schema_version": "future-research-schema-v2"},
+    ],
+)
+def test_research_spec_rejects_unimplemented_methodology_versions(
+    override: dict[str, str],
+) -> None:
+    with pytest.raises(ResearchError, match="Stage 2A supports only"):
+        ResearchSpec((timedelta(minutes=15),), **override)
