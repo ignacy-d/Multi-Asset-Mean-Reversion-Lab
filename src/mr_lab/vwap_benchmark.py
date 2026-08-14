@@ -183,6 +183,15 @@ class VwapStrategySpec:
     def __post_init__(self) -> None:
         if self.strategy_schema_version != STRATEGY_SCHEMA_VERSION:
             raise VwapBenchmarkError("unsupported strategy schema version")
+        supported_methodology = (
+            ("vwap_price_definition", VWAP_PRICE_DEFINITION),
+            ("weight_semantics", WEIGHT_SEMANTICS),
+            ("reset_mode", RESET_MODE),
+            ("normalized_deviation_definition", NORMALIZATION_DEFINITION),
+        )
+        for field, expected in supported_methodology:
+            if getattr(self, field) != expected:
+                raise VwapBenchmarkError(f"unsupported {field}")
         if type(self.volatility_lookback) is not int or self.volatility_lookback < 2:
             raise VwapBenchmarkError("volatility lookback must be at least 2")
         if (
@@ -300,6 +309,39 @@ def summarize_benchmark(
     return tuple(rows)
 
 
+def _compatible_horizons(timeframe: Timeframe) -> tuple[timedelta, ...]:
+    """Keep only horizons landing on a possible canonical bar availability."""
+    return tuple(
+        horizon
+        for horizon in DEFAULT_HORIZONS
+        if horizon >= timeframe.duration
+        and horizon % timeframe.duration == timedelta(0)
+    )
+
+
+def _manifest_declared_dates(manifest: object) -> tuple[date, ...]:
+    """Parse every Stage 1D request/component date used by the discovery guard."""
+    if not isinstance(manifest, dict):
+        raise VwapBenchmarkError("invalid offline corpus manifest")
+    try:
+        scalar_dates = (
+            manifest["requested_start_date"],
+            manifest["requested_end_date"],
+        )
+        sequence_dates = (
+            *manifest["successful_component_dates"],
+            *manifest["confirmed_absent_dates"],
+        )
+        components = manifest["components"]
+        component_dates = tuple(component["requested_day"] for component in components)
+        values = (*scalar_dates, *sequence_dates, *component_dates)
+        if not all(isinstance(value, str) for value in values):
+            raise TypeError
+        return tuple(date.fromisoformat(value) for value in values)
+    except (KeyError, TypeError, ValueError) as error:
+        raise VwapBenchmarkError("invalid offline corpus manifest") from error
+
+
 def run_offline_benchmark(
     corpus_dir: Path, timeframe: str
 ) -> tuple[dict[str, object], ...]:
@@ -307,12 +349,9 @@ def run_offline_benchmark(
     manifest_path = corpus_dir / "corpus-manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        dates = tuple(
-            date.fromisoformat(value)
-            for value in manifest["successful_component_dates"]
-        )
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, json.JSONDecodeError) as error:
         raise VwapBenchmarkError("invalid offline corpus manifest") from error
+    dates = _manifest_declared_dates(manifest)
     if not dates or min(dates) < DISCOVERY_START or max(dates) > DISCOVERY_END:
         raise VwapBenchmarkError(
             "Stage 2B accepts only the frozen 2024 discovery corpus"
@@ -323,7 +362,7 @@ def run_offline_benchmark(
         raise VwapBenchmarkError("timeframe must be M5, M15, or H1")
     bars = resample_bars(dataset.bars, target).bars
     observations = build_research_observations(bars, DEFAULT_SESSION_SPEC)
-    research_spec = ResearchSpec(DEFAULT_HORIZONS)
+    research_spec = ResearchSpec(_compatible_horizons(target))
     outcomes = build_forward_outcomes(observations, research_spec)
     rows = []
     for lookback in DEFAULT_VOLATILITY_LOOKBACKS:

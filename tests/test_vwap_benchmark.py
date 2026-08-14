@@ -17,6 +17,10 @@ from mr_lab.research import (
 )
 from mr_lab.sessions import DEFAULT_SESSION_SPEC, SessionSpec, TimeWindow
 from mr_lab.vwap_benchmark import (
+    NORMALIZATION_DEFINITION,
+    RESET_MODE,
+    VWAP_PRICE_DEFINITION,
+    WEIGHT_SEMANTICS,
     VwapBenchmarkError,
     VwapStrategySpec,
     build_vwap_features,
@@ -177,6 +181,22 @@ def test_strategy_identity_is_canonical_sensitive_and_separate() -> None:
     assert "research_spec_id" not in first.to_json()
 
 
+@pytest.mark.parametrize(
+    ("field", "implemented"),
+    (
+        ("vwap_price_definition", VWAP_PRICE_DEFINITION),
+        ("weight_semantics", WEIGHT_SEMANTICS),
+        ("reset_mode", RESET_MODE),
+        ("normalized_deviation_definition", NORMALIZATION_DEFINITION),
+    ),
+)
+def test_strategy_spec_rejects_unimplemented_methodology(
+    field: str, implemented: str
+) -> None:
+    with pytest.raises(VwapBenchmarkError, match=f"unsupported {field}"):
+        VwapStrategySpec(20, 1.5, **{field: f"not-{implemented}"})
+
+
 @pytest.mark.parametrize("timeframe", ["5m", "15m", "1h"])
 def test_timeframes_forward_reuse_signed_outcomes_and_summary(timeframe: str) -> None:
     duration = Timeframe(timeframe).duration
@@ -268,3 +288,56 @@ def test_offline_cli_is_deterministic_and_rejects_holdout_before_loading(
     )
     with pytest.raises(VwapBenchmarkError, match="2024"):
         main(["--corpus-dir", str(corpus), "--timeframe", "M5", "--output", str(first)])
+
+
+def test_h1_cli_emits_only_compatible_default_horizons(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus"
+    synthetic_corpus(corpus)
+    output = tmp_path / "h1.json"
+
+    assert (
+        main(
+            ["--corpus-dir", str(corpus), "--timeframe", "H1", "--output", str(output)]
+        )
+        == 0
+    )
+
+    rows = json.loads(output.read_text())
+    assert {row["forward_horizon_seconds"] for row in rows} == {3600, 7200}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("requested_end_date", "2025-01-01"),
+        ("confirmed_absent_dates", ["2025-01-01"]),
+    ),
+)
+def test_discovery_guard_checks_all_manifest_dates_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str | list[str],
+) -> None:
+    corpus = tmp_path / "corpus"
+    synthetic_corpus(corpus)
+    manifest_path = corpus / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        "mr_lab.vwap_benchmark.load_offline_corpus",
+        lambda _: pytest.fail("loader must not read BI5 for a non-2024 manifest"),
+    )
+
+    with pytest.raises(VwapBenchmarkError, match="2024"):
+        main(
+            [
+                "--corpus-dir",
+                str(corpus),
+                "--timeframe",
+                "M5",
+                "--output",
+                str(tmp_path / "result.json"),
+            ]
+        )
