@@ -5,12 +5,71 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 2A — minimal point-in-time research/event engine
+## Current stage: 2B — session-reset VWAP deviation benchmark
 
-Stages 0 through 1D remain intact. Stage 2A adds immutable research observations,
-a current-bar-only provider-activity semantic, and exact elapsed-clock forward
-labels. It deliberately adds no strategy or executable PnL assumptions: VWAP
-and Bollinger hypotheses remain future work.
+Stages 0 through 2A remain intact. Stage 2B adds the first discovery benchmark:
+a point-in-time, major-session-reset, activity-weighted bar VWAP deviation
+family. It remains statistical BID-data research, not executable PnL, and does
+not introduce costs, optimization, Bollinger Bands, or OU modelling.
+
+## Stage 2B VWAP benchmark semantics
+
+For every research-active bar in each independently active Stage 1C major
+session, the benchmark defines `HLC3 = (high + low + close) / 3` and computes
+`VWAP_t = cumulative(HLC3 * volume) / cumulative(volume)` through the current
+completed bar. Dukascopy volume has `QUOTE_ACTIVITY` semantics, so this is an
+**activity-weighted bar VWAP**, not centralized executed-volume FX VWAP.
+Inactive flat zero-activity filler bars stay in canonical time but neither add
+weight nor generate signals. A price-moving zero-volume bar remains
+research-active and adds zero weight; VWAP is unavailable while cumulative
+weight is zero.
+
+Each stream resets at its Stage 1C major session's historical local start using
+the configured IANA timezone and DST rules. Asia, London, and New York are
+independent anchors. Thus an overlap bar can carry distinct London and New York
+VWAPs while retaining its contextual `active_sessions`, regime, and named
+windows.
+
+The benchmark price is the current close. `relative_deviation = close / VWAP -
+1`, and `vwap_deviation_z = relative_deviation / rolling_volatility`, where
+rolling volatility is the sample standard deviation of exactly the configured
+number of consecutive close-to-close arithmetic bar returns ending at the
+current bar. Both adjacent observations must be research-active for a return;
+the denominator is unavailable during warm-up, across inactive filler, or when
+zero. This explicit rule uses past/current completed bars only and preserves
+prefix invariance.
+
+The frozen discovery grid is M5/M15/H1, exact-clock 15/30/60/120-minute Stage
+2A horizons, thresholds 1.0/1.5/2.0/2.5, and volatility lookbacks 20/40 bars.
+Strict inequalities create LONG below `-threshold` and SHORT above
+`+threshold`; equality creates no signal. Every configuration and direction
+(`all`, `long`, `short`) remains visible and is never profit-ranked.
+
+`VwapStrategySpec` hashes canonical sorted compact JSON with SHA-256. Its
+versioned inputs are HLC3, quote-activity weighting, major-session-instance
+reset, the normalized-deviation formula, lookback, and threshold.
+`strategy_spec_id` remains separate from `dataset_id`, `session_spec_id`, and
+`research_spec_id`.
+
+The offline-only runner reconstructs data exclusively with
+`load_offline_corpus()`, rejects any manifest declaring dates outside the
+frozen 2024 discovery period before reading BI5 components, resamples without
+compressing inactive elapsed time, and emits deterministic compact JSON or CSV
+summaries. It never acquires data:
+
+```bash
+uv run mr-lab-vwap-benchmark \
+  --corpus-dir /path/to/saved-2024-corpus \
+  --timeframe M15 \
+  --output results/stage-2b-m15.json
+```
+
+Summary rows retain all four independent identities, timeframe, anchor,
+threshold, lookback, horizon, and direction, plus signal/LONG/SHORT counts,
+valid and unavailable counts, mean/median signed forward return, win rate,
+sample standard deviation, standard error, a descriptive t-statistic when
+defined, and signals per available UTC research month. A t-statistic alone is
+not a claim of statistical significance.
 
 ## Stage 2A research semantics
 
@@ -280,17 +339,17 @@ boundaries.
 ## Roadmap
 
 - **Stage 1D:** reproducible discovery corpus.
-- **Stage 2A:** point-in-time research observations, provider no-activity
-  semantics, and fixed clock-time forward outcomes.
-- **Stage 2B:** VWAP-deviation mean-reversion benchmark.
-- **Stage 2C:** Bollinger-deviation mean-reversion benchmark.
+- **Stage 2A (completed):** point-in-time research observations, provider
+  no-activity semantics, and fixed clock-time forward outcomes.
+- **Stage 2B (current):** VWAP-deviation mean-reversion benchmark.
+- **Stage 2C (next):** Bollinger-deviation mean-reversion benchmark.
 - **Stage 3:** realistic transaction-cost and execution assumptions.
 - **Stage 4:** broader universe plus out-of-sample and walk-forward evaluation.
 - **Later:** consider OU models only after simple benchmark families justify
   further complexity.
 
 The split remains frozen: **2024 is discovery; 2025 is the untouched future OOS
-holdout.** Stage 2A neither inspects nor acquires 2025.
+holdout.** Stage 2B neither reads, acquires, summarizes, nor analyzes 2025.
 
 ## Foundation and future architecture
 
