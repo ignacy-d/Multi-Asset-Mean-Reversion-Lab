@@ -14,6 +14,7 @@ from mr_lab.vwap_benchmark import (
     VwapBenchmarkError,
     VwapStrategySpec,
     build_vwap_features,
+    signal_direction,
 )
 from mr_lab.vwap_m1_robustness import (
     CANONICAL_M1,
@@ -171,27 +172,42 @@ def test_robustness_identity_is_deterministic_source_sensitive_and_separate() ->
     assert canonical.strategy_spec_id == same.strategy_spec_id
     assert canonical.strategy_spec_id != native.strategy_spec_id
     assert canonical.strategy_spec_id != VwapStrategySpec(20, 1.5).strategy_spec_id
-    assert (
-        VwapStrategySpec(20, 1.5).strategy_spec_id
-        == VwapStrategySpec(20, 1.5).strategy_spec_id
+    # Golden ID produced by the pre-PR Stage 2B implementation at base 942079c.
+    assert VwapStrategySpec(20, 1.5).strategy_spec_id == (
+        "sha256:6aca0e037562736c266ebcf1e8a518383b1a32961dad47082c02d423ad3ce7eb"
     )
     with pytest.raises(VwapBenchmarkError, match="construction"):
         VwapRobustnessStrategySpec(20, 1.5, "daily")
 
 
-def test_frozen_grid_and_native_feature_behavior_are_unchanged() -> None:
+def test_frozen_grid_and_native_feature_golden_regression() -> None:
     assert DEFAULT_THRESHOLDS == (1.0, 1.5, 2.0, 2.5)
     assert DEFAULT_VOLATILITY_LOOKBACKS == (20, 40)
     start = datetime(2024, 1, 2, 8, tzinfo=UTC)
     native = obs(
         [
-            bar(start + timedelta(minutes=5 * i), 100 + i, timeframe="5m")
-            for i in range(3)
+            bar(start, 100, volume=1000, timeframe="5m"),
+            bar(start + timedelta(minutes=5), 101, timeframe="5m"),
+            bar(start + timedelta(minutes=10), 80, timeframe="5m"),
         ]
     )
-    assert build_vwap_features(native, DEFAULT_SESSION_SPEC, 2) == build_vwap_features(
-        native, DEFAULT_SESSION_SPEC, 2
+    london = [
+        feature
+        for feature in build_vwap_features(native, DEFAULT_SESSION_SPEC, 2)
+        if feature.anchor_session == "london"
+    ]
+    latest = london[-1]
+
+    # Golden native-timeframe values produced by Stage 2B at base commit 942079c.
+    assert [feature.vwap for feature in london] == pytest.approx(
+        [100.0, 100_101 / 1001, 100_181 / 1002]
     )
+    assert latest.relative_deviation == pytest.approx(-0.19984827462293242)
+    assert latest.rolling_volatility == pytest.approx(0.15409326984075158)
+    assert latest.vwap_deviation_z == pytest.approx(-1.2969305851544752)
+    assert latest.anchor_session == "london"
+    assert latest.session_instance.isoformat() == "2024-01-02"
+    assert signal_direction(latest, 1.0).name == "LONG"
 
 
 def test_offline_execution_is_deterministic_no_network_and_rejects_2025_first(
