@@ -1,8 +1,7 @@
-"""Parse the verified Dukascopy EURUSD M1 BID candle representation.
+"""Parse verified Dukascopy M1 BID candle representations.
 
-This provider-local module deliberately does not acquire data.  The 24-byte
-record contract is frozen from the 2024-01-02 raw artifact; it is not claimed
-to describe other Dukascopy instruments or files.
+The shared 24-byte record structure and per-instrument scales are verified from
+bounded 2024 samples. This provider-local module does not acquire data.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ from mr_lab.data import (
     resample_bars,
     validate_dataset,
 )
+from mr_lab.providers.instruments import get_instrument_spec
 
 PROVIDER = "Dukascopy"
 INSTRUMENT = "EURUSD"
@@ -56,7 +56,9 @@ def decode_m1_bid_payload(payload: bytes) -> bytes:
     return decoded
 
 
-def parse_decoded_m1_bid_bars(decoded: bytes, requested_day: date) -> tuple[Bar, ...]:
+def parse_decoded_m1_bid_bars(
+    decoded: bytes, requested_day: date, instrument: str = INSTRUMENT
+) -> tuple[Bar, ...]:
     """Convert complete verified records to immutable point-in-time bars."""
     if not isinstance(requested_day, date) or isinstance(requested_day, datetime):
         raise Bi5ParseError("requested_day must be a date")
@@ -65,6 +67,7 @@ def parse_decoded_m1_bid_bars(decoded: bytes, requested_day: date) -> tuple[Bar,
     if len(decoded) % RECORD.size:
         raise Bi5ParseError("decoded BI5 payload contains a partial 24-byte record")
 
+    spec = get_instrument_spec(instrument)
     day_start = datetime.combine(requested_day, datetime.min.time(), tzinfo=UTC)
     bars: list[Bar] = []
     previous_offset: int | None = None
@@ -82,10 +85,10 @@ def parse_decoded_m1_bid_bars(decoded: bytes, requested_day: date) -> tuple[Bar,
         if volume < 0:
             raise Bi5ParseError(f"record {index} volume is negative")
 
-        open_price = open_int / PRICE_SCALE
-        close_price = close_int / PRICE_SCALE
-        low_price = low_int / PRICE_SCALE
-        high_price = high_int / PRICE_SCALE
+        open_price = spec.decode_price(open_int)
+        close_price = spec.decode_price(close_int)
+        low_price = spec.decode_price(low_int)
+        high_price = spec.decode_price(high_int)
         if not all(
             math.isfinite(value)
             for value in (open_price, close_price, low_price, high_price)
@@ -100,7 +103,7 @@ def parse_decoded_m1_bid_bars(decoded: bytes, requested_day: date) -> tuple[Bar,
         close_time = open_time + M1.duration
         bars.append(
             Bar(
-                instrument=INSTRUMENT,
+                instrument=spec.instrument,
                 timeframe=M1,
                 open_time=open_time,
                 close_time=close_time,
@@ -121,17 +124,24 @@ def parse_decoded_m1_bid_bars(decoded: bytes, requested_day: date) -> tuple[Bar,
     return tuple(bars)
 
 
-def parse_m1_bid_bars(payload: bytes, requested_day: date) -> tuple[Bar, ...]:
-    """Decode raw BI5 bytes and return verified EURUSD M1 BID bars."""
-    return parse_decoded_m1_bid_bars(decode_m1_bid_payload(payload), requested_day)
+def parse_m1_bid_bars(
+    payload: bytes, requested_day: date, instrument: str = INSTRUMENT
+) -> tuple[Bar, ...]:
+    """Decode raw BI5 bytes and return verified M1 BID bars."""
+    return parse_decoded_m1_bid_bars(
+        decode_m1_bid_payload(payload), requested_day, instrument
+    )
 
 
-def build_dataset_metadata(payload: bytes, requested_day: date) -> DatasetMetadata:
+def build_dataset_metadata(
+    payload: bytes, requested_day: date, instrument: str = INSTRUMENT
+) -> DatasetMetadata:
     """Build stable canonical metadata whose identity excludes retrieval time."""
+    spec = get_instrument_spec(instrument)
     raw_sha256 = hashlib.sha256(payload).hexdigest()
     identity_inputs = {
         "canonical_schema_version": CANONICAL_SCHEMA_VERSION,
-        "instrument": INSTRUMENT,
+        "instrument": spec.instrument,
         "parser_schema_version": PARSER_SCHEMA_VERSION,
         "price_basis": PriceBasis.BID.value,
         "provider": PROVIDER,
@@ -141,14 +151,16 @@ def build_dataset_metadata(payload: bytes, requested_day: date) -> DatasetMetada
         "timeframe": M1.value,
         "volume_semantics": VOLUME_SEMANTICS.value,
     }
+    if spec.instrument != INSTRUMENT:
+        identity_inputs["instrument_spec"] = spec.as_dict()
     serialized = json.dumps(
         identity_inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
     dataset_id = f"sha256:{hashlib.sha256(serialized).hexdigest()}"
     return DatasetMetadata(
-        source=PROVIDER,
-        instrument=INSTRUMENT,
-        price_basis=PriceBasis.BID,
+        source=spec.provider,
+        instrument=spec.instrument,
+        price_basis=spec.price_basis,
         volume_semantics=VOLUME_SEMANTICS,
         schema_version=CANONICAL_SCHEMA_VERSION,
         dataset_id=dataset_id,
@@ -157,11 +169,14 @@ def build_dataset_metadata(payload: bytes, requested_day: date) -> DatasetMetada
     )
 
 
-def canonicalization_audit(payload: bytes, requested_day: date) -> dict[str, object]:
+def canonicalization_audit(
+    payload: bytes, requested_day: date, instrument: str = INSTRUMENT
+) -> dict[str, object]:
     """Validate, resample, and summarize a payload without storing canonical bars."""
     decoded = decode_m1_bid_payload(payload)
-    bars = parse_decoded_m1_bid_bars(decoded, requested_day)
-    metadata = build_dataset_metadata(payload, requested_day)
+    spec = get_instrument_spec(instrument)
+    bars = parse_decoded_m1_bid_bars(decoded, requested_day, spec.instrument)
+    metadata = build_dataset_metadata(payload, requested_day, spec.instrument)
     report = validate_dataset(bars, metadata)
     results = {
         name: resample_bars(bars, Timeframe(timeframe))
@@ -174,6 +189,8 @@ def canonicalization_audit(payload: bytes, requested_day: date) -> dict[str, obj
         "compressed_byte_length": len(payload),
         "decoded_byte_length": len(decoded),
         "parser_schema_version": PARSER_SCHEMA_VERSION,
+        "price_scale": spec.price_scale,
+        "price_precision": spec.price_precision,
         "canonical_schema_version": metadata.schema_version,
         "dataset_id": metadata.dataset_id,
         "instrument": metadata.instrument,
@@ -209,6 +226,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--date", type=date.fromisoformat, required=True)
+    parser.add_argument("--instrument", default="EURUSD")
     parser.add_argument("--expected-sha256", required=True)
     parser.add_argument("--audit-output", type=Path, required=True)
     args = parser.parse_args()
@@ -219,7 +237,7 @@ def main() -> None:
             "raw SHA-256 mismatch: "
             f"expected {args.expected_sha256}, got {actual_sha256}"
         )
-    audit = canonicalization_audit(payload, args.date)
+    audit = canonicalization_audit(payload, args.date, args.instrument)
     expected = {"m1_count": 1440, "gap_count": 0}
     for key, value in expected.items():
         if audit[key] != value:
