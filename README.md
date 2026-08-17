@@ -5,12 +5,40 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 2C — rolling Bollinger deviation benchmark
+## Current stage: VWAP construction robustness
 
-Stages 0 through 2B remain intact. Stage 2C adds the second simple discovery
-benchmark: point-in-time rolling Bollinger deviation mean reversion. It remains
-statistical BID-data research, not executable PnL, and introduces neither costs,
-optimization, strategy confluence, nor OU modelling.
+Stage 2B is the completed native-timeframe session VWAP benchmark and Stage 2C
+is the completed Bollinger benchmark. The current narrow robustness stage compares
+the unchanged native-timeframe VWAP with canonical-M1 session VWAP sampled onto
+M5, M15, and H1 completed observations. Next is multi-asset/session replication;
+costs and execution are later, and OU work remains later still unless simple
+benchmark families justify it. The 2025 out-of-sample holdout remains untouched.
+
+## Canonical-M1 VWAP construction robustness
+
+The alternative equilibrium applies the unchanged Stage 2B HLC3 and quote-activity
+formula independently to each Stage 1C session instance, but uses canonical M1 bars.
+At a research observation available at `T`, its session-instance VWAP includes only
+M1 observations with `available_at <= T`; no value is carried between session
+instances or between overlapping London/New York streams. Native research-bar
+volatility, signal boundaries, thresholds, lookbacks, and exact-clock outcomes stay
+frozen. The separate robustness identity records `vwap_construction_source` as
+`canonical_m1` or `native_timeframe` without changing historical Stage 2B IDs.
+
+The offline-only runner validates the complete manifest date declaration before
+loading any component and writes separate results:
+
+```bash
+uv run mr-lab-vwap-m1-robustness \
+  --corpus-dir /path/to/saved-2024-corpus \
+  --timeframe M15 \
+  --output results/stage-2b-vwap-m1-robustness-2024-m15.json
+```
+
+The manually dispatched
+`.github/workflows/run-stage-2b-vwap-m1-robustness-real-2024.yml` workflow reuses
+the frozen Stage 1D artifact without contacting Dukascopy and emits an independent
+audit and artifact.
 
 ## Stage 2C Bollinger benchmark semantics
 
