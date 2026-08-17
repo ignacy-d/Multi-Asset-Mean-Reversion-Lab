@@ -1,0 +1,156 @@
+name: Run Stage 2B canonical-M1 VWAP robustness real 2024
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Require the main branch
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "This workflow must be dispatched from the main branch." >&2
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install locked development environment
+        run: uv sync --locked --dev
+
+      - name: Download and extract the frozen Stage 1D artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARTIFACT_ID: "9202006993"
+          SOURCE_WORKFLOW_RUN_ID: "31746932310"
+          SOURCE_ARTIFACT_NAME: dukascopy-eurusd-m1-bid-2024-01-01-2024-12-31
+        run: |
+          set -euo pipefail
+          mkdir -p artifact-download corpus-extracted
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}" \
+            > artifact-download/metadata.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = json.loads(
+              Path("artifact-download/metadata.json").read_text(encoding="utf-8")
+          )
+          expected_id = int(os.environ["SOURCE_ARTIFACT_ID"])
+          expected_run_id = int(os.environ["SOURCE_WORKFLOW_RUN_ID"])
+          expected_name = os.environ["SOURCE_ARTIFACT_NAME"]
+          if metadata.get("id") != expected_id:
+              raise SystemExit("downloaded artifact metadata has an unexpected ID")
+          if metadata.get("name") != expected_name:
+              raise SystemExit("downloaded artifact metadata has an unexpected name")
+          if metadata.get("expired") is not False:
+              raise SystemExit(f"artifact {expected_id} is expired")
+          workflow_run = metadata.get("workflow_run") or {}
+          if workflow_run.get("id") != expected_run_id:
+              raise SystemExit("artifact originates from an unexpected workflow run")
+          PY
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" \
+            > artifact-download/stage-1d.zip
+          unzip -q artifact-download/stage-1d.zip -d corpus-extracted
+
+          mapfile -d '' manifests < <(
+            find corpus-extracted -type f -name corpus-manifest.json -print0
+          )
+          if [[ ${#manifests[@]} -ne 1 ]]; then
+            echo "Expected exactly one corpus-manifest.json; found ${#manifests[@]}." >&2
+            exit 1
+          fi
+          corpus_dir="$(dirname "${manifests[0]}")"
+          printf 'CORPUS_DIR=%s\n' "$corpus_dir" >> "$GITHUB_ENV"
+
+      - name: Run the canonical-M1 robustness grid
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          uv run mr-lab-vwap-m1-robustness \
+            --corpus-dir "$CORPUS_DIR" \
+            --timeframe M5 \
+            --output results/stage-2b-vwap-m1-robustness-2024-m5.json
+          uv run mr-lab-vwap-m1-robustness \
+            --corpus-dir "$CORPUS_DIR" \
+            --timeframe M15 \
+            --output results/stage-2b-vwap-m1-robustness-2024-m15.json
+          uv run mr-lab-vwap-m1-robustness \
+            --corpus-dir "$CORPUS_DIR" \
+            --timeframe H1 \
+            --output results/stage-2b-vwap-m1-robustness-2024-h1.json
+
+      - name: Write deterministic execution audit
+        env:
+          SOURCE_ARTIFACT_ID: "9202006993"
+          SOURCE_WORKFLOW_RUN_ID: "31746932310"
+        run: |
+          set -euo pipefail
+          SOURCE_MAIN_COMMIT_SHA="$(git rev-parse HEAD)"
+          export SOURCE_MAIN_COMMIT_SHA
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(
+              (Path(os.environ["CORPUS_DIR"]) / "corpus-manifest.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          result_names = (
+              "stage-2b-vwap-m1-robustness-2024-m5.json",
+              "stage-2b-vwap-m1-robustness-2024-m15.json",
+              "stage-2b-vwap-m1-robustness-2024-h1.json",
+          )
+          result_hashes = {
+              name: hashlib.sha256((Path("results") / name).read_bytes()).hexdigest()
+              for name in result_names
+          }
+          audit = {
+              "assembled_dataset_id": manifest["assembled_dataset_id"],
+              "corpus_id": manifest["corpus_id"],
+              "requested_end_date": manifest["requested_end_date"],
+              "requested_start_date": manifest["requested_start_date"],
+              "result_files": list(result_names),
+              "result_sha256": result_hashes,
+              "source_artifact_id": int(os.environ["SOURCE_ARTIFACT_ID"]),
+              "source_main_commit_sha": os.environ["SOURCE_MAIN_COMMIT_SHA"],
+              "source_workflow_run_id": int(os.environ["SOURCE_WORKFLOW_RUN_ID"]),
+          }
+          Path("results/stage-2b-vwap-m1-robustness-execution-audit.json").write_text(
+              json.dumps(audit, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload real 2024 benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-2b-vwap-m1-robustness-real-2024
+          path: |
+            results/stage-2b-vwap-m1-robustness-2024-m5.json
+            results/stage-2b-vwap-m1-robustness-2024-m15.json
+            results/stage-2b-vwap-m1-robustness-2024-h1.json
+            results/stage-2b-vwap-m1-robustness-execution-audit.json
+          if-no-files-found: error
+          retention-days: 14
