@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = []
 
 [project.scripts]
+mr-lab-bollinger-benchmark = "mr_lab.bollinger_benchmark:main"
 mr-lab-vwap-benchmark = "mr_lab.vwap_benchmark:main"
 
 [dependency-groups]

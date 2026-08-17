@@ -5,12 +5,63 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: 2B — session-reset VWAP deviation benchmark
+## Current stage: 2C — rolling Bollinger deviation benchmark
 
-Stages 0 through 2A remain intact. Stage 2B adds the first discovery benchmark:
-a point-in-time, major-session-reset, activity-weighted bar VWAP deviation
-family. It remains statistical BID-data research, not executable PnL, and does
-not introduce costs, optimization, Bollinger Bands, or OU modelling.
+Stages 0 through 2B remain intact. Stage 2C adds the second simple discovery
+benchmark: point-in-time rolling Bollinger deviation mean reversion. It remains
+statistical BID-data research, not executable PnL, and introduces neither costs,
+optimization, strategy confluence, nor OU modelling.
+
+## Stage 2C Bollinger benchmark semantics
+
+For each M5, M15, and H1 observation, the equilibrium is the arithmetic mean of
+CLOSE over exactly 20 or 40 consecutive canonical observations ending at the
+current completed bar. Dispersion is the sample standard deviation of those
+same CLOSE values, and `bollinger_z = (close - middle) / sample_stddev`. A zero
+dispersion makes the feature unavailable.
+
+Every observation in the window must be Stage 2A research-active. An inactive
+flat zero-volume filler remains in canonical time, invalidates any required
+window containing it, and is never skipped or allowed to signal. A moving
+zero-volume bar remains active. Consequently the implementation neither
+compresses elapsed time nor reaches farther into history across inactive gaps.
+
+The frozen discovery grid is lookbacks 20/40 and absolute z thresholds
+1.0/1.5/2.0/2.5. Strict inequalities generate LONG below the negative threshold
+and SHORT above the positive threshold; equality does not signal. Exact-clock
+Stage 2A outcomes are 15/30/60/120 minutes for M5 and M15, and only 60/120
+minutes for H1.
+
+Unlike Stage 2B, session membership does not anchor or reset the Bollinger
+equilibrium. Existing Stage 1C Asia, London, and New York memberships are only
+contextual breakdowns. Because memberships are independent and overlap, a
+signal can legitimately contribute to both London and New York summaries;
+these counts are not a mutually exclusive partition. Named-window labels remain
+attached to the underlying research observations for later work.
+
+`BollingerStrategySpec` freezes CLOSE, arithmetic rolling mean, sample CLOSE
+standard deviation, and the consecutive-active canonical-window rule. It hashes
+canonical sorted compact JSON with SHA-256, independently of dataset, session,
+and research identities. Output provides unranked overall and contextual rows,
+all/long/short directions, counts, exact-clock availability, mean/median signed
+return, win rate, sample standard deviation, standard error, descriptive
+t-statistic, available months, and normalized monthly frequency. The
+t-statistic alone is not a significance claim.
+
+The offline runner checks every manifest request, successful/absent, and
+component date against the frozen 2024 discovery interval before calling
+`load_offline_corpus()`; it never acquires data:
+
+```bash
+uv run mr-lab-bollinger-benchmark \
+  --corpus-dir /path/to/saved-2024-corpus \
+  --timeframe M15 \
+  --output results/stage-2c-2024-m15.json
+```
+
+The manual `.github/workflows/run-stage-2c-real-2024.yml` workflow reuses the
+frozen Stage 1D artifact and emits separate Stage 2C M5/M15/H1 artifacts without
+modifying Stage 2B results.
 
 ## Stage 2B VWAP benchmark semantics
 
@@ -339,17 +390,18 @@ boundaries.
 ## Roadmap
 
 - **Stage 1D:** reproducible discovery corpus.
-- **Stage 2A (completed):** point-in-time research observations, provider
-  no-activity semantics, and fixed clock-time forward outcomes.
-- **Stage 2B (current):** VWAP-deviation mean-reversion benchmark.
-- **Stage 2C (next):** Bollinger-deviation mean-reversion benchmark.
-- **Stage 3:** realistic transaction-cost and execution assumptions.
-- **Stage 4:** broader universe plus out-of-sample and walk-forward evaluation.
-- **Later:** consider OU models only after simple benchmark families justify
-  further complexity.
+- **Stage 2A (completed):** point-in-time research engine.
+- **Stage 2B (completed):** session-reset VWAP deviation benchmark.
+- **Stage 2C (current):** rolling Bollinger deviation benchmark.
+- **Next:** VWAP construction robustness: native-timeframe session VWAP versus
+  canonical-M1 session VWAP sampled on research timeframes.
+- **Then:** multi-asset and session replication.
+- **Later:** realistic costs and execution assumptions.
+- **Later:** consider OU only if simple benchmark families justify it.
+- **Protected:** out-of-sample and walk-forward evaluation remains untouched.
 
 The split remains frozen: **2024 is discovery; 2025 is the untouched future OOS
-holdout.** Stage 2B neither reads, acquires, summarizes, nor analyzes 2025.
+holdout.** Stage 2C neither reads, acquires, summarizes, nor analyzes 2025.
 
 ## Foundation and future architecture
 
