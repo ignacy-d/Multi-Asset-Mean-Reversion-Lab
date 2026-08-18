@@ -59,6 +59,13 @@ uv run mr-lab-replicate \
   --canonical-m1-vwap
 ```
 
+The runner writes one deterministic JSON document for every construction and
+timeframe (nine documents when canonical-M1 robustness is enabled), followed by
+a compact Markdown inventory. The inventory deliberately displays the
+predeclared USDJPY natural sessions Asia and New York first, then London and any
+remaining contexts; it retains links to every unranked result document and does
+not alter or interpret the frozen benchmark rows.
+
 Later work remains realistic transaction costs and execution semantics,
 dependence-aware/event-level trade construction, OU quality filtering only if
 simple families justify it, protected OOS/walk-forward, portfolio risk, Monte
