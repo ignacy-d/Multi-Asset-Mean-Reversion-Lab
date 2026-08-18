@@ -13,6 +13,12 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from mr_lab.providers.instruments import (
+    ProviderInstrumentSpec,
+    get_candidate_instrument_spec,
+    get_instrument_spec,
+)
+
 HOST = "datafeed.dukascopy.com"
 PROVIDER = "Dukascopy"
 _TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
@@ -29,9 +35,12 @@ class ProviderNoData(AcquisitionError):
 
 def build_url(instrument: str, day: date) -> str:
     """Build the public M1 BID candle URL (provider months are zero based)."""
-    normalized = instrument.strip().upper()
-    if normalized != "EURUSD":
-        raise ValueError("Stage 1A-R acquisition is bounded to EURUSD")
+    spec = get_instrument_spec(instrument)
+    return _build_url(spec, day)
+
+
+def _build_url(spec: ProviderInstrumentSpec, day: date) -> str:
+    normalized = spec.provider_symbol
     return (
         f"https://{HOST}/datafeed/{normalized}/{day.year:04d}/"
         f"{day.month - 1:02d}/{day.day:02d}/BID_candles_min_1.bi5"
@@ -68,13 +77,35 @@ def make_provenance(
     url: str,
     http_status: int,
     decoded_byte_length: int,
+    instrument: str = "EURUSD",
 ) -> dict[str, object]:
     """Build audit metadata; retrieval time is provenance, not the SHA-256."""
+    return _make_provenance(
+        payload,
+        requested_day,
+        url,
+        http_status,
+        decoded_byte_length,
+        get_instrument_spec(instrument),
+    )
+
+
+def _make_provenance(
+    payload: bytes,
+    requested_day: date,
+    url: str,
+    http_status: int,
+    decoded_byte_length: int,
+    spec: ProviderInstrumentSpec,
+) -> dict[str, object]:
     return {
-        "provider": PROVIDER,
+        "provider": spec.provider,
         "host": HOST,
         "requested_url": url,
-        "canonical_instrument": "EURUSD",
+        "canonical_instrument": spec.instrument,
+        "provider_symbol": spec.provider_symbol,
+        "price_scale": spec.price_scale,
+        "price_precision": spec.price_precision,
         "source_timeframe": "M1",
         "price_side": "BID",
         "requested_date": requested_day.isoformat(),
@@ -101,11 +132,59 @@ def acquire(
     getter: Callable[[str, float], tuple[int, bytes]] = _get,
     sleeper: Callable[[float], None] = time.sleep,
     logger: Callable[[str], None] = print,
+    instrument: str = "EURUSD",
 ) -> tuple[Path, Path]:
     """GET one frozen day and write its payload and provenance."""
+    return _acquire_with_spec(
+        output_dir,
+        requested_day,
+        get_instrument_spec(instrument),
+        timeout=timeout,
+        retries=retries,
+        getter=getter,
+        sleeper=sleeper,
+        logger=logger,
+    )
+
+
+def acquire_verification_sample(
+    output_dir: Path,
+    requested_day: date,
+    instrument: str,
+    *,
+    timeout: float = 30.0,
+    retries: int = 6,
+    getter: Callable[[str, float], tuple[int, bytes]] = _get,
+    sleeper: Callable[[float], None] = time.sleep,
+    logger: Callable[[str], None] = print,
+) -> tuple[Path, Path]:
+    """Acquire one candidate instrument solely for bounded format verification."""
+    return _acquire_with_spec(
+        output_dir,
+        requested_day,
+        get_candidate_instrument_spec(instrument),
+        timeout=timeout,
+        retries=retries,
+        getter=getter,
+        sleeper=sleeper,
+        logger=logger,
+    )
+
+
+def _acquire_with_spec(
+    output_dir: Path,
+    requested_day: date,
+    spec: ProviderInstrumentSpec,
+    *,
+    timeout: float,
+    retries: int,
+    getter: Callable[[str, float], tuple[int, bytes]],
+    sleeper: Callable[[float], None],
+    logger: Callable[[str], None],
+) -> tuple[Path, Path]:
     if retries < 0:
         raise ValueError("retries must be non-negative")
-    url = build_url("EURUSD", requested_day)
+    url = _build_url(spec, requested_day)
     total_attempts = retries + 1
     for attempt in range(total_attempts):
         try:
@@ -144,15 +223,16 @@ def acquire(
         sleeper(backoff)
 
     decoded_byte_length = validate_payload(payload)
-    metadata = make_provenance(
-        payload=payload,
-        requested_day=requested_day,
-        url=url,
-        http_status=status,
-        decoded_byte_length=decoded_byte_length,
+    metadata = _make_provenance(
+        payload,
+        requested_day,
+        url,
+        status,
+        decoded_byte_length,
+        spec,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"EURUSD-{requested_day.isoformat()}-M1-BID"
+    stem = f"{spec.instrument}-{requested_day.isoformat()}-M1-BID"
     raw_path = output_dir / f"{stem}.bi5"
     metadata_path = output_dir / f"{stem}.json"
     if raw_path.exists() or metadata_path.exists():
@@ -169,8 +249,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", type=date.fromisoformat, default=date(2024, 1, 2))
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--instrument", default="EURUSD")
     args = parser.parse_args()
-    raw_path, metadata_path = acquire(args.output_dir, args.date)
+    raw_path, metadata_path = acquire(
+        args.output_dir, args.date, instrument=args.instrument
+    )
     print(f"raw_payload={raw_path}")
     print(f"metadata={metadata_path}")
 

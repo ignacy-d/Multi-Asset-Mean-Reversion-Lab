@@ -3,6 +3,17 @@ name: Acquire historical corpus
 on:
   workflow_dispatch:
     inputs:
+      instrument:
+        description: Canonical FX instrument
+        required: true
+        default: EURUSD
+        type: choice
+        options:
+          - EURUSD
+          - GBPUSD
+          - USDJPY
+          - AUDUSD
+          - AUDJPY
       start_date:
         description: Inclusive UTC start date (YYYY-MM-DD)
         required: true
@@ -31,16 +42,17 @@ jobs:
           python-version: "3.12"
       - name: Install locked development environment
         run: uv sync --locked --dev
-      - name: Acquire, validate, assemble, and audit EURUSD M1 BID range
+      - name: Acquire, validate, assemble, and audit selected M1 BID range
         run: >-
           uv run python -m mr_lab.providers.dukascopy_range
+          --instrument "${{ inputs.instrument }}"
           --start-date "${{ inputs.start_date }}"
           --end-date "${{ inputs.end_date }}"
           --output-dir data/raw/stage-1d-corpus
       - name: Upload immutable raw snapshots, provenance, and corpus audit
         uses: actions/upload-artifact@v4
         with:
-          name: dukascopy-eurusd-m1-bid-${{ inputs.start_date }}-${{ inputs.end_date }}
+          name: dukascopy-${{ inputs.instrument }}-m1-bid-${{ inputs.start_date }}-${{ inputs.end_date }}
           path: data/raw/stage-1d-corpus/
           if-no-files-found: error
           retention-days: 14

@@ -19,6 +19,7 @@ from mr_lab.providers.dukascopy_bi5 import (
     build_dataset_metadata,
     parse_m1_bid_bars,
 )
+from mr_lab.providers.instruments import get_instrument_spec
 
 MANIFEST_SCHEMA_VERSION = "dukascopy-multiday-manifest-v1"
 
@@ -33,6 +34,7 @@ class DailyPayload:
 
     requested_day: date
     payload: bytes
+    instrument: str = INSTRUMENT
 
     def __post_init__(self) -> None:
         if not isinstance(self.requested_day, date) or isinstance(
@@ -41,6 +43,11 @@ class DailyPayload:
             raise MultiDayAssemblyError("requested_day must be a date")
         if not isinstance(self.payload, bytes):
             raise MultiDayAssemblyError("payload must be immutable bytes")
+        try:
+            spec = get_instrument_spec(self.instrument)
+        except ValueError as error:
+            raise MultiDayAssemblyError(str(error)) from error
+        object.__setattr__(self, "instrument", spec.instrument)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +139,13 @@ def assemble_daily_payloads(
     if any(not isinstance(item, DailyPayload) for item in inputs):
         raise MultiDayAssemblyError("all inputs must be DailyPayload instances")
 
+    instruments = {item.instrument for item in inputs}
+    if len(instruments) != 1:
+        raise MultiDayAssemblyError(
+            "daily payloads must contain exactly one instrument"
+        )
+    spec = get_instrument_spec(instruments.pop())
+
     ordered = sorted(inputs, key=lambda item: item.requested_day)
     days = [item.requested_day for item in ordered]
     if len(days) != len(set(days)):
@@ -141,8 +155,12 @@ def assemble_daily_payloads(
     bars: list[Bar] = []
     for item in ordered:
         # Stage 1A remains the sole BI5 decoder and daily identity implementation.
-        daily_bars = parse_m1_bid_bars(item.payload, item.requested_day)
-        daily_metadata = build_dataset_metadata(item.payload, item.requested_day)
+        daily_bars = parse_m1_bid_bars(
+            item.payload, item.requested_day, item.instrument
+        )
+        daily_metadata = build_dataset_metadata(
+            item.payload, item.requested_day, item.instrument
+        )
         validate_dataset(daily_bars, daily_metadata)
         components.append(
             ComponentDay(
@@ -156,7 +174,7 @@ def assemble_daily_payloads(
     identity_inputs = {
         "canonical_schema_version": CANONICAL_SCHEMA_VERSION,
         "components": [component.as_dict() for component in components],
-        "instrument": INSTRUMENT,
+        "instrument": spec.instrument,
         "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
         "native_timeframe": M1.value,
         "parser_schema_version": PARSER_SCHEMA_VERSION,
@@ -165,12 +183,14 @@ def assemble_daily_payloads(
         "source_timezone": SOURCE_TIMEZONE,
         "volume_semantics": VOLUME_SEMANTICS.value,
     }
+    if spec.instrument != INSTRUMENT:
+        identity_inputs["instrument_spec"] = spec.as_dict()
     dataset_id = (
         f"sha256:{hashlib.sha256(_canonical_json(identity_inputs)).hexdigest()}"
     )
     metadata = DatasetMetadata(
-        source=PROVIDER,
-        instrument=INSTRUMENT,
+        source=spec.provider,
+        instrument=spec.instrument,
         price_basis=daily_metadata.price_basis,
         volume_semantics=VOLUME_SEMANTICS,
         schema_version=CANONICAL_SCHEMA_VERSION,

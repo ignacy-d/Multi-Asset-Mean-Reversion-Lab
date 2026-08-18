@@ -17,7 +17,6 @@ from mr_lab.providers.dukascopy_bi5 import (
     CANONICAL_SCHEMA_VERSION,
     INSTRUMENT,
     PARSER_SCHEMA_VERSION,
-    PROVIDER,
     SOURCE_TIMEZONE,
     VOLUME_SEMANTICS,
 )
@@ -26,8 +25,10 @@ from mr_lab.providers.dukascopy_multiday import (
     MultiDayDataset,
     assemble_daily_payloads,
 )
+from mr_lab.providers.instruments import get_instrument_spec
 
 CORPUS_SCHEMA_VERSION = "dukascopy-eurusd-corpus-v1"
+GENERIC_CORPUS_SCHEMA_VERSION = "dukascopy-multi-asset-corpus-v1"
 MAX_CALENDAR_DAYS = 370
 DISCOVERY_START = date(2024, 1, 1)
 DISCOVERY_END = date(2024, 12, 31)
@@ -50,6 +51,9 @@ def load_offline_corpus(corpus_dir: Path) -> MultiDayDataset:
         )
         components = manifest["components"]
         expected_dataset_id = manifest["assembled_dataset_id"]
+        instrument = get_instrument_spec(
+            manifest.get("instrument", INSTRUMENT)
+        ).instrument
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
         raise RangeAcquisitionError(
             "invalid or missing offline corpus manifest"
@@ -63,7 +67,7 @@ def load_offline_corpus(corpus_dir: Path) -> MultiDayDataset:
     }
     payloads = []
     for day in dates:
-        stem = f"EURUSD-{day.isoformat()}-M1-BID"
+        stem = f"{instrument}-{day.isoformat()}-M1-BID"
         try:
             raw = (corpus_dir / f"{stem}.bi5").read_bytes()
             provenance = json.loads(
@@ -77,12 +81,13 @@ def load_offline_corpus(corpus_dir: Path) -> MultiDayDataset:
         digest = hashlib.sha256(raw).hexdigest()
         if (
             provenance.get("requested_date") != day.isoformat()
+            or provenance.get("canonical_instrument", INSTRUMENT) != instrument
             or provenance.get("sha256") != digest
         ):
             raise RangeAcquisitionError(f"provenance mismatch for {day}")
         if component.get("raw_sha256") != digest:
             raise RangeAcquisitionError(f"manifest payload hash mismatch for {day}")
-        payloads.append(DailyPayload(day, raw))
+        payloads.append(DailyPayload(day, raw, instrument))
     try:
         dataset = assemble_daily_payloads(payloads)
     except (OSError, ValueError) as error:
@@ -127,10 +132,15 @@ class CorpusManifest:
     def identity_inputs(self) -> dict[str, object]:
         """Return all and only stable inputs to the corpus identity."""
         assembled = self.dataset.manifest
-        return {
-            "corpus_schema_version": CORPUS_SCHEMA_VERSION,
-            "provider": PROVIDER,
-            "instrument": INSTRUMENT,
+        spec = get_instrument_spec(self.dataset.metadata.instrument)
+        values = {
+            "corpus_schema_version": (
+                CORPUS_SCHEMA_VERSION
+                if spec.instrument == INSTRUMENT
+                else GENERIC_CORPUS_SCHEMA_VERSION
+            ),
+            "provider": spec.provider,
+            "instrument": spec.instrument,
             "requested_start_date": self.requested_start_date.isoformat(),
             "requested_end_date": self.requested_end_date.isoformat(),
             "requested_calendar_day_count": len(
@@ -160,6 +170,9 @@ class CorpusManifest:
             "volume_semantics": VOLUME_SEMANTICS.value,
             "source_timezone": SOURCE_TIMEZONE,
         }
+        if spec.instrument != INSTRUMENT:
+            values["instrument_spec"] = spec.as_dict()
+        return values
 
     @property
     def corpus_id(self) -> str:
@@ -185,10 +198,14 @@ def build_corpus_manifest(
     end_date: date,
     successful_payloads: Iterable[DailyPayload],
     confirmed_absent_dates: Iterable[date],
+    instrument: str = INSTRUMENT,
 ) -> CorpusManifest:
     """Assemble successful days and bind them to the complete range request."""
     requested = enumerate_dates(start_date, end_date)
+    spec = get_instrument_spec(instrument)
     payloads = tuple(successful_payloads)
+    if any(item.instrument != spec.instrument for item in payloads):
+        raise RangeAcquisitionError("successful payload instrument mismatch")
     absent = tuple(sorted(confirmed_absent_dates))
     successful_dates = tuple(sorted(item.requested_day for item in payloads))
     if len(absent) != len(set(absent)):
@@ -222,6 +239,7 @@ def acquire_range(
     acquire_day: Callable[..., tuple[Path, Path]] = acquire,
     sleeper: Callable[[float], None] = time.sleep,
     logger: Callable[[str], None] = print,
+    instrument: str = INSTRUMENT,
 ) -> RangeAcquisitionResult:
     """Sequentially acquire, validate, assemble, and audit an inclusive range.
 
@@ -229,6 +247,11 @@ def acquire_range(
     transport, server, payload, parsing, or assembly error propagates and fails
     the request. No bars or dates are synthesized.
     """
+    spec = get_instrument_spec(instrument)
+    if start_date < DISCOVERY_START or end_date > DISCOVERY_END:
+        raise RangeAcquisitionError(
+            "Stage 3 acquisition accepts only 2024 discovery dates"
+        )
     days = enumerate_dates(start_date, end_date)
     if delay_seconds < 0:
         raise RangeAcquisitionError("delay_seconds must be non-negative")
@@ -240,20 +263,23 @@ def acquire_range(
         progress = f"[{index + 1}/{len(days)}]"
         logger(f"{progress} acquiring {day.isoformat()}")
         try:
-            raw_path, provenance_path = acquire_day(
-                output_dir, day, timeout=timeout, retries=retries
-            )
+            kwargs = {"timeout": timeout, "retries": retries}
+            if spec.instrument != INSTRUMENT:
+                kwargs["instrument"] = spec.instrument
+            raw_path, provenance_path = acquire_day(output_dir, day, **kwargs)
         except ProviderNoData:
             absent.append(day)
             logger(f"{progress} absent {day.isoformat()}")
         else:
             raw_paths.append(raw_path)
             provenance_paths.append(provenance_path)
-            payloads.append(DailyPayload(day, raw_path.read_bytes()))
+            payloads.append(DailyPayload(day, raw_path.read_bytes(), spec.instrument))
         if delay_seconds and index != len(days) - 1:
             sleeper(delay_seconds)
 
-    manifest = build_corpus_manifest(start_date, end_date, payloads, absent)
+    manifest = build_corpus_manifest(
+        start_date, end_date, payloads, absent, spec.instrument
+    )
     manifest_path = output_dir / "corpus-manifest.json"
     if manifest_path.exists():
         raise RangeAcquisitionError("refusing to overwrite an existing corpus manifest")
@@ -272,6 +298,7 @@ def main() -> None:
     parser.add_argument("--start-date", type=date.fromisoformat, required=True)
     parser.add_argument("--end-date", type=date.fromisoformat, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--instrument", default=INSTRUMENT)
     parser.add_argument("--delay-seconds", type=float, default=1.0)
     args = parser.parse_args()
     result = acquire_range(
@@ -279,6 +306,7 @@ def main() -> None:
         args.start_date,
         args.end_date,
         delay_seconds=args.delay_seconds,
+        instrument=args.instrument,
     )
     print(f"corpus_manifest={result.manifest_path}")
     print(f"corpus_id={result.manifest.corpus_id}")
