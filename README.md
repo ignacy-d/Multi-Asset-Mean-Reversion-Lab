@@ -66,11 +66,13 @@ predeclared USDJPY natural sessions Asia and New York first, then London and any
 remaining contexts; it retains links to every unranked result document and does
 not alter or interpret the frozen benchmark rows.
 
-The manual `run-stage-3b-usdjpy-real-2024.yml` workflow pins the completed
-USDJPY full-year corpus artifact and its originating run, executes this exact
-command without provider access, verifies all nine result identities, and
-uploads the JSON documents, comparison report, and execution audit as one
-immutable GitHub Actions artifact.
+The PR-branch executable `run-stage-3b-usdjpy-real-2024.yml` workflow pins the
+completed USDJPY full-year corpus artifact and its originating run, executes
+this exact command without provider access, verifies all nine result identities,
+and uploads the JSON documents, comparison report, and execution audit as one
+immutable GitHub Actions artifact. Its pull-request trigger is restricted to
+same-repository PR #20; `workflow_dispatch` remains available after the workflow
+reaches the default branch.
 
 Later work remains realistic transaction costs and execution semantics,
 dependence-aware/event-level trade construction, OU quality filtering only if

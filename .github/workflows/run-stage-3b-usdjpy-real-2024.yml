@@ -2,6 +2,8 @@ name: Run Stage 3B USDJPY real 2024 replication
 
 on:
   workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -9,6 +11,10 @@ permissions:
 
 jobs:
   replicate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.number == 20 &&
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -168,4 +174,3 @@ jobs:
           path: results/stage-3b-usdjpy/
           if-no-files-found: error
           retention-days: 90
-
