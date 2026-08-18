@@ -5,14 +5,64 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
-## Current stage: VWAP construction robustness
+## Current stage: Stage 3A multi-asset data enablement
 
-Stage 2B is the completed native-timeframe session VWAP benchmark and Stage 2C
-is the completed Bollinger benchmark. The current narrow robustness stage compares
-the unchanged native-timeframe VWAP with canonical-M1 session VWAP sampled onto
-M5, M15, and H1 completed observations. Next is multi-asset/session replication;
-costs and execution are later, and OU work remains later still unless simple
-benchmark families justify it. The 2025 out-of-sample holdout remains untouched.
+Completed work comprises Stage 0A–1D foundation, canonical data, validation,
+sessions and frozen corpus infrastructure; the Stage 2A point-in-time research
+engine; the frozen Stage 2B VWAP and Stage 2C Bollinger benchmarks; and the
+canonical-M1 VWAP construction robustness path. Stage 3A now makes the provider
+and data boundary explicitly multi-asset while leaving all strategy arithmetic,
+sessions, thresholds, lookbacks, and horizons unchanged.
+
+The initial candidate universe is exactly EURUSD, GBPUSD, USDJPY, AUDUSD, and
+AUDJPY. Immutable `ProviderInstrumentSpec` values bind the canonical and provider
+symbols, candidate integer price scale and decimal precision, native M1 timeframe,
+BID basis, QUOTE_ACTIVITY volume semantics, Dukascopy identity, and an explicit
+verification state. EURUSD remains production-verified at scale 100,000 (five
+decimals). GBPUSD and AUDUSD declare unverified candidates of 100,000/five;
+USDJPY and AUDJPY declare unverified candidates of 1,000/three. Normal
+acquisition, canonicalization, corpus assembly, and replication fail closed for
+those candidates until bounded real-provider verification has succeeded and the
+specification is deliberately promoted. No research module infers these values.
+
+Stage 3A verification is deliberately bounded to one public 2024-01-02 M1 BID
+file for each new instrument. The pull-request and manually dispatched
+`verify-stage-3a-instruments.yml` workflow checks URL resolution, LZMA decompression, whole
+24-byte records, candidate scaling, plausible positive OHLC, metadata,
+nonnegative quote activity, M1 construction, and generic resampling. This is the
+only path allowed to use unverified candidates, and it creates no strategy
+results. A successful run verifies the sample but does not silently mutate source
+or promote production eligibility. The same date can be checked locally with:
+
+```bash
+uv run python -m mr_lab.providers.verify_instruments \
+  --output-dir data/raw/stage-3a-verification
+```
+
+New-instrument daily, assembled, and corpus identities include the complete
+instrument spec in canonical sorted compact JSON before SHA-256 hashing. A
+corpus contains exactly one instrument and mixed components fail explicitly.
+The legacy EURUSD identity schemas and hash inputs are retained byte-for-byte,
+so historical EURUSD IDs and result artifacts do not change.
+
+Stage 3B is next: frozen 2024 multi-asset/session replication. Given one already
+frozen corpus, the reusable runner executes the unchanged VWAP and Bollinger
+grids for M5, M15, and H1, optionally adds canonical-M1 VWAP robustness, and
+writes instrument-labelled documents:
+
+```bash
+uv run mr-lab-replicate \
+  --instrument USDJPY \
+  --corpus-dir /path/to/usdjpy-2024-corpus \
+  --output-dir results/stage-3b-usdjpy \
+  --canonical-m1-vwap
+```
+
+Later work remains realistic transaction costs and execution semantics,
+dependence-aware/event-level trade construction, OU quality filtering only if
+simple families justify it, protected OOS/walk-forward, portfolio risk, Monte
+Carlo/prop-risk analysis, and an eventual live/tick execution layer. The 2025
+holdout remains rejected and untouched.
 
 ## Canonical-M1 VWAP construction robustness
 

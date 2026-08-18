@@ -137,6 +137,9 @@ def test_price_scaling_and_dataset_identity_are_deterministic() -> None:
     assert parse_m1_bid_bars(payload, DAY)[0].open == 1.10366
     assert first == second
     assert first.dataset_id == expected_dataset_id
+    assert first.dataset_id == (
+        "sha256:72d50f6f54bc6e0f015754a4e3918d847f39ad44b88929a69424dd4ea4ed5285"
+    )
     assert (
         first.dataset_id
         != build_dataset_metadata(compressed(record(60)), DAY).dataset_id

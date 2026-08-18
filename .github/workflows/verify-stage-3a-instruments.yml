@@ -1,0 +1,30 @@
+name: Verify Stage 3A instrument decoding
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --dev
+      - name: Verify one 2024-01-02 sample per new instrument
+        run: uv run python -m mr_lab.providers.verify_instruments --output-dir data/raw/stage-3a-verification
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage-3a-provider-verification-2024-01-02
+          path: data/raw/stage-3a-verification/
+          if-no-files-found: error
+          retention-days: 14
