@@ -84,12 +84,13 @@ def test_candidate_specs_and_verification_decoding(instrument, scale, encoded, d
     )
 
 
-def test_supported_universe_urls_and_rejections():
+def test_supported_universe_is_production_verified_and_rejects_unknown():
     assert SUPPORTED_INSTRUMENTS == ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "AUDJPY")
-    assert build_url("EURUSD", DAY).endswith("/EURUSD/2024/00/02/BID_candles_min_1.bi5")
-    for instrument in SUPPORTED_INSTRUMENTS[1:]:
-        with pytest.raises(InstrumentSpecError, match="not production-verified"):
-            build_url(instrument, DAY)
+    for instrument in SUPPORTED_INSTRUMENTS:
+        assert get_instrument_spec(instrument).decoding_verified
+        assert build_url(instrument, DAY).endswith(
+            f"/{instrument}/2024/00/02/BID_candles_min_1.bi5"
+        )
     with pytest.raises(InstrumentSpecError, match="unsupported instrument"):
         get_instrument_spec("NZDUSD")
     with pytest.raises(InstrumentSpecError, match="price_scale"):
@@ -102,30 +103,45 @@ def test_supported_universe_urls_and_rejections():
 
 
 def test_verification_status_changes_eligibility_not_decoding_facts():
-    candidate = get_candidate_instrument_spec("USDJPY")
-    verified = replace(candidate, decoding_verified=True)
-    assert not candidate.decoding_verified
+    verified = get_candidate_instrument_spec("USDJPY")
+    candidate = replace(verified, decoding_verified=False)
     assert require_verified(verified) is verified
     assert candidate.as_dict() | {"decoding_verified": True} == verified.as_dict()
     assert candidate.decode_price(143_210) == verified.decode_price(143_210)
 
 
-def test_normal_acquisition_rejects_candidate_before_network(tmp_path):
-    called = False
+@pytest.mark.parametrize("instrument", SUPPORTED_INSTRUMENTS)
+def test_normal_acquisition_canonicalization_and_corpus_accept_frozen_universe(
+    tmp_path, instrument
+):
+    raw = payload(100_000)
 
     def getter(_url, _timeout):
-        nonlocal called
-        called = True
+        return 200, raw
 
-    with pytest.raises(InstrumentSpecError, match="not production-verified"):
-        acquire(tmp_path, DAY, instrument="GBPUSD", getter=getter)
-    assert not called
-    with pytest.raises(InstrumentSpecError, match="not production-verified"):
-        parse_m1_bid_bars(payload(127_456), DAY, "GBPUSD")
-    with pytest.raises(MultiDayAssemblyError, match="not production-verified"):
-        DailyPayload(DAY, payload(127_456), "GBPUSD")
-    with pytest.raises(InstrumentSpecError, match="not production-verified"):
-        run_frozen_replication(tmp_path, tmp_path / "results", "GBPUSD")
+    acquired, _ = acquire(
+        tmp_path / instrument, DAY, instrument=instrument, getter=getter
+    )
+    bars = parse_m1_bid_bars(acquired.read_bytes(), DAY, instrument)
+    daily = DailyPayload(DAY, raw, instrument)
+    manifest = build_corpus_manifest(DAY, DAY, [daily], [], instrument)
+    assert bars[0].instrument == instrument
+    assert manifest.dataset.metadata.instrument == instrument
+
+
+@pytest.mark.parametrize("instrument", SUPPORTED_INSTRUMENTS)
+def test_replication_accepts_frozen_universe(tmp_path, monkeypatch, instrument):
+    import mr_lab.replication as replication
+
+    dataset = assemble_daily_payloads([DailyPayload(DAY, payload(100_000), instrument)])
+    monkeypatch.setattr(replication, "load_offline_corpus", lambda _path: dataset)
+    monkeypatch.setattr(replication, "run_vwap", lambda _path, _timeframe: ())
+    monkeypatch.setattr(replication, "run_bollinger", lambda _path, _timeframe: ())
+
+    written = run_frozen_replication(tmp_path, tmp_path / "results", instrument)
+
+    assert len(written) == 6
+    assert all(path.is_file() for path in written)
 
 
 def test_verification_acquisition_uses_candidate_provider_path(tmp_path):
@@ -157,14 +173,7 @@ def test_zero_volume_point_in_time_prefix_and_generic_resampling():
         assert all(bar.instrument == "EURUSD" for bar in result.bars)
 
 
-def test_instrument_sensitive_identities_and_mixed_rejection(monkeypatch):
-    import mr_lab.providers.instruments as instruments
-
-    monkeypatch.setitem(
-        instruments._SPECS,
-        "GBPUSD",
-        replace(get_candidate_instrument_spec("GBPUSD"), decoding_verified=True),
-    )
+def test_instrument_sensitive_identities_and_mixed_rejection():
     raw = payload(100_000)
     eur_daily = build_dataset_metadata(raw, DAY, "EURUSD")
     gbp_daily = build_dataset_metadata(raw, DAY, "GBPUSD")

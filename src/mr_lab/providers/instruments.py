@@ -85,21 +85,13 @@ class ProviderInstrumentSpec:
 
 
 _SPECS = {
-    # EURUSD is the historically verified Stage 1A contract. New-instrument
-    # scales remain candidates until bounded real-provider verification succeeds.
+    # EURUSD is the historically verified Stage 1A contract. The four Stage 3A
+    # specifications were promoted after bounded real-provider verification.
     "EURUSD": ProviderInstrumentSpec("EURUSD", "EURUSD", 100_000, 5),
-    "GBPUSD": ProviderInstrumentSpec(
-        "GBPUSD", "GBPUSD", 100_000, 5, decoding_verified=False
-    ),
-    "USDJPY": ProviderInstrumentSpec(
-        "USDJPY", "USDJPY", 1_000, 3, decoding_verified=False
-    ),
-    "AUDUSD": ProviderInstrumentSpec(
-        "AUDUSD", "AUDUSD", 100_000, 5, decoding_verified=False
-    ),
-    "AUDJPY": ProviderInstrumentSpec(
-        "AUDJPY", "AUDJPY", 1_000, 3, decoding_verified=False
-    ),
+    "GBPUSD": ProviderInstrumentSpec("GBPUSD", "GBPUSD", 100_000, 5),
+    "USDJPY": ProviderInstrumentSpec("USDJPY", "USDJPY", 1_000, 3),
+    "AUDUSD": ProviderInstrumentSpec("AUDUSD", "AUDUSD", 100_000, 5),
+    "AUDJPY": ProviderInstrumentSpec("AUDJPY", "AUDJPY", 1_000, 3),
 }
 
 SUPPORTED_INSTRUMENTS = tuple(_SPECS)
