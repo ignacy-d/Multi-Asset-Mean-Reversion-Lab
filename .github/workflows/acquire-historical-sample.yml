@@ -1,4 +1,4 @@
-name: Acquire historical corpus
+name: Acquire checkpointed 2024 historical corpus
 
 on:
   workflow_dispatch:
@@ -8,28 +8,18 @@ on:
         required: true
         default: EURUSD
         type: choice
-        options:
-          - EURUSD
-          - GBPUSD
-          - USDJPY
-          - AUDUSD
-          - AUDJPY
-      start_date:
-        description: Inclusive UTC start date (YYYY-MM-DD)
-        required: true
-        default: "2024-01-01"
-        type: string
-      end_date:
-        description: Inclusive UTC end date (YYYY-MM-DD)
-        required: true
-        default: "2024-12-31"
-        type: string
+        options: [EURUSD, GBPUSD, USDJPY, AUDUSD, AUDJPY]
 
 permissions:
   contents: read
 
 jobs:
-  acquire:
+  acquire-month:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        month: ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -40,19 +30,45 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install locked development environment
-        run: uv sync --locked --dev
-      - name: Acquire, validate, assemble, and audit selected M1 BID range
+      - run: uv sync --locked --dev
+      - name: Acquire month sequentially with a two-second request delay
         run: >-
-          uv run python -m mr_lab.providers.dukascopy_range
+          uv run python -m mr_lab.providers.dukascopy_monthly acquire-month
+          --year 2024 --month ${{ matrix.month }}
           --instrument "${{ inputs.instrument }}"
-          --start-date "${{ inputs.start_date }}"
-          --end-date "${{ inputs.end_date }}"
-          --output-dir data/raw/stage-1d-corpus
-      - name: Upload immutable raw snapshots, provenance, and corpus audit
+          --output-dir data/raw/month-${{ matrix.month }}
+      - name: Persist immutable monthly checkpoint
         uses: actions/upload-artifact@v4
         with:
-          name: dukascopy-${{ inputs.instrument }}-m1-bid-${{ inputs.start_date }}-${{ inputs.end_date }}
-          path: data/raw/stage-1d-corpus/
+          name: dukascopy-${{ inputs.instrument }}-m1-bid-2024-${{ matrix.month }}
+          path: data/raw/month-${{ matrix.month }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble-year:
+    needs: acquire-month
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --dev
+      - name: Download all successful monthly checkpoints
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dukascopy-${{ inputs.instrument }}-m1-bid-2024-*
+          path: data/raw/months
+      - name: Verify and assemble the deterministic full-year corpus
+        run: >-
+          uv run python -m mr_lab.providers.dukascopy_monthly assemble-year
+          --year 2024 --instrument "${{ inputs.instrument }}"
+          --chunks-root data/raw/months
+          --output-dir data/raw/stage-3a-corpus
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dukascopy-${{ inputs.instrument }}-m1-bid-2024-full-year
+          path: data/raw/stage-3a-corpus/
           if-no-files-found: error
           retention-days: 14
