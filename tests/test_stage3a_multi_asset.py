@@ -140,8 +140,60 @@ def test_replication_accepts_frozen_universe(tmp_path, monkeypatch, instrument):
 
     written = run_frozen_replication(tmp_path, tmp_path / "results", instrument)
 
-    assert len(written) == 6
+    assert len(written) == 7
     assert all(path.is_file() for path in written)
+    report = written[-1].read_text(encoding="utf-8")
+    assert "Asia, New York, London" in report
+    assert "not ranked evidence" in report
+
+
+def test_replication_writes_nine_documents_and_complete_session_report(
+    tmp_path, monkeypatch
+):
+    import mr_lab.replication as replication
+
+    dataset = assemble_daily_payloads([DailyPayload(DAY, payload(143_210), "USDJPY")])
+    monkeypatch.setattr(replication, "load_offline_corpus", lambda _path: dataset)
+
+    def vwap(_path, timeframe):
+        return tuple(
+            {
+                "anchor_session": session,
+                "direction": "all",
+                "signal_count": index + 1,
+                "timeframe": timeframe,
+            }
+            for index, session in enumerate(("asia", "london", "new_york"))
+        )
+
+    def bollinger(_path, timeframe):
+        return tuple(
+            {
+                "context_session": session,
+                "direction": "all",
+                "signal_count": index + 1,
+                "timeframe": timeframe,
+            }
+            for index, session in enumerate((None, "asia", "london", "new_york"))
+        )
+
+    monkeypatch.setattr(replication, "run_vwap", vwap)
+    monkeypatch.setattr(replication, "run_offline_robustness", vwap)
+    monkeypatch.setattr(replication, "run_bollinger", bollinger)
+
+    written = run_frozen_replication(
+        tmp_path,
+        tmp_path / "results",
+        "USDJPY",
+        include_canonical_m1_vwap=True,
+    )
+
+    assert len([path for path in written if path.suffix == ".json"]) == 9
+    report = written[-1].read_text(encoding="utf-8")
+    assert report.index("| asia |") < report.index("| new_york |")
+    assert "| london |" in report
+    assert "| overall |" in report
+    assert report.count(".json`") == 9
 
 
 def test_verification_acquisition_uses_candidate_provider_path(tmp_path):
