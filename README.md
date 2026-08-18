@@ -14,16 +14,17 @@ canonical-M1 VWAP construction robustness path. Stage 3A now makes the provider
 and data boundary explicitly multi-asset while leaving all strategy arithmetic,
 sessions, thresholds, lookbacks, and horizons unchanged.
 
-The initial candidate universe is exactly EURUSD, GBPUSD, USDJPY, AUDUSD, and
+The frozen production universe is exactly EURUSD, GBPUSD, USDJPY, AUDUSD, and
 AUDJPY. Immutable `ProviderInstrumentSpec` values bind the canonical and provider
-symbols, candidate integer price scale and decimal precision, native M1 timeframe,
+symbols, integer price scale and decimal precision, native M1 timeframe,
 BID basis, QUOTE_ACTIVITY volume semantics, Dukascopy identity, and an explicit
 verification state. EURUSD remains production-verified at scale 100,000 (five
-decimals). GBPUSD and AUDUSD declare unverified candidates of 100,000/five;
-USDJPY and AUDJPY declare unverified candidates of 1,000/three. Normal
-acquisition, canonicalization, corpus assembly, and replication fail closed for
-those candidates until bounded real-provider verification has succeeded and the
-specification is deliberately promoted. No research module infers these values.
+decimals). GBPUSD and AUDUSD retain scales of 100,000/five; USDJPY and AUDJPY
+retain scales of 1,000/three. GBPUSD, USDJPY, AUDUSD, and AUDJPY were promoted to
+production-verified only after successful bounded real-provider verification run
+`32113934283`. Normal acquisition, canonicalization, corpus assembly, and
+replication now accept all five frozen instruments and continue to fail closed
+for unsupported instruments. No research module infers these values.
 
 Stage 3A verification is deliberately bounded to one public 2024-01-02 M1 BID
 file for each new instrument. The pull-request and manually dispatched
@@ -31,8 +32,8 @@ file for each new instrument. The pull-request and manually dispatched
 24-byte records, candidate scaling, plausible positive OHLC, metadata,
 nonnegative quote activity, M1 construction, and generic resampling. This is the
 only path allowed to use unverified candidates, and it creates no strategy
-results. A successful run verifies the sample but does not silently mutate source
-or promote production eligibility. The same date can be checked locally with:
+results. Promotion remains a deliberate source change after a successful run.
+The same date can be checked locally with:
 
 ```bash
 uv run python -m mr_lab.providers.verify_instruments \
