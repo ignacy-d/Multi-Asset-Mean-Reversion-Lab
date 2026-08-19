@@ -1,0 +1,156 @@
+name: Temporary diagnostic - AUDJPY 2024-10-03 Dukascopy object
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-object:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET_URL: https://datafeed.dukascopy.com/datafeed/AUDJPY/2024/09/03/BID_candles_min_1.bi5
+      MR_LAB_USER_AGENT: mr-lab/Stage-1A-R
+      BROWSER_USER_AGENT: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36
+    steps:
+      - name: Run three isolated diagnostic rounds
+        shell: bash
+        run: |
+          set -uo pipefail
+          log_dir="${RUNNER_TEMP}/audjpy-2024-10-03-diagnostic"
+          mkdir -p "$log_dir"
+
+          cat >"${RUNNER_TEMP}/diagnostic_get.py" <<'PY'
+          import datetime
+          import lzma
+          import sys
+          import urllib.error
+          import urllib.request
+
+          url, user_agent, output = sys.argv[1:]
+          request = urllib.request.Request(
+              url, method="GET", headers={"User-Agent": user_agent}
+          )
+          print(f"utc_timestamp: {datetime.datetime.now(datetime.UTC).isoformat()}")
+          print(f"requested_url: {url}")
+          try:
+              response = urllib.request.urlopen(request, timeout=120)
+          except urllib.error.HTTPError as error:
+              response = error
+          except Exception as error:
+              print(f"request_error: {type(error).__name__}: {error}")
+              raise SystemExit(0)
+
+          with response:
+              body = response.read()
+              status = response.status
+              content_type = response.headers.get("Content-Type", "")
+              print(f"http_status: {status}")
+              print(f"final_effective_url: {response.geturl()}")
+              print("response_headers:")
+              for key, value in response.headers.items():
+                  print(f"  {key}: {value}")
+              print(f"content_type: {content_type or '<absent>'}")
+              print(f"content_length_header: {response.headers.get('Content-Length', '<absent>')}")
+              print(f"response_body_size: {len(body)}")
+              if status == 200:
+                  try:
+                      lzma.decompress(body)
+                  except lzma.LZMAError as error:
+                      print(f"valid_lzma: false ({error})")
+                  else:
+                      print("valid_lzma: true")
+              textual = content_type.lower().startswith("text/") or any(
+                  marker in content_type.lower()
+                  for marker in ("json", "xml", "html")
+              )
+              if textual:
+                  preview = body[:512].decode("utf-8", errors="backslashreplace")
+                  print(f"text_body_prefix_512_bytes: {preview!r}")
+              with open(output, "wb") as body_file:
+                  body_file.write(body)
+          PY
+
+          cat >"${RUNNER_TEMP}/summarize_curl.py" <<'PY'
+          import lzma
+          import pathlib
+          import sys
+
+          headers_path, body_path, metadata_path = map(pathlib.Path, sys.argv[1:])
+          raw_headers = headers_path.read_text(encoding="iso-8859-1", errors="replace")
+          body = body_path.read_bytes()
+          metadata = metadata_path.read_text(encoding="utf-8", errors="replace")
+          blocks = [block for block in raw_headers.replace("\r\n", "\n").split("\n\n") if block.strip()]
+          final_headers = blocks[-1].splitlines() if blocks else []
+          parsed = {}
+          for line in final_headers[1:]:
+              if ":" in line:
+                  key, value = line.split(":", 1)
+                  parsed[key.strip().lower()] = value.strip()
+          print("response_headers:")
+          print(raw_headers.rstrip())
+          print(metadata.rstrip())
+          content_type = parsed.get("content-type", "")
+          print(f"content_type: {content_type or '<absent>'}")
+          print(f"content_length_header: {parsed.get('content-length', '<absent>')}")
+          print(f"response_body_size: {len(body)}")
+          status_line = next((line for line in metadata.splitlines() if line.startswith("http_status: ")), "")
+          if status_line == "http_status: 200":
+              try:
+                  lzma.decompress(body)
+              except lzma.LZMAError as error:
+                  print(f"valid_lzma: false ({error})")
+              else:
+                  print("valid_lzma: true")
+          textual = content_type.lower().startswith("text/") or any(
+              marker in content_type.lower() for marker in ("json", "xml", "html")
+          )
+          if textual:
+              preview = body[:512].decode("utf-8", errors="backslashreplace")
+              print(f"text_body_prefix_512_bytes: {preview!r}")
+          PY
+
+          for attempt in 1 2 3; do
+            printf 'utc_timestamp: %s\nclient: python-urllib\nattempt: %s\n' \
+              "$(date --utc --iso-8601=seconds)" "$attempt" \
+              >"${log_dir}/urllib-attempt-${attempt}.log"
+            python "${RUNNER_TEMP}/diagnostic_get.py" \
+              "$TARGET_URL" "$MR_LAB_USER_AGENT" \
+              "${log_dir}/urllib-attempt-${attempt}.body" \
+              >>"${log_dir}/urllib-attempt-${attempt}.log" 2>&1
+
+            curl_headers="${log_dir}/curl-attempt-${attempt}.headers"
+            curl_body="${log_dir}/curl-attempt-${attempt}.body"
+            curl_metadata="${log_dir}/curl-attempt-${attempt}.metadata"
+            printf 'utc_timestamp: %s\nclient: curl\nattempt: %s\nrequested_url: %s\n' \
+              "$(date --utc --iso-8601=seconds)" "$attempt" "$TARGET_URL" \
+              >"${log_dir}/curl-attempt-${attempt}.log"
+            curl --location --silent --show-error --max-time 120 \
+              --user-agent "$BROWSER_USER_AGENT" \
+              --dump-header "$curl_headers" --output "$curl_body" \
+              --write-out 'http_status: %{http_code}\nfinal_effective_url: %{url_effective}\n' \
+              "$TARGET_URL" >"$curl_metadata" 2>>"${log_dir}/curl-attempt-${attempt}.log" || true
+            touch "$curl_headers" "$curl_body" "$curl_metadata"
+            python "${RUNNER_TEMP}/summarize_curl.py" \
+              "$curl_headers" "$curl_body" "$curl_metadata" \
+              >>"${log_dir}/curl-attempt-${attempt}.log" 2>&1
+
+            if [[ "$attempt" -lt 3 ]]; then
+              echo "Pausing five minutes before the next diagnostic round."
+              sleep 300
+            fi
+          done
+
+          # Body files are used only to calculate diagnostics and are not retained.
+          rm -f "$log_dir"/*.body "$log_dir"/*.headers "$log_dir"/*.metadata
+
+      - name: Upload temporary diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: temporary-audjpy-2024-10-03-dukascopy-diagnostic
+          path: ${{ runner.temp }}/audjpy-2024-10-03-diagnostic/*.log
+          if-no-files-found: warn
+          retention-days: 7
