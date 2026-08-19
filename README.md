@@ -75,6 +75,33 @@ report, and execution audit as one immutable, instrument-labelled GitHub Actions
 artifact. It must be dispatched from the repository's `main` branch; dispatches
 from any other ref fail before artifact download or replication.
 
+## Stage 4A event-path diagnostics
+
+Stage 4A adds a descriptive event record for every qualifying, frozen Stage 3B
+signal observation. Observations are retained as-is and can overlap heavily;
+they are **not independent trades**. No breach deduplication or trade construction
+is performed. At signal time `T`, the research close is frozen as `P0`, the
+applicable VWAP or Bollinger center is frozen as `E0`, and `D0 = P0 - E0`.
+Movement is always evaluated against that frozen `E0`; later equilibrium values
+cannot move the target or affect signal eligibility.
+
+The diagnostic path uses exact, causal canonical-M1 observations after `T` and
+does not stop at session boundaries. It records direction-normalized returns at
+5, 15, 30, 60, and 120 minutes; M1-ordered first passage of 25%, 50%, 75%, and
+100% reversion; continuous maximum reversion; and direction-normalized MAE/MFE
+with their first occurrence times. Minimal causal pre-signal fields record raw
+and signed price movement over 5, 15, and 30 minutes plus `impulse_share_h =
+abs(P0 - P[-h]) / abs(D0)`. These formation-speed values are descriptive and do
+not classify shocks.
+
+A missing minute anywhere in the required 120-minute future path marks the event
+incomplete: fixed snapshots that exist remain explicit, while first passage,
+maximum reversion, and pathwise MAE/MFE are unavailable rather than computed on
+a shortened path. Each unavailable pre-signal offset is independently `null`.
+Stage 4A adds no costs, spreads, slippage, trade or execution rules, TP/SL,
+optimization, dynamic equilibrium, filters, models, reporting dashboard, or 2025
+analysis.
+
 Later work remains realistic transaction costs and execution semantics,
 dependence-aware/event-level trade construction, OU quality filtering only if
 simple families justify it, protected OOS/walk-forward, portfolio risk, Monte
