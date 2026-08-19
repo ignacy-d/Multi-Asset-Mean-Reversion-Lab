@@ -71,7 +71,9 @@ selects and validates an instrument-labelled full-year corpus artifact and its
 originating run, executes this exact replication interface without provider
 access, verifies every expected result identity, and uploads the JSON documents,
 comparison report, and execution audit as one immutable, instrument-labelled
-GitHub Actions artifact.
+GitHub Actions artifact. It must be dispatched from the repository's `main`
+branch; dispatches from any other ref fail before artifact download or
+replication.
 
 Later work remains realistic transaction costs and execution semantics,
 dependence-aware/event-level trade construction, OU quality filtering only if
