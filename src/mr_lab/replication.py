@@ -42,8 +42,7 @@ def _write_comparison_report(
         f"- Assembled dataset ID: `{dataset_id}`",
         "- Construction order: native-timeframe VWAP, canonical-M1 VWAP "
         "robustness, Bollinger.",
-        "- Session display order: Asia, New York, London, then any remaining "
-        "contexts.",
+        "- Session display order: Asia, New York, London, then any remaining contexts.",
         "- Values below are descriptive inventory totals, not ranked evidence "
         "and not a methodology change.",
         "",
@@ -51,9 +50,10 @@ def _write_comparison_report(
         "All-direction signal total* |",
         "| --- | --- | --- | ---: | ---: |",
     ]
-    family_order = {name: index for index, name in enumerate(
-        ("vwap", "vwap-canonical-m1", "bollinger")
-    )}
+    family_order = {
+        name: index
+        for index, name in enumerate(("vwap", "vwap-canonical-m1", "bollinger"))
+    }
     timeframe_order = {name: index for index, name in enumerate(TIMEFRAMES)}
     session_order = {name: index for index, name in enumerate(SESSION_DISPLAY_ORDER)}
     summaries = []
