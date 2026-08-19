@@ -61,71 +61,6 @@ jobs:
           printf 'INSTRUMENT_LOWER=%s\n' "$instrument_lower" >> "$GITHUB_ENV"
           printf 'OUTPUT_DIR=results/stage-3b-%s\n' "$instrument_lower" >> "$GITHUB_ENV"
 
-      - name: Resolve the immutable source artifact from the supplied run
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_WORKFLOW_RUN_ID: ${{ inputs.source_workflow_run_id }}
-          SOURCE_ARTIFACT_NAME: dukascopy-${{ inputs.instrument }}-m1-bid-2024-full-year
-        run: |
-          set -euo pipefail
-          mkdir -p artifact-download
-
-          if [[ ! "$SOURCE_WORKFLOW_RUN_ID" =~ ^[0-9]+$ ]]; then
-            echo "::error::Source workflow run ID must be an integer."
-            exit 1
-          fi
-          if ! gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_WORKFLOW_RUN_ID}" \
-            > artifact-download/workflow-run.json; then
-            echo "::error::Source workflow run ${SOURCE_WORKFLOW_RUN_ID} does not exist or is not accessible with github.token."
-            exit 1
-          fi
-          if ! gh api --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_WORKFLOW_RUN_ID}/artifacts?per_page=100" \
-            > artifact-download/artifact-pages.json; then
-            echo "::error::Artifacts for source workflow run ${SOURCE_WORKFLOW_RUN_ID} are not accessible with github.token."
-            exit 1
-          fi
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          run_id = int(os.environ["SOURCE_WORKFLOW_RUN_ID"])
-          run = json.loads(
-              Path("artifact-download/workflow-run.json").read_text(encoding="utf-8")
-          )
-          if run.get("id") != run_id:
-              raise SystemExit("resolved workflow run has an unexpected ID")
-
-          pages = json.loads(
-              Path("artifact-download/artifact-pages.json").read_text(encoding="utf-8")
-          )
-          artifacts = [artifact for page in pages for artifact in page["artifacts"]]
-          matches = [
-              artifact
-              for artifact in artifacts
-              if artifact.get("name") == os.environ["SOURCE_ARTIFACT_NAME"]
-          ]
-          if len(matches) != 1:
-              raise SystemExit(
-                  "expected exactly one source artifact named "
-                  f"{os.environ['SOURCE_ARTIFACT_NAME']!r} in workflow run {run_id}; "
-                  f"found {len(matches)}"
-              )
-          artifact = matches[0]
-          if artifact.get("expired") is not False:
-              raise SystemExit("the resolved source artifact is expired")
-          artifact_id = artifact.get("id")
-          if not isinstance(artifact_id, int):
-              raise SystemExit("resolved source artifact has an invalid ID")
-          workflow_run = artifact.get("workflow_run") or {}
-          if workflow_run.get("id") != run_id:
-              raise SystemExit("resolved artifact has unexpected workflow provenance")
-          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env_file:
-              env_file.write(f"SOURCE_ARTIFACT_ID={artifact_id}\n")
-          print(f"resolved_source_artifact_id={artifact_id}")
-          PY
 
       - name: Download and verify the immutable full-year corpus
         env:
@@ -134,8 +69,6 @@ jobs:
           SOURCE_ARTIFACT_NAME: dukascopy-${{ inputs.instrument }}-m1-bid-2024-full-year
         run: |
           set -euo pipefail
-          mkdir -p corpus-extracted
-
           gh api \
             "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}" \
             > artifact-download/metadata.json
@@ -278,7 +211,6 @@ jobs:
       - name: Upload immutable instrument-labelled Stage 3B research artifact
         uses: actions/upload-artifact@v4
         with:
-          name: stage-3b-${{ env.INSTRUMENT_LOWER }}-2024-results-source-${{ env.SOURCE_ARTIFACT_ID }}
           path: ${{ env.OUTPUT_DIR }}/
           if-no-files-found: error
           retention-days: 90

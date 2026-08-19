@@ -64,17 +64,7 @@ timeframe (nine documents when canonical-M1 robustness is enabled), followed by
 a compact Markdown inventory. The inventory deliberately displays the
 predeclared USDJPY natural sessions Asia and New York first, then London and any
 remaining contexts; it retains links to every unranked result document and does
-not alter or interpret the frozen benchmark rows.
-
-The manually dispatched `run-stage-3b-multi-asset-real-2024.yml` workflow takes
-an instrument and source workflow run ID, then resolves exactly one matching
-instrument-labelled full-year corpus artifact from that run. It executes this
-exact replication interface without provider access, verifies every expected
-provenance and result identity, and uploads the JSON documents, comparison
-report, and execution audit as one immutable, instrument-labelled GitHub Actions
-artifact. It must be dispatched from the repository's `main` branch; dispatches
-from any other ref fail before artifact download or replication.
-
+not alter or interpret the frozen benchmark
 Later work remains realistic transaction costs and execution semantics,
 dependence-aware/event-level trade construction, OU quality filtering only if
 simple families justify it, protected OOS/walk-forward, portfolio risk, Monte
