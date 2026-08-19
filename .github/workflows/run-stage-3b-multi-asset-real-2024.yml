@@ -1,0 +1,284 @@
+name: Run Stage 3B multi-asset real 2024 replication
+
+on:
+  workflow_dispatch:
+    inputs:
+      instrument:
+        description: Instrument to replicate
+        required: true
+        type: choice
+        options:
+          - EURUSD
+          - GBPUSD
+          - USDJPY
+          - AUDUSD
+          - AUDJPY
+      source_workflow_run_id:
+        description: Workflow run ID that produced the source artifact
+        required: true
+        type: string
+      canonical_m1_vwap:
+        description: Include the unchanged canonical-M1 VWAP robustness family
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  replicate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Require dispatch from the frozen main branch
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Frozen Stage 3B replication must run from main (refs/heads/main); dispatched ref was ${GITHUB_REF}."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install locked development environment
+        run: uv sync --locked --dev
+
+      - name: Derive instrument-labelled paths
+        env:
+          INSTRUMENT: ${{ inputs.instrument }}
+        run: |
+          set -euo pipefail
+          instrument_lower="${INSTRUMENT,,}"
+          printf 'INSTRUMENT_LOWER=%s\n' "$instrument_lower" >> "$GITHUB_ENV"
+          printf 'OUTPUT_DIR=results/stage-3b-%s\n' "$instrument_lower" >> "$GITHUB_ENV"
+
+      - name: Resolve the immutable source artifact from the supplied run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_WORKFLOW_RUN_ID: ${{ inputs.source_workflow_run_id }}
+          SOURCE_ARTIFACT_NAME: dukascopy-${{ inputs.instrument }}-m1-bid-2024-full-year
+        run: |
+          set -euo pipefail
+          mkdir -p artifact-download
+
+          if [[ ! "$SOURCE_WORKFLOW_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Source workflow run ID must be an integer."
+            exit 1
+          fi
+          if ! gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_WORKFLOW_RUN_ID}" \
+            > artifact-download/workflow-run.json; then
+            echo "::error::Source workflow run ${SOURCE_WORKFLOW_RUN_ID} does not exist or is not accessible with github.token."
+            exit 1
+          fi
+          if ! gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_WORKFLOW_RUN_ID}/artifacts?per_page=100" \
+            > artifact-download/artifact-pages.json; then
+            echo "::error::Artifacts for source workflow run ${SOURCE_WORKFLOW_RUN_ID} are not accessible with github.token."
+            exit 1
+          fi
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          run_id = int(os.environ["SOURCE_WORKFLOW_RUN_ID"])
+          run = json.loads(
+              Path("artifact-download/workflow-run.json").read_text(encoding="utf-8")
+          )
+          if run.get("id") != run_id:
+              raise SystemExit("resolved workflow run has an unexpected ID")
+
+          pages = json.loads(
+              Path("artifact-download/artifact-pages.json").read_text(encoding="utf-8")
+          )
+          artifacts = [artifact for page in pages for artifact in page["artifacts"]]
+          matches = [
+              artifact
+              for artifact in artifacts
+              if artifact.get("name") == os.environ["SOURCE_ARTIFACT_NAME"]
+          ]
+          if len(matches) != 1:
+              raise SystemExit(
+                  "expected exactly one source artifact named "
+                  f"{os.environ['SOURCE_ARTIFACT_NAME']!r} in workflow run {run_id}; "
+                  f"found {len(matches)}"
+              )
+          artifact = matches[0]
+          if artifact.get("expired") is not False:
+              raise SystemExit("the resolved source artifact is expired")
+          artifact_id = artifact.get("id")
+          if not isinstance(artifact_id, int):
+              raise SystemExit("resolved source artifact has an invalid ID")
+          workflow_run = artifact.get("workflow_run") or {}
+          if workflow_run.get("id") != run_id:
+              raise SystemExit("resolved artifact has unexpected workflow provenance")
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env_file:
+              env_file.write(f"SOURCE_ARTIFACT_ID={artifact_id}\n")
+          print(f"resolved_source_artifact_id={artifact_id}")
+          PY
+
+      - name: Download and verify the immutable full-year corpus
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_WORKFLOW_RUN_ID: ${{ inputs.source_workflow_run_id }}
+          SOURCE_ARTIFACT_NAME: dukascopy-${{ inputs.instrument }}-m1-bid-2024-full-year
+        run: |
+          set -euo pipefail
+          mkdir -p corpus-extracted
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}" \
+            > artifact-download/metadata.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = json.loads(
+              Path("artifact-download/metadata.json").read_text(encoding="utf-8")
+          )
+          if metadata.get("id") != int(os.environ["SOURCE_ARTIFACT_ID"]):
+              raise SystemExit("downloaded artifact metadata has an unexpected ID")
+          if metadata.get("name") != os.environ["SOURCE_ARTIFACT_NAME"]:
+              raise SystemExit("downloaded artifact metadata has an unexpected name")
+          if metadata.get("expired") is not False:
+              raise SystemExit("the pinned source artifact is expired")
+          workflow_run = metadata.get("workflow_run") or {}
+          if workflow_run.get("id") != int(os.environ["SOURCE_WORKFLOW_RUN_ID"]):
+              raise SystemExit("artifact originates from an unexpected workflow run")
+          PY
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" \
+            > artifact-download/source-2024.zip
+          unzip -q artifact-download/source-2024.zip -d corpus-extracted
+
+          mapfile -d '' manifests < <(
+            find corpus-extracted -type f -name corpus-manifest.json -print0
+          )
+          if [[ ${#manifests[@]} -ne 1 ]]; then
+            echo "Expected exactly one corpus-manifest.json; found ${#manifests[@]}." >&2
+            exit 1
+          fi
+          corpus_dir="$(dirname "${manifests[0]}")"
+          printf 'CORPUS_DIR=%s\n' "$corpus_dir" >> "$GITHUB_ENV"
+
+      - name: Run the complete frozen Stage 3B grid
+        env:
+          INSTRUMENT: ${{ inputs.instrument }}
+          CANONICAL_M1_VWAP: ${{ inputs.canonical_m1_vwap }}
+        run: |
+          set -euo pipefail
+          args=(
+            --instrument "$INSTRUMENT"
+            --corpus-dir "$CORPUS_DIR"
+            --output-dir "$OUTPUT_DIR"
+          )
+          if [[ "$CANONICAL_M1_VWAP" == "true" ]]; then
+            args+=(--canonical-m1-vwap)
+          fi
+          uv run mr-lab-replicate "${args[@]}"
+
+      - name: Verify outputs and write deterministic execution audit
+        env:
+          INSTRUMENT: ${{ inputs.instrument }}
+          CANONICAL_M1_VWAP: ${{ inputs.canonical_m1_vwap }}
+          SOURCE_WORKFLOW_RUN_ID: ${{ inputs.source_workflow_run_id }}
+          SOURCE_ARTIFACT_NAME: dukascopy-${{ inputs.instrument }}-m1-bid-2024-full-year
+        run: |
+          set -euo pipefail
+          export SOURCE_COMMIT_SHA="$(git rev-parse HEAD)"
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          corpus_dir = Path(os.environ["CORPUS_DIR"])
+          instrument = os.environ["INSTRUMENT"]
+          instrument_lower = instrument.lower()
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+          manifest = json.loads(
+              (corpus_dir / "corpus-manifest.json").read_text(encoding="utf-8")
+          )
+          if manifest.get("instrument") != instrument:
+              raise SystemExit("source corpus instrument does not match selection")
+          if (
+              manifest.get("requested_start_date") != "2024-01-01"
+              or manifest.get("requested_end_date") != "2024-12-31"
+          ):
+              raise SystemExit("source corpus is not the complete frozen 2024 range")
+
+          families = ["vwap"]
+          if os.environ["CANONICAL_M1_VWAP"] == "true":
+              families.append("vwap-canonical-m1")
+          families.append("bollinger")
+          timeframes = ("m5", "m15", "h1")
+          result_names = tuple(
+              f"stage-3b-{instrument_lower}-{family}-{timeframe}.json"
+              for family in families
+              for timeframe in timeframes
+          )
+          expected = {
+              *result_names,
+              f"stage-3b-{instrument_lower}-comparison.md",
+          }
+          actual = {path.name for path in output_dir.iterdir() if path.is_file()}
+          if actual != expected:
+              raise SystemExit(
+                  f"unexpected Stage 3B outputs: expected={sorted(expected)!r} "
+                  f"actual={sorted(actual)!r}"
+              )
+          for name in result_names:
+              document = json.loads((output_dir / name).read_text(encoding="utf-8"))
+              if (
+                  document.get("instrument") != instrument
+                  or document.get("assembled_dataset_id")
+                  != manifest["assembled_dataset_id"]
+              ):
+                  raise SystemExit(f"result identity mismatch: {name}")
+
+          result_hashes = {
+              name: hashlib.sha256((output_dir / name).read_bytes()).hexdigest()
+              for name in sorted(expected)
+          }
+          audit = {
+              "assembled_dataset_id": manifest["assembled_dataset_id"],
+              "corpus_id": manifest["corpus_id"],
+              "instrument": instrument,
+              "requested_end_date": manifest["requested_end_date"],
+              "requested_start_date": manifest["requested_start_date"],
+              "result_files": list(result_names),
+              "result_sha256": result_hashes,
+              "source_artifact_id": int(os.environ["SOURCE_ARTIFACT_ID"]),
+              "source_artifact_name": os.environ["SOURCE_ARTIFACT_NAME"],
+              "source_commit_sha": os.environ["SOURCE_COMMIT_SHA"],
+              "source_workflow_run_id": int(os.environ["SOURCE_WORKFLOW_RUN_ID"]),
+          }
+          (output_dir / "execution-audit.json").write_text(
+              json.dumps(audit, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          print(f"corpus_id={audit['corpus_id']}")
+          print(f"assembled_dataset_id={audit['assembled_dataset_id']}")
+          for name in result_names:
+              print(f"result={name}")
+          PY
+
+      - name: Upload immutable instrument-labelled Stage 3B research artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-3b-${{ env.INSTRUMENT_LOWER }}-2024-results-source-${{ env.SOURCE_ARTIFACT_ID }}
+          path: ${{ env.OUTPUT_DIR }}/
+          if-no-files-found: error
+          retention-days: 90
