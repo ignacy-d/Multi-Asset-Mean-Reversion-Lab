@@ -1,0 +1,157 @@
+name: Temporary diagnostic - AUDJPY 2024-10-03 Dukascopy object
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET_URL: https://datafeed.dukascopy.com/datafeed/AUDJPY/2024/09/03/BID_candles_min_1.bi5
+      LOG_DIR: ${{ runner.temp }}/audjpy-2024-10-03-diagnostic
+    steps:
+      - name: Prepare diagnostic directory
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOG_DIR"
+
+      - name: Run three isolated diagnostic rounds
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for round in 1 2 3; do
+            echo "=== diagnostic round ${round} ===" | tee -a "$LOG_DIR/summary.log"
+            date -u '+timestamp_utc=%Y-%m-%dT%H:%M:%SZ' | tee -a "$LOG_DIR/summary.log"
+
+            ROUND="$round" python - <<'PY'
+          import lzma
+          import os
+          from datetime import UTC, datetime
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          url = os.environ["TARGET_URL"]
+          log_dir = Path(os.environ["LOG_DIR"])
+          round_no = os.environ["ROUND"]
+          body_path = log_dir / f"urllib-round-{round_no}.body"
+          log_path = log_dir / f"urllib-round-{round_no}.log"
+          lines = [
+              f"timestamp_utc={datetime.now(UTC).isoformat()}",
+              f"requested_url={url}",
+              "client=python-urllib",
+              "user_agent=mr-lab/Stage-1A-R",
+          ]
+          request = Request(url, method="GET", headers={"User-Agent": "mr-lab/Stage-1A-R"})
+          try:
+              with urlopen(request, timeout=60) as response:
+                  status = response.status
+                  effective_url = response.geturl()
+                  headers = response.headers
+                  body = response.read()
+          except HTTPError as error:
+              status = error.code
+              effective_url = error.geturl()
+              headers = error.headers
+              try:
+                  body = error.read()
+              except Exception:
+                  body = b""
+          except (TimeoutError, URLError) as error:
+              lines.append(f"transport_error={error!r}")
+              log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          else:
+              body_path.write_bytes(body)
+              lines.extend(
+                  [
+                      f"http_status={status}",
+                      f"effective_url={effective_url}",
+                      f"body_size={len(body)}",
+                  ]
+              )
+              for key, value in headers.items():
+                  lines.append(f"header_{key.lower().replace('-', '_')}={value}")
+              content_type = headers.get("Content-Type", "")
+              lines.append(f"content_type={content_type}")
+              lines.append(f"content_length={headers.get('Content-Length', '')}")
+              lines.append(f"retry_after={headers.get('Retry-After', '')}")
+              lines.append(f"server={headers.get('Server', '')}")
+              if status == 200:
+                  try:
+                      decoded = lzma.decompress(body)
+                  except lzma.LZMAError as error:
+                      lines.append(f"lzma_valid=false")
+                      lines.append(f"lzma_error={error}")
+                  else:
+                      lines.append("lzma_valid=true")
+                      lines.append(f"lzma_decoded_size={len(decoded)}")
+              if content_type.lower().startswith("text/") or b"<html" in body[:512].lower():
+                  preview = body[:512].decode("utf-8", errors="replace").replace("\n", "\\n")
+                  lines.append(f"text_preview_512={preview}")
+              log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+              body_path.unlink(missing_ok=True)
+          PY
+
+            curl_headers="$LOG_DIR/curl-round-${round}.headers"
+            curl_body="$LOG_DIR/curl-round-${round}.body"
+            curl_meta="$LOG_DIR/curl-round-${round}.meta"
+            curl_log="$LOG_DIR/curl-round-${round}.log"
+
+            set +e
+            curl_exit=0
+            curl \
+              --silent \
+              --show-error \
+              --location \
+              --max-time 60 \
+              --user-agent 'Mozilla/5.0 (diagnostic; mr-lab)' \
+              --dump-header "$curl_headers" \
+              --output "$curl_body" \
+              --write-out $'timestamp_utc=%{time_starttransfer}\nhttp_status=%{http_code}\neffective_url=%{url_effective}\ncontent_type=%{content_type}\nbody_size=%{size_download}\n' \
+              "$TARGET_URL" > "$curl_meta"
+            curl_exit=$?
+            set -e
+
+            {
+              date -u '+observed_at_utc=%Y-%m-%dT%H:%M:%SZ'
+              echo 'client=curl'
+              echo 'user_agent=Mozilla/5.0 (diagnostic; mr-lab)'
+              echo "requested_url=$TARGET_URL"
+              echo "curl_exit_code=$curl_exit"
+              cat "$curl_meta" 2>/dev/null || true
+              echo 'response_headers_begin'
+              cat "$curl_headers" 2>/dev/null || true
+              echo 'response_headers_end'
+              if [[ -f "$curl_body" ]]; then
+                echo "body_size_actual=$(wc -c < "$curl_body")"
+                content_type="$(awk 'BEGIN{IGNORECASE=1} /^Content-Type:/ {sub(/\r$/, ""); print substr($0, index($0, ":") + 2)}' "$curl_headers" | tail -n1)"
+                if [[ "$content_type" == text/* ]] || head -c 512 "$curl_body" | grep -Eiq '<!doctype html|<html'; then
+                  printf 'text_preview_512='
+                  head -c 512 "$curl_body" | tr '\n' ' '
+                  printf '\n'
+                fi
+              fi
+            } > "$curl_log"
+            rm -f "$curl_headers" "$curl_body" "$curl_meta"
+
+            cat "$LOG_DIR/urllib-round-${round}.log" | tee -a "$LOG_DIR/summary.log"
+            cat "$curl_log" | tee -a "$LOG_DIR/summary.log"
+
+            if [[ "$round" -lt 3 ]]; then
+              echo "Sleeping 300 seconds before next diagnostic round." | tee -a "$LOG_DIR/summary.log"
+              sleep 300
+            fi
+          done
+
+      - name: Upload temporary diagnostic logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: temporary-audjpy-2024-10-03-dukascopy-diagnostic
+          path: ${{ runner.temp }}/audjpy-2024-10-03-diagnostic/
+          if-no-files-found: error
+          retention-days: 7
