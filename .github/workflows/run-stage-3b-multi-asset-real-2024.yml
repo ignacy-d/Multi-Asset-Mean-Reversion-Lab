@@ -13,10 +13,6 @@ on:
           - USDJPY
           - AUDUSD
           - AUDJPY
-      source_artifact_id:
-        description: Immutable source corpus artifact ID
-        required: true
-        type: string
       source_workflow_run_id:
         description: Workflow run ID that produced the source artifact
         required: true
@@ -68,13 +64,11 @@ jobs:
       - name: Download and verify the immutable full-year corpus
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_ARTIFACT_ID: ${{ inputs.source_artifact_id }}
           SOURCE_WORKFLOW_RUN_ID: ${{ inputs.source_workflow_run_id }}
           SOURCE_ARTIFACT_NAME: dukascopy-${{ inputs.instrument }}-m1-bid-2024-full-year
         run: |
           set -euo pipefail
           mkdir -p artifact-download corpus-extracted
-
           gh api \
             "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}" \
             > artifact-download/metadata.json
@@ -132,7 +126,6 @@ jobs:
         env:
           INSTRUMENT: ${{ inputs.instrument }}
           CANONICAL_M1_VWAP: ${{ inputs.canonical_m1_vwap }}
-          SOURCE_ARTIFACT_ID: ${{ inputs.source_artifact_id }}
           SOURCE_WORKFLOW_RUN_ID: ${{ inputs.source_workflow_run_id }}
           SOURCE_ARTIFACT_NAME: dukascopy-${{ inputs.instrument }}-m1-bid-2024-full-year
         run: |
@@ -218,7 +211,6 @@ jobs:
       - name: Upload immutable instrument-labelled Stage 3B research artifact
         uses: actions/upload-artifact@v4
         with:
-          name: stage-3b-${{ env.INSTRUMENT_LOWER }}-2024-results-source-${{ inputs.source_artifact_id }}
           path: ${{ env.OUTPUT_DIR }}/
           if-no-files-found: error
           retention-days: 90
