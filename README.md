@@ -636,3 +636,23 @@ uv run ruff format --check .
 
 An example experiment contract is in `configs/example.toml`. Loading it only
 parses and validates configuration; it does not execute research or trading.
+# Stage 4A real 2024 path diagnostics
+
+After review and merge, `run-stage-4a-real-2024.yml` runs either `ALL` five frozen
+instruments or one selected instrument. Source workflow/artifact identities come
+from `configs/stage4a-2024-corpus-registry.json`; no source run ID is entered at
+dispatch. USDJPY, AUDUSD, and AUDJPY are verified; EURUSD awaits reviewer
+verification and GBPUSD awaits full-year acquisition. An individual verified
+instrument may run, but `ALL` fails preflight until all five are verified. The
+workflow runs only from `main`.
+
+Each instrument artifact contains exactly `events.jsonl`, `matrix.csv`,
+`summary.json`, `report.md`, and operational provenance in
+`execution-audit.json`. The research files remain the frozen Stage 4A
+conditional-observation diagnostics—not trades. Runs are bounded to 2024
+discovery data; the 2025 holdout remains sealed, including for incomplete
+late-December paths.
+
+Pins are immutable and fail closed. If a pinned GitHub artifact expires, a
+reviewed registry replacement or reacquisition is required; the workflow never
+selects a latest or substitute artifact automatically.
