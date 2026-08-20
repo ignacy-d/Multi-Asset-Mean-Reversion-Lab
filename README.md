@@ -86,13 +86,18 @@ Movement is always evaluated against that frozen `E0`; later equilibrium values
 cannot move the target or affect signal eligibility.
 
 The diagnostic path uses exact, causal canonical-M1 observations after `T` and
-does not stop at session boundaries. It records direction-normalized returns at
-5, 15, 30, 60, and 120 minutes; M1-ordered first passage of 25%, 50%, 75%, and
-100% reversion; continuous maximum reversion; and direction-normalized MAE/MFE
-with their first occurrence times. Minimal causal pre-signal fields record raw
-and signed price movement over 5, 15, and 30 minutes plus `impulse_share_h =
-abs(P0 - P[-h]) / abs(D0)`. These formation-speed values are descriptive and do
-not classify shocks.
+does not stop at session boundaries. Direction-normalized snapshots at 5, 15,
+30, 60, and 120 minutes use the exact-clock M1 **close**. Pathwise first passage
+of 25%, 50%, 75%, and 100% reversion, continuous maximum reversion, and MFE use
+the favorable intraminute extreme (high for long MR, low for short MR); MAE uses
+the adverse extreme (low for long MR, high for short MR). Hit and excursion times
+resolve to the first M1 minute containing the extreme. The ordering of high and
+low within that minute is unknown and is not inferred.
+
+Minimal causal pre-signal fields record raw and signed close movement over 5,
+15, and 30 minutes plus `impulse_share_h = abs(P0 - P[-h]) / abs(D0)`. These
+formation-speed values are descriptive and do not classify shocks. Stage 4A is
+not a trade simulator, and its path extremes do not create TP/SL rules.
 
 A missing minute anywhere in the required 120-minute future path marks the event
 incomplete: fixed snapshots that exist remain explicit, while first passage,

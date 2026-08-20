@@ -24,6 +24,27 @@ FIXED_HORIZONS_MINUTES = (5, 15, 30, 60, 120)
 FIRST_PASSAGE_LEVELS = (0.25, 0.50, 0.75, 1.00)
 PRE_SIGNAL_HORIZONS_MINUTES = (5, 15, 30)
 PATH_MINUTES = 120
+FROZEN_EQUILIBRIUM_RULE = "e0_fixed_at_signal_time-v1"
+REVERSION_FRACTION_DEFINITION = (
+    "direction_times_price_minus_p0_divided_by_absolute_d0-v1"
+)
+FIXED_HORIZON_PRICE_RULE = "exact_clock_canonical_m1_close-v1"
+HORIZON_DIAGNOSTIC_DEFINITION = (
+    "directional_price_movement_arithmetic_return_bps_pips_and_reversion-v1"
+)
+PIP_SIZE_RULE = "verified_instrument_precision_minus_one_decimal_place-v1"
+PATH_EXTREME_RULE = "long_high_low_short_low_high-v1"
+FIRST_PASSAGE_DEFINITION = (
+    "first_m1_minute_favorable_extreme_reversion_at_or_above_level-v1"
+)
+MAE_DEFINITION = "maximum_nonnegative_adverse_intraminute_price_excursion-v1"
+MFE_DEFINITION = "maximum_nonnegative_favorable_intraminute_price_excursion-v1"
+PATH_TIME_RESOLUTION = "first_qualifying_m1_minute_no_intrabar_order_inference-v1"
+MISSING_FUTURE_PATH_POLICY = (
+    "retain_available_fixed_snapshots_pathwise_metrics_unavailable-v1"
+)
+PRESIGNAL_MOVEMENT_DEFINITION = "p0_minus_exact_clock_prior_m1_close-v1"
+IMPULSE_SHARE_DEFINITION = "absolute_p0_minus_prior_close_divided_by_absolute_d0-v1"
 
 
 class EventPathError(ValueError):
@@ -91,7 +112,8 @@ class FrozenSignal:
 @dataclass(frozen=True, slots=True)
 class HorizonDiagnostic:
     horizon_minutes: int
-    signed_price_return: float
+    signed_price_movement: float
+    signed_arithmetic_return: float
     signed_return_bps: float
     signed_return_pips: float
     reversion_fraction: float
@@ -150,10 +172,23 @@ class Stage4AEvent:
 
 def _methodology_id() -> str:
     semantics = {
+        "first_passage_definition": FIRST_PASSAGE_DEFINITION,
         "first_passage_levels": FIRST_PASSAGE_LEVELS,
+        "fixed_horizon_price_rule": FIXED_HORIZON_PRICE_RULE,
         "fixed_horizons_minutes": FIXED_HORIZONS_MINUTES,
+        "frozen_equilibrium_rule": FROZEN_EQUILIBRIUM_RULE,
+        "horizon_diagnostic_definition": HORIZON_DIAGNOSTIC_DEFINITION,
+        "impulse_share_definition": IMPULSE_SHARE_DEFINITION,
+        "mae_definition": MAE_DEFINITION,
+        "mfe_definition": MFE_DEFINITION,
+        "missing_future_path_policy": MISSING_FUTURE_PATH_POLICY,
         "path_minutes": PATH_MINUTES,
+        "path_extreme_rule": PATH_EXTREME_RULE,
+        "path_time_resolution": PATH_TIME_RESOLUTION,
+        "pip_size_rule": PIP_SIZE_RULE,
+        "presignal_movement_definition": PRESIGNAL_MOVEMENT_DEFINITION,
         "presignal_horizons_minutes": PRE_SIGNAL_HORIZONS_MINUTES,
+        "reversion_fraction_definition": REVERSION_FRACTION_DEFINITION,
         "schema_version": STAGE4A_SCHEMA_VERSION,
     }
     encoded = json.dumps(semantics, sort_keys=True, separators=(",", ":"))
@@ -247,10 +282,11 @@ def frozen_signal_from_bollinger(
     )
 
 
-def _validate_m1(bars: Iterable[Bar], signal: FrozenSignal) -> dict[datetime, Bar]:
+def _prepare_m1_index(bars: Iterable[Bar], instrument: str) -> dict[datetime, Bar]:
+    """Materialize, validate, and index one canonical M1 corpus exactly once."""
     items = tuple(bars)
     if any(
-        bar.instrument != signal.instrument or bar.timeframe != Timeframe("1m")
+        bar.instrument != instrument or bar.timeframe != Timeframe("1m")
         for bar in items
     ):
         raise EventPathError(
@@ -261,9 +297,10 @@ def _validate_m1(bars: Iterable[Bar], signal: FrozenSignal) -> dict[datetime, Ba
     return {bar.available_at: bar for bar in items}
 
 
-def diagnose_event(signal: FrozenSignal, m1_bars: Iterable[Bar]) -> Stage4AEvent:
-    """Measure one frozen signal using exact causal M1 observations around T."""
-    by_time = _validate_m1(m1_bars, signal)
+def _diagnose_event_from_index(
+    signal: FrozenSignal, by_time: dict[datetime, Bar]
+) -> Stage4AEvent:
+    """Measure one frozen signal from an already validated canonical M1 index."""
     pip_size = 10 ** -(get_instrument_spec(signal.instrument).price_precision - 1)
     future = {
         minute: by_time.get(signal.signal_timestamp + timedelta(minutes=minute))
@@ -278,11 +315,13 @@ def diagnose_event(signal: FrozenSignal, m1_bars: Iterable[Bar]) -> Stage4AEvent
         if bar is None:
             continue
         movement = int(signal.direction) * (bar.close - signal.p0)
+        arithmetic_return = int(signal.direction) * (bar.close / signal.p0 - 1.0)
         horizons.append(
             HorizonDiagnostic(
                 minute,
                 movement,
-                movement / signal.p0 * 10_000,
+                arithmetic_return,
+                arithmetic_return * 10_000,
                 movement / pip_size,
                 movement / abs(signal.d0),
             )
@@ -292,24 +331,45 @@ def diagnose_event(signal: FrozenSignal, m1_bars: Iterable[Bar]) -> Stage4AEvent
     max_reversion = mae = mfe = None
     mae_time = mfe_time = None
     if complete:
-        path = tuple(
-            (minute, reversion_fraction(signal, future[minute].close))
-            for minute in future
-        )  # type: ignore[union-attr]
+        extremes = tuple(
+            (
+                minute,
+                bar.high if signal.direction is Direction.LONG else bar.low,
+                bar.low if signal.direction is Direction.LONG else bar.high,
+            )
+            for minute, bar in future.items()
+            if bar is not None
+        )
+        favorable_path = tuple(
+            (minute, reversion_fraction(signal, favorable))
+            for minute, favorable, _ in extremes
+        )
         first_passage = tuple(
             FirstPassageDiagnostic(
                 level,
-                any(value >= level for _, value in path),
-                next((minute for minute, value in path if value >= level), None),
+                any(value >= level for _, value in favorable_path),
+                next(
+                    (minute for minute, value in favorable_path if value >= level),
+                    None,
+                ),
             )
             for level in FIRST_PASSAGE_LEVELS
         )
-        max_reversion = max(value for _, value in path)
-        signed_moves = tuple((minute, value * abs(signal.d0)) for minute, value in path)
-        mfe = max(0.0, max(value for _, value in signed_moves))
-        mae = max(0.0, max(-value for _, value in signed_moves))
-        mfe_time = next((minute for minute, value in signed_moves if value == mfe), 0)
-        mae_time = next((minute for minute, value in signed_moves if -value == mae), 0)
+        max_reversion = max(value for _, value in favorable_path)
+        favorable_moves = tuple(
+            (minute, int(signal.direction) * (price - signal.p0))
+            for minute, price, _ in extremes
+        )
+        adverse_moves = tuple(
+            (minute, -int(signal.direction) * (price - signal.p0))
+            for minute, _, price in extremes
+        )
+        mfe = max(0.0, max(value for _, value in favorable_moves))
+        mae = max(0.0, max(value for _, value in adverse_moves))
+        mfe_time = next(
+            (minute for minute, value in favorable_moves if value == mfe), 0
+        )
+        mae_time = next((minute for minute, value in adverse_moves if value == mae), 0)
 
     presignal = []
     for minute in PRE_SIGNAL_HORIZONS_MINUTES:
@@ -349,11 +409,16 @@ def diagnose_event(signal: FrozenSignal, m1_bars: Iterable[Bar]) -> Stage4AEvent
     )
 
 
+def diagnose_event(signal: FrozenSignal, m1_bars: Iterable[Bar]) -> Stage4AEvent:
+    """Measure one frozen signal using exact causal M1 observations around T."""
+    by_time = _prepare_m1_index(m1_bars, signal.instrument)
+    return _diagnose_event_from_index(signal, by_time)
+
+
 def diagnose_events(
     signals: Iterable[FrozenSignal], m1_bars: Iterable[Bar]
 ) -> tuple[Stage4AEvent, ...]:
     """Diagnose observations in stable methodology-identity/timestamp order."""
-    bars = tuple(m1_bars)
     ordered = sorted(
         signals,
         key=lambda item: (
@@ -367,7 +432,13 @@ def diagnose_events(
             item.strategy_spec_id,
         ),
     )
-    return tuple(diagnose_event(signal, bars) for signal in ordered)
+    if not ordered:
+        return ()
+    instrument = ordered[0].instrument
+    if any(signal.instrument != instrument for signal in ordered):
+        raise EventPathError("signals must share the canonical M1 corpus instrument")
+    by_time = _prepare_m1_index(m1_bars, instrument)
+    return tuple(_diagnose_event_from_index(signal, by_time) for signal in ordered)
 
 
 def events_to_jsonl(events: Iterable[Stage4AEvent]) -> str:
