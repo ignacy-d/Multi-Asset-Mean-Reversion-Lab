@@ -18,28 +18,48 @@ jobs:
   select:
     runs-on: ubuntu-latest
     outputs:
-      instruments: ${{ steps.matrix.outputs.instruments }}
+      selection: ${{ steps.selection.outputs.selection }}
     steps:
       - name: Require main and construct the fixed matrix
-        id: matrix
+        id: selection
         env:
           SELECTED: ${{ inputs.instrument }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/main || { echo '::error::Stage 4A real runs require refs/heads/main'; exit 1; }
-          if [[ "$SELECTED" == ALL ]]; then
-            echo 'instruments=["EURUSD","GBPUSD","USDJPY","AUDUSD","AUDJPY"]' >> "$GITHUB_OUTPUT"
-          else
-            echo "instruments=[\"$SELECTED\"]" >> "$GITHUB_OUTPUT"
-          fi
+          echo "selection=$SELECTED" >> "$GITHUB_OUTPUT"
+
+  registry-preflight:
+    needs: select
+    runs-on: ubuntu-latest
+    outputs:
+      instruments: ${{ steps.preflight.outputs.instruments }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Require every selected immutable source to be verified
+        id: preflight
+        env:
+          SELECTED: ${{ needs.select.outputs.selection }}
+        run: |
+          set -euo pipefail
+          uv run python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from mr_lab.stage4a_runner import load_corpus_registry, select_verified_registry_entries
+          registry = load_corpus_registry(Path('configs/stage4a-2024-corpus-registry.json'))
+          entries = select_verified_registry_entries(registry, os.environ['SELECTED'])
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              output.write('instruments=' + json.dumps([entry['instrument'] for entry in entries], separators=(',', ':')) + '\n')
+          PY
 
   diagnose:
-    needs: select
+    needs: registry-preflight
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        instrument: ${{ fromJSON(needs.select.outputs.instruments) }}
+        instrument: ${{ fromJSON(needs.registry-preflight.outputs.instruments) }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -51,25 +71,28 @@ jobs:
       - name: Derive immutable result artifact name
         env: {INSTRUMENT: "${{ matrix.instrument }}"}
         run: echo "INSTRUMENT_LOWER=${INSTRUMENT,,}" >> "$GITHUB_ENV"
-      - name: Resolve and verify the pinned immutable corpus
+      - name: Resolve the selected validated registry entry
         env:
-          GH_TOKEN: ${{ github.token }}
           INSTRUMENT: ${{ matrix.instrument }}
         run: |
           set -euo pipefail
           mkdir -p source corpus result
-          python - <<'PY'
+          uv run python - <<'PY'
           import json, os
           from pathlib import Path
-          registry=json.loads(Path('configs/stage4a-2024-corpus-registry.json').read_text())
-          entry=registry['instruments'][os.environ['INSTRUMENT']]
-          required=('source_workflow_run_id','source_artifact_id','corpus_id','assembled_dataset_id')
-          if entry.get('verification_status') != 'verified' or any(not entry.get(k) for k in required):
-              raise SystemExit('registry entry is not independently verified; refusing real run')
+          from mr_lab.stage4a_runner import load_corpus_registry, validate_registry_entry
+          registry=load_corpus_registry(Path('configs/stage4a-2024-corpus-registry.json'))
+          entry=validate_registry_entry(os.environ['INSTRUMENT'], registry['instruments'][os.environ['INSTRUMENT']], require_verified=True)
           Path('source/entry.json').write_text(json.dumps(entry,sort_keys=True,separators=(',',':'))+'\n')
           with Path(os.environ['GITHUB_ENV']).open('a') as f:
               f.write(f"RUN_ID={entry['source_workflow_run_id']}\nARTIFACT_ID={entry['source_artifact_id']}\nARTIFACT_NAME={entry['source_artifact_name']}\n")
           PY
+
+      - name: Reverify and download the pinned immutable corpus
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > source/run.json
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > source/artifact.json
           python - <<'PY'
@@ -95,7 +118,7 @@ jobs:
           for k in ('instrument','corpus_id','assembled_dataset_id','requested_start_date','requested_end_date'):
               if m.get(k) != e[k]: raise SystemExit(f'manifest registry mismatch: {k}')
           PY
-          uv run mr-lab-stage4a --instrument "$INSTRUMENT" --corpus-dir "$CORPUS_DIR" --output-dir result --registry-entry source/entry.json
+          uv run mr-lab-stage4a --instrument "$INSTRUMENT" --corpus-dir "$CORPUS_DIR" --output-dir result --registry configs/stage4a-2024-corpus-registry.json
           test "$(find result -maxdepth 1 -type f | wc -l)" -eq 5
       - uses: actions/upload-artifact@v4
         with:
