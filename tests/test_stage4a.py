@@ -372,6 +372,39 @@ def test_report_structure_is_unranked_and_has_no_trade_metrics():
         assert forbidden not in report
 
 
+def test_directional_report_uses_only_anchor_threshold_and_preserves_directions():
+    rows = [
+        dict(row)
+        for row in aggregate_stage4a_events(
+            (
+                reporting_event(direction=Direction.LONG, threshold=2.0),
+                reporting_event(direction=Direction.SHORT, threshold=2.0, offset=1),
+                reporting_event(direction=Direction.LONG, threshold=2.5, offset=2),
+            )
+        )
+    ]
+    markers = {
+        ("long", 2.0): "ANCHOR_LONG",
+        ("short", 2.0): "ANCHOR_SHORT",
+        ("long", 2.5): "HIGHER_THRESHOLD_LONG",
+    }
+    for row in rows:
+        row["mean_pips_h60"] = markers[(row["direction"], row["threshold"])]
+
+    report = render_report(rows)
+    threshold_response = report.split("## Threshold response", 1)[1].split(
+        "## Directional asymmetry", 1
+    )[0]
+    directional = report.split("## Directional asymmetry", 1)[1].split(
+        "## Benchmark robustness", 1
+    )[0]
+
+    assert "ANCHOR_LONG" in directional
+    assert "ANCHOR_SHORT" in directional
+    assert "HIGHER_THRESHOLD_LONG" not in directional
+    assert "HIGHER_THRESHOLD_LONG" in threshold_response
+
+
 def test_four_outputs_are_byte_deterministic_and_hashes_match(tmp_path):
     events = (reporting_event(direction=Direction.SHORT, offset=1), reporting_event())
     first = tmp_path / "first"

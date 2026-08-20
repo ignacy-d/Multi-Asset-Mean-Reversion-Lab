@@ -308,7 +308,7 @@ def render_report(rows: Sequence[dict[str, object]]) -> str:
     )
     lines.extend(
         _markdown_table(
-            [row for row in rows if row["threshold"] >= 2.0], direction_columns
+            [row for row in rows if row["threshold"] == 2.0], direction_columns
         )
     )
     lines.extend(
