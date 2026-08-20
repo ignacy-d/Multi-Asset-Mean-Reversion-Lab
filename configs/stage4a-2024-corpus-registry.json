@@ -1,0 +1,10 @@
+{
+  "instruments": {
+    "AUDJPY": {"assembled_dataset_id": null, "corpus_id": null, "instrument": "AUDJPY", "requested_end_date": "2024-12-31", "requested_start_date": "2024-01-01", "source_artifact_id": null, "source_artifact_name": "dukascopy-AUDJPY-m1-bid-2024-full-year", "source_workflow_run_id": null, "verification_status": "unverified-github-access-unavailable"},
+    "AUDUSD": {"assembled_dataset_id": null, "corpus_id": null, "instrument": "AUDUSD", "requested_end_date": "2024-12-31", "requested_start_date": "2024-01-01", "source_artifact_id": null, "source_artifact_name": "dukascopy-AUDUSD-m1-bid-2024-full-year", "source_workflow_run_id": null, "verification_status": "unverified-github-access-unavailable"},
+    "EURUSD": {"assembled_dataset_id": null, "corpus_id": null, "instrument": "EURUSD", "requested_end_date": "2024-12-31", "requested_start_date": "2024-01-01", "source_artifact_id": null, "source_artifact_name": "dukascopy-EURUSD-m1-bid-2024-full-year", "source_workflow_run_id": null, "verification_status": "unverified-github-access-unavailable"},
+    "GBPUSD": {"assembled_dataset_id": null, "corpus_id": null, "instrument": "GBPUSD", "requested_end_date": "2024-12-31", "requested_start_date": "2024-01-01", "source_artifact_id": null, "source_artifact_name": "dukascopy-GBPUSD-m1-bid-2024-full-year", "source_workflow_run_id": null, "verification_status": "unverified-github-access-unavailable"},
+    "USDJPY": {"assembled_dataset_id": null, "corpus_id": null, "instrument": "USDJPY", "requested_end_date": "2024-12-31", "requested_start_date": "2024-01-01", "source_artifact_id": null, "source_artifact_name": "dukascopy-USDJPY-m1-bid-2024-full-year", "source_workflow_run_id": null, "verification_status": "unverified-github-access-unavailable"}
+  },
+  "registry_schema_version": "stage-4a-2024-corpus-registry-v1"
+}
