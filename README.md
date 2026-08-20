@@ -103,9 +103,26 @@ A missing minute anywhere in the required 120-minute future path marks the event
 incomplete: fixed snapshots that exist remain explicit, while first passage,
 maximum reversion, and pathwise MAE/MFE are unavailable rather than computed on
 a shortened path. Each unavailable pre-signal offset is independently `null`.
-Stage 4A adds no costs, spreads, slippage, trade or execution rules, TP/SL,
-optimization, dynamic equilibrium, filters, models, reporting dashboard, or 2025
-analysis.
+
+The deterministic Stage 4A reporting API writes exactly `events.jsonl`,
+`matrix.csv`, `summary.json`, and `report.md`. The matrix groups by instrument,
+benchmark family, signal timeframe, session, direction, lookback, threshold, and
+the unchanged event methodology ID. Exact-snapshot aggregates expose their own
+available counts. First-passage hit rates, MAE/MFE, and maximum-reversion
+summaries use complete 120-minute paths only; hit-time summaries use hits only.
+Missing observations are excluded rather than replaced with zero. Quantiles use
+Python's `statistics.quantiles(method="inclusive")` linear interpolation at
+`(n - 1) * p`, with a singleton returning its sole value.
+
+The concise report starts with the predeclared `|z| >= 2.0` anchor, then shows
+the 1.0/1.5/2.0/2.5 threshold response, directional asymmetry with LONG and SHORT
+preserved, and descriptive benchmark robustness. Rows remain in methodology
+identity order: nothing is ranked, selected, or optimized. Stage 4A rows are
+conditional observations and may overlap heavily; observation counts are **not
+independent trade counts**, and no test may assume event independence here.
+Stage 4A adds no Stage 4B construction or deduplication, costs, spreads,
+slippage, trade or execution rules, TP/SL, optimization, dynamic equilibrium,
+filters, models, reporting dashboard, or 2025 analysis.
 
 Later work remains realistic transaction costs and execution semantics,
 dependence-aware/event-level trade construction, OU quality filtering only if
