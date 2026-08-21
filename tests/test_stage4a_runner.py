@@ -451,8 +451,37 @@ def test_workflow_preflight_metadata_outputs_and_env_step_regression():
     assert "ps -eo pid,ppid,%cpu,%mem,rss,vsz,stat,comm" in workflow
     assert "timeout-minutes: 180" in workflow
     assert "cancel-in-progress: true" not in workflow
-    for name in (*runner.RESEARCH_FILES, "execution-audit.json"):
-        assert f"result/{name}" in workflow
+    full_name = (
+        "stage-4a-${{ env.INSTRUMENT_LOWER }}-2024-path-diagnostics-source-"
+        "${{ env.ARTIFACT_ID }}"
+    )
+    review_name = (
+        "stage-4a-${{ env.INSTRUMENT_LOWER }}-2024-review-source-${{ env.ARTIFACT_ID }}"
+    )
+    full_artifact = f"""\
+          name: {full_name}
+          path: |
+            result/events.jsonl
+            result/matrix.csv
+            result/summary.json
+            result/report.md
+            result/execution-audit.json
+          if-no-files-found: error
+          retention-days: 90"""
+    review_artifact = f"""\
+          name: {review_name}
+          path: |
+            result/matrix.csv
+            result/summary.json
+            result/report.md
+            result/execution-audit.json
+          if-no-files-found: error
+          retention-days: 90"""
+    assert full_artifact in workflow
+    assert review_artifact in workflow
+    assert workflow.count("uses: actions/upload-artifact@v4") == 2
+    assert workflow.count("if-no-files-found: error") == 2
+    assert workflow.count("result/events.jsonl") == 1
     resolve = workflow.index("name: Resolve the selected validated registry entry")
     consume = workflow.index("name: Reverify and download the pinned immutable corpus")
     assert resolve < consume
