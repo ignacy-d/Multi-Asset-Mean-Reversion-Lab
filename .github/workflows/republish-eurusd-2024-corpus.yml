@@ -1,0 +1,128 @@
+name: Republish frozen EURUSD 2024 corpus
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  republish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main || { echo '::error::Corpus republication requires refs/heads/main'; exit 1; }
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - name: Independently verify pinned legacy artifact metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LEGACY_RUN_ID: "31746932310"
+          LEGACY_ARTIFACT_ID: "9202006993"
+          LEGACY_ARTIFACT_NAME: dukascopy-eurusd-m1-bid-2024-01-01-2024-12-31
+        run: |
+          set -euo pipefail
+          mkdir -p legacy corpus audit
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$LEGACY_RUN_ID" > legacy/run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$LEGACY_ARTIFACT_ID" > legacy/artifact.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          run = json.loads(Path("legacy/run.json").read_text())
+          artifact = json.loads(Path("legacy/artifact.json").read_text())
+          if run.get("id") != int(os.environ["LEGACY_RUN_ID"]):
+              raise SystemExit("legacy workflow run identity mismatch")
+          if run.get("conclusion") != "success":
+              raise SystemExit("legacy workflow run did not succeed")
+          if artifact.get("id") != int(os.environ["LEGACY_ARTIFACT_ID"]):
+              raise SystemExit("legacy artifact identity mismatch")
+          if artifact.get("name") != os.environ["LEGACY_ARTIFACT_NAME"]:
+              raise SystemExit("legacy artifact name mismatch")
+          if artifact.get("expired") is not False:
+              raise SystemExit("legacy artifact is expired")
+          if (artifact.get("workflow_run") or {}).get("id") != run["id"]:
+              raise SystemExit("legacy artifact/run provenance mismatch")
+          PY
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$LEGACY_ARTIFACT_ID/zip" > legacy/corpus.zip
+          unzip -q legacy/corpus.zip -d corpus
+          mapfile -d '' manifests < <(find corpus -type f -name corpus-manifest.json -print0)
+          test "${#manifests[@]}" -eq 1 || { echo '::error::Expected exactly one corpus manifest'; exit 1; }
+          echo "CORPUS_DIR=$(dirname "${manifests[0]}")" >> "$GITHUB_ENV"
+      - name: Verify frozen manifest, components, provenance, and reconstruction
+        env:
+          LEGACY_RUN_ID: "31746932310"
+          LEGACY_ARTIFACT_ID: "9202006993"
+          LEGACY_ARTIFACT_NAME: dukascopy-eurusd-m1-bid-2024-01-01-2024-12-31
+          REPUBLISHED_ARTIFACT_NAME: dukascopy-EURUSD-m1-bid-2024-full-year
+          EXPECTED_CORPUS_ID: sha256:ce14fc8557b11afd11f81c928370452eca4f023b1d9d72c296ff69d7cb073009
+          EXPECTED_DATASET_ID: sha256:af4c1e166e94c4a10e40586ef33319aa134531d93f84c59922b746aca559c916
+        run: |
+          set -euo pipefail
+          uv run python - <<'PY'
+          import json, os, subprocess
+          from datetime import date
+          from pathlib import Path
+          from mr_lab.providers.dukascopy_range import CorpusManifest, load_offline_corpus
+
+          corpus_dir = Path(os.environ["CORPUS_DIR"])
+          manifest = json.loads((corpus_dir / "corpus-manifest.json").read_text())
+          expected = {
+              "instrument": "EURUSD",
+              "requested_start_date": "2024-01-01",
+              "requested_end_date": "2024-12-31",
+              "corpus_id": os.environ["EXPECTED_CORPUS_ID"],
+              "assembled_dataset_id": os.environ["EXPECTED_DATASET_ID"],
+          }
+          for field, value in expected.items():
+              if manifest.get(field) != value:
+                  raise SystemExit(f"frozen manifest mismatch: {field}")
+          dataset = load_offline_corpus(corpus_dir)
+          reconstructed = CorpusManifest(
+              date.fromisoformat(expected["requested_start_date"]),
+              date.fromisoformat(expected["requested_end_date"]),
+              tuple(date.fromisoformat(value) for value in manifest["confirmed_absent_dates"]),
+              dataset,
+          )
+          if reconstructed.corpus_id != expected["corpus_id"]:
+              raise SystemExit("offline reconstruction corpus identity mismatch")
+          audit = {
+              "assembled_dataset_id": expected["assembled_dataset_id"],
+              "component_sha_provenance_verification_status": "verified",
+              "corpus_id": expected["corpus_id"],
+              "instrument": expected["instrument"],
+              "legacy_artifact_metadata_verification_status": "verified",
+              "legacy_source_artifact_id": int(os.environ["LEGACY_ARTIFACT_ID"]),
+              "legacy_source_artifact_name": os.environ["LEGACY_ARTIFACT_NAME"],
+              "legacy_source_workflow_run_id": int(os.environ["LEGACY_RUN_ID"]),
+              "manifest_verification_status": "verified",
+              "offline_reconstruction_identity_verification_status": "verified",
+              "republished_artifact_name": os.environ["REPUBLISHED_ARTIFACT_NAME"],
+              "repository_commit_sha_used_for_verification": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip(),
+              "requested_end_date": expected["requested_end_date"],
+              "requested_start_date": expected["requested_start_date"],
+          }
+          Path("audit/eurusd-2024-corpus-migration-audit.json").write_text(
+              json.dumps(audit, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          PY
+      - name: Republish unchanged verified corpus under canonical name
+        uses: actions/upload-artifact@v4
+        with:
+          name: dukascopy-EURUSD-m1-bid-2024-full-year
+          path: ${{ env.CORPUS_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload deterministic migration audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: eurusd-2024-corpus-migration-audit
+          path: audit/eurusd-2024-corpus-migration-audit.json
+          if-no-files-found: error
+          retention-days: 90
