@@ -18,7 +18,7 @@ from statistics import fmean, median, quantiles
 from tempfile import NamedTemporaryFile
 
 from mr_lab.providers.instruments import get_instrument_spec
-from mr_lab.stage4a import Stage4AEvent, events_to_jsonl
+from mr_lab.stage4a import Stage4AEvent
 
 STAGE4A_REPORT_SCHEMA_VERSION = "stage-4a-report-v1"
 MATRIX_GROUP_FIELDS = (
@@ -356,25 +356,54 @@ def _atomic_write(path: Path, content: bytes) -> None:
     temporary_path.replace(path)
 
 
+def _atomic_stream_events(path: Path, events: Iterable[Stage4AEvent]) -> str:
+    """Atomically stream the frozen JSONL representation and return its digest."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    digest = sha256()
+    try:
+        with NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            for event in events:
+                encoded = event.to_json().encode()
+                temporary.write(encoded)
+                temporary.write(b"\n")
+                digest.update(encoded)
+                digest.update(b"\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        temporary_path.replace(path)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+    return digest.hexdigest()
+
+
 def write_stage4a_outputs(
     events: Iterable[Stage4AEvent], output_dir: str | Path
 ) -> dict[str, Path]:
     """Write exactly the four deterministic Stage 4A reporting artifacts."""
     ordered = tuple(sorted(events, key=_event_key))
+    print(f"STAGE4A_REPORTING ordering_complete event_count={len(ordered)}", flush=True)
     rows = aggregate_stage4a_events(ordered)
-    events_bytes = events_to_jsonl(ordered).encode()
+    print(
+        f"STAGE4A_REPORTING aggregation_complete matrix_row_count={len(rows)}",
+        flush=True,
+    )
     matrix_bytes = matrix_to_csv(rows).encode()
     report_bytes = render_report(rows).encode()
     paths = {
         name: Path(output_dir) / name
         for name in ("events.jsonl", "matrix.csv", "summary.json", "report.md")
     }
-    for name, content in (
-        ("events.jsonl", events_bytes),
-        ("matrix.csv", matrix_bytes),
-        ("report.md", report_bytes),
-    ):
-        _atomic_write(paths[name], content)
+    print("STAGE4A_REPORTING events_stream_start", flush=True)
+    events_digest = _atomic_stream_events(paths["events.jsonl"], ordered)
+    print("STAGE4A_REPORTING events_stream_complete", flush=True)
+    _atomic_write(paths["matrix.csv"], matrix_bytes)
+    print("STAGE4A_REPORTING matrix_write_complete", flush=True)
+    _atomic_write(paths["report.md"], report_bytes)
+    print("STAGE4A_REPORTING report_write_complete", flush=True)
 
     summary = {
         "benchmark_families": sorted(
@@ -383,7 +412,7 @@ def write_stage4a_outputs(
         "complete_path_total": sum(event.future_path_complete for event in ordered),
         "event_total": len(ordered),
         "hashes": {
-            "events.jsonl": sha256(events_bytes).hexdigest(),
+            "events.jsonl": events_digest,
             "matrix.csv": sha256(matrix_bytes).hexdigest(),
             "report.md": sha256(report_bytes).hexdigest(),
         },
@@ -410,6 +439,7 @@ def write_stage4a_outputs(
         json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode()
     _atomic_write(paths["summary.json"], summary_bytes)
+    print("STAGE4A_REPORTING summary_write_complete", flush=True)
     return paths
 
 

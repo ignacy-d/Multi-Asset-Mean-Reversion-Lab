@@ -168,7 +168,9 @@ def test_partial_registry_fails_closed_for_all_but_verified_single_proceeds():
         select_verified_registry_entries(registry, "GBPUSD")
 
 
-def test_signal_grid_uses_family_constants_identities_and_contexts(monkeypatch):
+def test_signal_grid_uses_family_constants_identities_contexts_and_progress(
+    monkeypatch, capsys
+):
     calls = []
     overlap = SimpleNamespace(
         observation=SimpleNamespace(
@@ -237,6 +239,17 @@ def test_signal_grid_uses_family_constants_identities_and_contexts(monkeypatch):
         assert strategy_id in expected[family]
         if family == "bollinger":
             assert context in (None, "london", "new_york")
+    progress = capsys.readouterr().out
+    assert "STAGE4A_PROGRESS m1_observations_prepared" in progress
+    for timeframe in ("M5", "M15", "H1"):
+        assert f"STAGE4A_PROGRESS timeframe_start timeframe={timeframe}" in progress
+        assert (
+            f"STAGE4A_PROGRESS timeframe_features_complete timeframe={timeframe}"
+            in progress
+        )
+        assert f"STAGE4A_PROGRESS timeframe_complete timeframe={timeframe}" in progress
+    assert "STAGE4A_PROGRESS signal_assembly_complete total_signals=120" in progress
+    assert len(progress.splitlines()) == 11
 
 
 def test_adapters_preserve_strict_stage3b_eligibility_and_direction_parity():
@@ -298,7 +311,9 @@ def test_adapters_preserve_strict_stage3b_eligibility_and_direction_parity():
     assert signal.direction is Direction.LONG and signal.session == "london"
 
 
-def test_runner_batches_diagnostics_and_reporting_once(monkeypatch, tmp_path):
+def test_runner_batches_diagnostics_reporting_and_logs_progress(
+    monkeypatch, tmp_path, capsys
+):
     calls = {"load": 0, "diagnose": 0, "report": 0}
     data = SimpleNamespace(
         metadata=SimpleNamespace(instrument="EURUSD", dataset_id="dataset"),
@@ -332,6 +347,15 @@ def test_runner_batches_diagnostics_and_reporting_once(monkeypatch, tmp_path):
     )
     runner.run_stage4a_2024(tmp_path, tmp_path, "EURUSD")
     assert calls == {"load": 1, "diagnose": 1, "report": 1}
+    progress = capsys.readouterr().out.splitlines()
+    assert progress == [
+        "STAGE4A_PROGRESS corpus_manifest_validated",
+        "STAGE4A_PROGRESS corpus_loaded",
+        "STAGE4A_PROGRESS diagnose_start total_signals=3",
+        "STAGE4A_PROGRESS diagnose_complete total_events=3",
+        "STAGE4A_PROGRESS reporting_start total_events=3",
+        "STAGE4A_PROGRESS reporting_complete",
+    ]
 
 
 def test_execution_audit_is_bound_hashed_deterministic_and_exact_inventory(tmp_path):
@@ -420,6 +444,13 @@ def test_workflow_preflight_metadata_outputs_and_env_step_regression():
     ):
         assert check in workflow
     assert "uv run mr-lab-stage4a" in workflow
+    assert "/usr/bin/time -v uv run mr-lab-stage4a" in workflow
+    for diagnostic in ("nproc", "free -h", "df -h", "ulimit -a"):
+        assert diagnostic in workflow
+    assert "if: ${{ failure() || cancelled() }}" in workflow
+    assert "ps -eo pid,ppid,%cpu,%mem,rss,vsz,stat,comm" in workflow
+    assert "timeout-minutes: 180" in workflow
+    assert "cancel-in-progress: true" not in workflow
     for name in (*runner.RESEARCH_FILES, "execution-audit.json"):
         assert f"result/{name}" in workflow
     resolve = workflow.index("name: Resolve the selected validated registry entry")
