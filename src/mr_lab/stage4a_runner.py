@@ -209,8 +209,16 @@ def select_verified_registry_entries(
 def assemble_frozen_signals(dataset, manifest: Mapping[str, object]):
     """Build the complete frozen grid while reusing each Stage 3B feature builder."""
     m1_observations = build_research_observations(dataset.bars, DEFAULT_SESSION_SPEC)
+    print("STAGE4A_PROGRESS m1_observations_prepared", flush=True)
     signals = []
     for timeframe in FROZEN_TIMEFRAMES:
+        timeframe_name = {"5m": "M5", "15m": "M15", "1h": "H1"}[timeframe.value]
+        print(
+            f"STAGE4A_PROGRESS timeframe_start timeframe={timeframe_name}",
+            flush=True,
+        )
+        timeframe_start = len(signals)
+        family_counts = {"vwap": 0, "vwap-canonical-m1": 0, "bollinger": 0}
         observations = build_research_observations(
             resample_bars(dataset.bars, timeframe).bars, DEFAULT_SESSION_SPEC
         )
@@ -229,6 +237,7 @@ def assemble_frozen_signals(dataset, manifest: Mapping[str, object]):
                     "source_corpus_id": manifest["corpus_id"],
                     "assembled_dataset_id": manifest["assembled_dataset_id"],
                 }
+                before = len(signals)
                 signals.extend(
                     signal
                     for feature in native
@@ -241,6 +250,8 @@ def assemble_frozen_signals(dataset, manifest: Mapping[str, object]):
                         )
                     )
                 )
+                family_counts["vwap"] += len(signals) - before
+                before = len(signals)
                 signals.extend(
                     signal
                     for feature in canonical
@@ -253,6 +264,7 @@ def assemble_frozen_signals(dataset, manifest: Mapping[str, object]):
                         )
                     )
                 )
+                family_counts["vwap-canonical-m1"] += len(signals) - before
         for lookback in BOLLINGER_LOOKBACKS:
             bollinger = build_bollinger_features(observations, lookback)
             for threshold in BOLLINGER_THRESHOLDS:
@@ -283,20 +295,43 @@ def assemble_frozen_signals(dataset, manifest: Mapping[str, object]):
                         )
                         if signal is not None:
                             signals.append(signal)
+                            family_counts["bollinger"] += 1
+        print(
+            f"STAGE4A_PROGRESS timeframe_features_complete timeframe={timeframe_name}",
+            flush=True,
+        )
+        print(
+            "STAGE4A_PROGRESS timeframe_complete "
+            f"timeframe={timeframe_name} signal_count={len(signals) - timeframe_start} "
+            f"vwap={family_counts['vwap']} "
+            f"vwap-canonical-m1={family_counts['vwap-canonical-m1']} "
+            f"bollinger={family_counts['bollinger']}",
+            flush=True,
+        )
+    print(
+        f"STAGE4A_PROGRESS signal_assembly_complete total_signals={len(signals)}",
+        flush=True,
+    )
     return tuple(signals)
 
 
 def run_stage4a_2024(corpus_dir: Path, output_dir: Path, instrument: str):
     """Load once, diagnose one instrument batch, and reuse frozen reporting."""
     manifest = read_and_validate_manifest(corpus_dir, instrument)
+    print("STAGE4A_PROGRESS corpus_manifest_validated", flush=True)
     dataset = load_offline_corpus(corpus_dir)
+    print("STAGE4A_PROGRESS corpus_loaded", flush=True)
     if dataset.metadata.instrument != instrument:
         raise Stage4ARunnerError("loaded dataset instrument disagrees with selection")
     if dataset.metadata.dataset_id != manifest["assembled_dataset_id"]:
         raise Stage4ARunnerError("loaded dataset identity disagrees with manifest")
     signals = assemble_frozen_signals(dataset, manifest)
+    print(f"STAGE4A_PROGRESS diagnose_start total_signals={len(signals)}", flush=True)
     events = diagnose_events(signals, dataset.bars)
+    print(f"STAGE4A_PROGRESS diagnose_complete total_events={len(events)}", flush=True)
+    print(f"STAGE4A_PROGRESS reporting_start total_events={len(events)}", flush=True)
     paths = write_stage4a_outputs(events, output_dir)
+    print("STAGE4A_PROGRESS reporting_complete", flush=True)
     return paths, events, manifest
 
 
@@ -375,6 +410,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             registry_schema_version=str(registry["registry_schema_version"]),
             manifest=_manifest,
         )
+        print("STAGE4A_PROGRESS audit_complete", flush=True)
     for path in paths.values():
         print(f"result={path}")
     return 0

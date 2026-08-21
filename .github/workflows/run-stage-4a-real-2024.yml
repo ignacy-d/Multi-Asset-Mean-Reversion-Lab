@@ -111,6 +111,7 @@ jobs:
       - name: Verify manifest pin and run Stage 4A CLI
         env: {INSTRUMENT: "${{ matrix.instrument }}"}
         run: |
+          set -euo pipefail
           python - <<'PY'
           import json, os
           from pathlib import Path
@@ -118,8 +119,28 @@ jobs:
           for k in ('instrument','corpus_id','assembled_dataset_id','requested_start_date','requested_end_date'):
               if m.get(k) != e[k]: raise SystemExit(f'manifest registry mismatch: {k}')
           PY
-          uv run mr-lab-stage4a --instrument "$INSTRUMENT" --corpus-dir "$CORPUS_DIR" --output-dir result --registry configs/stage4a-2024-corpus-registry.json
+          echo '=== Stage 4A runner resources before CLI ==='
+          nproc || true
+          free -h || true
+          df -h || true
+          ulimit -a || true
+          /usr/bin/time -v uv run mr-lab-stage4a --instrument "$INSTRUMENT" --corpus-dir "$CORPUS_DIR" --output-dir result --registry configs/stage4a-2024-corpus-registry.json
           test "$(find result -maxdepth 1 -type f | wc -l)" -eq 5
+          echo '=== Stage 4A runner resources after successful CLI ==='
+          free -h || true
+          df -h || true
+      - name: Print safe failure or cancellation diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          echo '=== Stage 4A failure diagnostics (no market-data contents) ==='
+          free -h || true
+          df -h || true
+          ps -eo pid,ppid,%cpu,%mem,rss,vsz,stat,comm --sort=-rss | head -40 || true
+          if [[ -d result ]]; then
+            find result -maxdepth 1 -type f -printf '%f %s bytes\n' | sort || true
+          else
+            echo 'result directory is absent'
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: stage-4a-${{ env.INSTRUMENT_LOWER }}-2024-path-diagnostics-source-${{ env.ARTIFACT_ID }}

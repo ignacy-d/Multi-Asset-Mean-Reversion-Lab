@@ -22,6 +22,8 @@ from mr_lab.stage4a import (
 from mr_lab.stage4a_reporting import (
     MATRIX_GROUP_FIELDS,
     QUANTILE_CONVENTION,
+    _atomic_stream_events,
+    _event_key,
     aggregate_stage4a_events,
     matrix_to_csv,
     render_report,
@@ -406,7 +408,11 @@ def test_directional_report_uses_only_anchor_threshold_and_preserves_directions(
 
 
 def test_four_outputs_are_byte_deterministic_and_hashes_match(tmp_path):
-    events = (reporting_event(direction=Direction.SHORT, offset=1), reporting_event())
+    events = (
+        reporting_event(direction=Direction.SHORT, offset=2),
+        reporting_event(offset=0),
+        reporting_event(direction=Direction.LONG, threshold=1.5, offset=1),
+    )
     first = tmp_path / "first"
     second = tmp_path / "second"
     paths = write_stage4a_outputs(reversed(events), first)
@@ -425,14 +431,41 @@ def test_four_outputs_are_byte_deterministic_and_hashes_match(tmp_path):
     records = [
         json.loads(line) for line in (first / "events.jsonl").read_text().splitlines()
     ]
-    assert len(records) == 2 and all(
+    assert len(records) == 3 and all(
         record["stage4a_methodology_id"] == events[0].stage4a_methodology_id
         for record in records
     )
+    ordered = tuple(sorted(events, key=_event_key))
+    old_expected = events_to_jsonl(ordered).encode()
+    actual = (first / "events.jsonl").read_bytes()
+    assert actual == old_expected
+    assert actual.endswith(b"\n") and actual.count(b"\n") == len(events)
+    assert summary["hashes"]["events.jsonl"] == hashlib.sha256(actual).hexdigest()
     csv_rows = list(
         csv.DictReader(io.StringIO(matrix_to_csv(aggregate_stage4a_events(events))))
     )
-    assert len(csv_rows) == 2
+    assert len(csv_rows) == 3
+
+
+def test_stream_failure_never_replaces_existing_final_file(tmp_path):
+    target = tmp_path / "events.jsonl"
+    target.write_bytes(b"previous-valid-output\n")
+
+    class FailsAfterOne:
+        def __init__(self):
+            self.calls = 0
+
+        def to_json(self):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("injected stream failure")
+            return '{"valid":true}'
+
+    event = FailsAfterOne()
+    with pytest.raises(RuntimeError, match="injected stream failure"):
+        _atomic_stream_events(target, (event, event))
+    assert target.read_bytes() == b"previous-valid-output\n"
+    assert tuple(tmp_path.iterdir()) == (target,)
 
 
 def test_insufficient_presignal_history_is_explicit_per_horizon():
