@@ -118,7 +118,7 @@ jobs:
           name: dukascopy-EURUSD-m1-bid-2024-full-year
           path: ${{ env.CORPUS_DIR }}/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
       - name: Upload deterministic migration audit
         uses: actions/upload-artifact@v4
         with:
