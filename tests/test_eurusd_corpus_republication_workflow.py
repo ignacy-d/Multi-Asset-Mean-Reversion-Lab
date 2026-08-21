@@ -43,9 +43,12 @@ def test_exact_frozen_manifest_contract_and_offline_verification_are_required() 
     assert 'reconstructed.corpus_id != expected["corpus_id"]' in text
 
 
-def test_republication_name_and_no_acquisition_path() -> None:
+def test_republication_name_retention_and_no_acquisition_path() -> None:
     text = workflow_text()
-    assert "name: dukascopy-EURUSD-m1-bid-2024-full-year" in text
-    assert "if-no-files-found: error" in text
+    canonical_block = text.split(
+        "name: dukascopy-EURUSD-m1-bid-2024-full-year", 1
+    )[1].split("- name: Upload deterministic migration audit", 1)[0]
+    assert "if-no-files-found: error" in canonical_block
+    assert "retention-days: 90" in canonical_block
     assert "acquire(" not in text
     assert "dukascopy.com" not in text
