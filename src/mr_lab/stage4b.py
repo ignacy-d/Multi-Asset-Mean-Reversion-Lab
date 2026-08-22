@@ -196,6 +196,20 @@ def _state_key(s):
     )
 
 
+def _state_sort_key(s):
+    """Total ordering for state processing without changing state identity."""
+    return (
+        s.instrument,
+        s.benchmark_family,
+        str(s.signal_timeframe),
+        s.session is not None,
+        s.session or "",
+        s.direction.name,
+        s.lookback,
+        s.timestamp,
+    )
+
+
 def _event_id(s):
     raw = json.dumps(
         (*_state_key(s), s.timestamp.isoformat(), s.p0, s.e0, s.z, SIGNAL_THRESHOLD),
@@ -208,7 +222,7 @@ def _event_id(s):
 def deduplicate_states(states) -> tuple[CandidateEvent, ...]:
     armed = {}
     events = []
-    for state in sorted(states, key=lambda s: (_state_key(s), s.timestamp)):
+    for state in sorted(states, key=_state_sort_key):
         key = _state_key(state)
         if not state.qualifying:
             if abs(state.z) < SIGNAL_THRESHOLD:
