@@ -91,9 +91,15 @@ def test_manifest_guard_rejects_every_malformed_or_out_of_scope_date(
 def test_registry_exact_pins_and_status_model():
     registry = load_corpus_registry(Path("configs/stage4a-2024-corpus-registry.json"))
     entries = registry["instruments"]
-    assert entries["EURUSD"]["verification_status"] == "pending-reviewer-verification"
+    assert entries["EURUSD"]["verification_status"] == "verified"
     assert entries["GBPUSD"]["verification_status"] == "pending-acquisition"
     expected = {
+        "EURUSD": (
+            32523318565,
+            9461322006,
+            "sha256:ce14fc8557b11afd11f81c928370452eca4f023b1d9d72c296ff69d7cb073009",
+            "sha256:af4c1e166e94c4a10e40586ef33319aa134531d93f84c59922b746aca559c916",
+        ),
         "USDJPY": (
             32122032975,
             9326494647,
@@ -161,6 +167,10 @@ def test_partial_registry_fails_closed_for_all_but_verified_single_proceeds():
     assert (
         select_verified_registry_entries(registry, "USDJPY")[0]["instrument"]
         == "USDJPY"
+    )
+    assert (
+        select_verified_registry_entries(registry, "EURUSD")[0]["instrument"]
+        == "EURUSD"
     )
     with pytest.raises(Stage4ARunnerError):
         select_verified_registry_entries(registry, "ALL")
