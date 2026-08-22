@@ -1,21 +1,17 @@
-"""Frozen Stage 4B gross-BID trade construction.
-
-The functions in this module are deliberately independent of signal generation and
-reporting.  They consume point-in-time Stage 4A signals and completed canonical M1
-bars, making the engine reusable by a later eligibility filter without changing
-trade semantics.
-"""
+"""Frozen Stage 4B point-in-time signal state and gross-BID trade engine."""
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Protocol
 
-from mr_lab.data import Bar
+from mr_lab.data import Bar, Timeframe
 from mr_lab.providers.instruments import get_instrument_spec
+from mr_lab.research import Direction
 from mr_lab.stage4a import FrozenSignal
 
 SIGNAL_THRESHOLD = 2.0
@@ -26,9 +22,67 @@ TIME_STOPS_MINUTES = (30, 60, 120)
 DIAGNOSTIC_HORIZONS = (5, 15, 30)
 STAGE4B_REPORT_SCHEMA_VERSION = "stage-4b-report-v1"
 
+SEMANTICS = {
+    "threshold_qualification": "existing-stage3b-signal-direction-abs-z-ge-2-v1",
+    "dedup_rearm": "per-spec-first-qualifier-rearm-only-valid-abs-z-lt-2-v2",
+    "reversion_fraction": "direction-times-price-minus-p0-over-abs-d0-v1",
+    "entry_modes": ENTRY_MODES,
+    "entry_windows_minutes": {
+        "immediate": 0,
+        "m1-reclaim-p0": 15,
+        "extension25-then-reclaim-p0": 30,
+    },
+    "extension25": (
+        "m1-extreme-r-le-minus-0.25-then-same-or-later-completed-close-reclaim-v2"
+    ),
+    "diagnostics": {"horizons": DIAGNOSTIC_HORIZONS, "barriers": (0.25, 0.50)},
+    "take_profits_original_displacement": TP_FRACTIONS,
+    "stop_extensions_original_displacement": SL_FRACTIONS,
+    "time_stops_from_entry_exact_m1_close": TIME_STOPS_MINUTES,
+    "target_already_passed": "ineligible-when-r-entry-ge-tp-v1",
+    "m1_completion": "available-at-close-and-strictly-after-entry-v1",
+    "joint_first_exit": "first-m1-tp-sl-or-exact-time-stop-v1",
+    "same_minute_ambiguity": "adverse-first-headline-favorable-first-bound-v1",
+    "exit_bar_mae_mfe": (
+        "certain-prior-bars-plus-exit-price-bound-no-full-exit-bar-extrema-v2"
+    ),
+    "pip_rule": "verified-instrument-precision-minus-one-v1",
+    "baseline_filter": {"family": "none", "spec": "none-v1"},
+    "report_schema": STAGE4B_REPORT_SCHEMA_VERSION,
+}
+STAGE4B_METHODOLOGY_ID = (
+    "sha256:" + sha256(json.dumps(SEMANTICS, sort_keys=True).encode()).hexdigest()
+)
+
 
 class Stage4BError(ValueError):
-    """Raised when input would violate the frozen methodology."""
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SignalState:
+    """One valid completed research observation, qualifying or below threshold."""
+
+    instrument: str
+    timestamp: datetime
+    benchmark_family: str
+    signal_timeframe: Timeframe
+    session: str | None
+    direction: Direction
+    lookback: int
+    p0: float
+    e0: float
+    z: float
+    source_corpus_id: str
+    assembled_dataset_id: str | None
+    strategy_spec_id: str
+    qualifying: bool
+
+    def __post_init__(self):
+        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() != timedelta(0):
+            raise Stage4BError("state timestamp must be UTC")
+        if not math.isfinite(self.z):
+            raise Stage4BError("state z must be finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +98,6 @@ class EntryEligibilityFilter(Protocol):
 
 
 class NoEntryEligibilityFilter:
-    """Frozen baseline; future OU/regime work plugs in at this boundary."""
-
     def evaluate(self, event: CandidateEvent) -> EligibilityDecision:
         return EligibilityDecision()
 
@@ -55,7 +107,7 @@ class CandidateEvent:
     candidate_event_id: str
     signal: FrozenSignal
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self):
         value = asdict(self)
         value["signal"]["signal_timestamp"] = self.signal.signal_timestamp.isoformat()
         value["signal"]["signal_timeframe"] = str(self.signal.signal_timeframe)
@@ -85,99 +137,145 @@ class ExitResult:
     exit_ordering: str = "unambiguous"
     exit_price_adverse_first: float | None = None
     exit_price_favorable_first: float | None = None
-    gross_pips_adverse_first: float | None = None
-    gross_pips_favorable_first: float | None = None
-    mae_price: float | None = None
-    mfe_price: float | None = None
-    time_to_mae: int | None = None
-    time_to_mfe: int | None = None
+    gross_return_price_adverse_first: float | None = None
+    gross_return_price_favorable_first: float | None = None
+    gross_return_pips_adverse_first: float | None = None
+    gross_return_pips_favorable_first: float | None = None
+    gross_return_bp_adverse_first: float | None = None
+    gross_return_bp_favorable_first: float | None = None
+    gross_return_fraction_d0_adverse_first: float | None = None
+    gross_return_fraction_d0_favorable_first: float | None = None
+    holding_minutes: int | None = None
+    mae_price_certain: float | None = None
+    mae_price_upper_bound: float | None = None
+    mae_pips_certain: float | None = None
+    mae_bp_certain: float | None = None
+    mae_fraction_d0_certain: float | None = None
+    mfe_price_certain: float | None = None
+    mfe_price_upper_bound: float | None = None
+    mfe_pips_certain: float | None = None
+    mfe_bp_certain: float | None = None
+    mfe_fraction_d0_certain: float | None = None
+    time_to_mae_certain: int | None = None
+    time_to_mfe_certain: int | None = None
+    exit_bar_path_ambiguous: bool = False
 
 
-def _key(signal: FrozenSignal) -> tuple[object, ...]:
+class M1Index:
+    """Validated canonical M1 exact-time index built once per corpus."""
+
+    def __init__(self, bars):
+        selected = sorted(
+            (b for b in bars if b.timeframe == Timeframe("1m")),
+            key=lambda b: b.available_at,
+        )
+        self._by_time = {b.available_at: b for b in selected}
+        if len(self._by_time) != len(selected):
+            raise Stage4BError("duplicate M1 availability time")
+        self.instrument = selected[0].instrument if selected else None
+
+    def path(self, start: datetime, minutes: int) -> tuple[Bar, ...]:
+        return tuple(
+            b
+            for n in range(1, minutes + 1)
+            if (b := self._by_time.get(start + timedelta(minutes=n))) is not None
+        )
+
+    def exact(self, timestamp: datetime):
+        return self._by_time.get(timestamp)
+
+
+def _state_key(s):
     return (
-        signal.instrument,
-        signal.benchmark_family,
-        str(signal.signal_timeframe),
-        signal.session,
-        signal.direction,
-        signal.lookback,
+        s.instrument,
+        s.benchmark_family,
+        str(s.signal_timeframe),
+        s.session,
+        s.direction,
+        s.lookback,
     )
 
 
-def _event_id(signal: FrozenSignal) -> str:
-    identity = (
-        *_key(signal),
-        signal.signal_timestamp.isoformat(),
-        signal.p0,
-        signal.e0,
-        signal.normalized_deviation,
-        SIGNAL_THRESHOLD,
+def _event_id(s):
+    raw = json.dumps(
+        (*_state_key(s), s.timestamp.isoformat(), s.p0, s.e0, s.z, SIGNAL_THRESHOLD),
+        default=str,
+        separators=(",", ":"),
     )
-    encoded = json.dumps(identity, default=str, separators=(",", ":"))
-    return "stage4b-" + sha256(encoded.encode()).hexdigest()[:24]
+    return "stage4b-" + sha256(raw.encode()).hexdigest()[:24]
 
 
-def deduplicate_signals(
-    signals: list[FrozenSignal] | tuple[FrozenSignal, ...],
-) -> tuple[CandidateEvent, ...]:
-    """Emit the first qualifying bar of each excursion, rearming below 2.0."""
-    ordered = sorted(signals, key=lambda s: (_key(s), s.signal_timestamp))
-    armed: dict[tuple[object, ...], bool] = {}
-    events: list[CandidateEvent] = []
-    for signal in ordered:
-        if signal.threshold != SIGNAL_THRESHOLD:
+def deduplicate_states(states) -> tuple[CandidateEvent, ...]:
+    armed = {}
+    events = []
+    for state in sorted(states, key=lambda s: (_state_key(s), s.timestamp)):
+        key = _state_key(state)
+        if not state.qualifying:
+            if abs(state.z) < SIGNAL_THRESHOLD:
+                armed[key] = True
             continue
-        key = _key(signal)
-        qualifying = abs(signal.normalized_deviation) >= SIGNAL_THRESHOLD
-        if not qualifying:
-            armed[key] = True
-        elif armed.get(key, True):
-            events.append(CandidateEvent(_event_id(signal), signal))
+        if abs(state.z) < SIGNAL_THRESHOLD:
+            raise Stage4BError("qualifying state below threshold")
+        if armed.get(key, True):
+            d0 = state.p0 - state.e0
+            signal = FrozenSignal(
+                state.instrument,
+                state.timestamp,
+                state.benchmark_family,
+                state.signal_timeframe,
+                state.session,
+                state.lookback,
+                SIGNAL_THRESHOLD,
+                state.direction,
+                state.p0,
+                state.e0,
+                d0,
+                state.z,
+                state.source_corpus_id,
+                state.assembled_dataset_id,
+                state.strategy_spec_id,
+            )
+            events.append(CandidateEvent(_event_id(state), signal))
             armed[key] = False
     return tuple(
         sorted(events, key=lambda e: (e.signal.signal_timestamp, e.candidate_event_id))
     )
 
 
-def reversion_fraction(signal: FrozenSignal, price: float) -> float:
+def reversion_fraction(signal, price):
     return int(signal.direction) * (price - signal.p0) / abs(signal.d0)
 
 
-def _extremes(signal: FrozenSignal, bar: Bar) -> tuple[float, float]:
-    values = (reversion_fraction(signal, bar.high), reversion_fraction(signal, bar.low))
-    return max(values), min(values)
+def _extremes(signal, bar):
+    x = (reversion_fraction(signal, bar.high), reversion_fraction(signal, bar.low))
+    return max(x), min(x)
 
 
-def _future_bars(
-    signal: FrozenSignal, bars: tuple[Bar, ...] | list[Bar], minutes: int
-) -> list[Bar]:
-    deadline = signal.signal_timestamp + timedelta(minutes=minutes)
-    return [b for b in bars if signal.signal_timestamp < b.available_at <= deadline]
+def pip_size(instrument):
+    return 10 ** -(get_instrument_spec(instrument).price_precision - 1)
 
 
-def construct_entry(
-    event: CandidateEvent, bars: tuple[Bar, ...] | list[Bar], mode: str
-) -> Entry:
-    """Sequentially construct one entry using completed closes only for reclaim."""
+def construct_entry(event, index, mode):
     if mode not in ENTRY_MODES:
         raise Stage4BError("unsupported entry mode")
     s = event.signal
     if mode == "immediate":
         return Entry(mode, True, s.signal_timestamp, s.p0, 0, 0.0, 0.0, 0.0)
-    path = _future_bars(s, bars, 15 if mode == "m1-reclaim-p0" else 30)
+    path = index.path(s.signal_timestamp, 15 if mode == "m1-reclaim-p0" else 30)
     favorable = adverse = 0.0
-    extension_at: datetime | None = None
-    extension_wait: int | None = None
+    ext_time = None
+    ext_wait = None
     for bar in path:
         fav, adv = _extremes(s, bar)
-        favorable, adverse = max(favorable, fav), min(adverse, adv)
+        favorable = max(favorable, fav)
+        adverse = min(adverse, adv)
         wait = int((bar.available_at - s.signal_timestamp).total_seconds() / 60)
-        if mode.startswith("extension") and extension_at is None and adv <= -0.25:
-            extension_at, extension_wait = bar.available_at, wait
-            # Reclaim must be subsequent; ordering inside this bar is unknowable.
-            continue
+        if mode.startswith("extension") and ext_time is None and adv <= -0.25:
+            ext_time = bar.available_at
+            ext_wait = wait
         reclaim = int(s.direction) * (bar.close - s.p0) > 0
-        if reclaim and (mode == "m1-reclaim-p0" or extension_at is not None):
+        # The completed close is known after every intrabar extreme in this M1 bar.
+        if reclaim and (mode == "m1-reclaim-p0" or ext_time is not None):
             return Entry(
                 mode,
                 True,
@@ -187,45 +285,54 @@ def construct_entry(
                 reversion_fraction(s, bar.close),
                 favorable,
                 adverse,
-                extension_wait,
+                ext_wait,
                 None
-                if extension_at is None
-                else int((bar.available_at - extension_at).total_seconds() / 60),
+                if ext_time is None
+                else int((bar.available_at - ext_time).total_seconds() / 60),
             )
     return Entry(
         mode,
         False,
         pre_entry_max_favorable=favorable,
         pre_entry_max_adverse=adverse,
-        time_to_extension25=extension_wait,
+        time_to_extension25=ext_wait,
     )
 
 
-def path_diagnostic(
-    event: CandidateEvent, bars: tuple[Bar, ...] | list[Bar]
-) -> tuple[dict[str, object], ...]:
+def construct_eligible_entries(event, index, eligibility_filter):
+    """Invoke eligibility exactly once before constructing any entry path."""
+    decision = eligibility_filter.evaluate(event)
+    entries = (
+        {mode: construct_entry(event, index, mode) for mode in ENTRY_MODES}
+        if decision.eligible
+        else {}
+    )
+    return decision, entries
+
+
+def path_diagnostic(event, index):
+    full = index.path(event.signal.signal_timestamp, 30)
     rows = []
     for horizon in DIAGNOSTIC_HORIZONS:
-        hits: dict[str, int | None] = {
+        hits = {
             k: None
             for k in ("reversion25", "extension25", "reversion50", "extension50")
         }
-        ambiguity: dict[str, bool] = {"25": False, "50": False}
-        for bar in _future_bars(event.signal, bars, horizon):
-            fav, adv = _extremes(event.signal, bar)
+        for bar in full:
             minute = int(
                 (bar.available_at - event.signal.signal_timestamp).total_seconds() / 60
             )
+            if minute > horizon:
+                break
+            fav, adv = _extremes(event.signal, bar)
             for level, suffix in ((0.25, "25"), (0.5, "50")):
-                rk, ek = "reversion" + suffix, "extension" + suffix
-                if hits[rk] is None and fav >= level:
-                    hits[rk] = minute
-                if hits[ek] is None and adv <= -level:
-                    hits[ek] = minute
-                ambiguity[suffix] |= fav >= level and adv <= -level
-        row: dict[str, object] = {"horizon_minutes": horizon}
-        for level in ("25", "50"):
-            r, e = hits["reversion" + level], hits["extension" + level]
+                if hits["reversion" + suffix] is None and fav >= level:
+                    hits["reversion" + suffix] = minute
+                if hits["extension" + suffix] is None and adv <= -level:
+                    hits["extension" + suffix] = minute
+        row = {"horizon_minutes": horizon}
+        for suffix in ("25", "50"):
+            r, e = hits["reversion" + suffix], hits["extension" + suffix]
             order = (
                 "none"
                 if r is None and e is None
@@ -235,63 +342,40 @@ def path_diagnostic(
                 if r is None or e < r
                 else "ambiguous_same_minute"
             )
-            row.update(
-                {
-                    f"reversion{level}_hit": r is not None,
-                    f"extension{level}_hit": e is not None,
-                    f"time_to_reversion{level}": r,
-                    f"time_to_extension{level}": e,
-                    f"ordering_{level}": order,
-                    f"same_minute_ambiguity_{level}": ambiguity[level] and r == e,
-                }
-            )
+            row |= {
+                f"reversion{suffix}_hit": r is not None,
+                f"extension{suffix}_hit": e is not None,
+                f"time_to_reversion{suffix}": r,
+                f"time_to_extension{suffix}": e,
+                f"ordering_{suffix}": order,
+                f"same_minute_ambiguity_{suffix}": order == "ambiguous_same_minute",
+            }
         rows.append(row)
     return tuple(rows)
 
 
-def pip_size(instrument: str) -> float:
-    spec = get_instrument_spec(instrument)
-    return 10 ** -(spec.price_precision - 1)
+def target_already_passed(entry, tp):
+    return bool(
+        entry.executed and entry.r_at_entry is not None and entry.r_at_entry >= tp
+    )
 
 
-def simulate_exit(
-    event: CandidateEvent,
-    entry: Entry,
-    bars: tuple[Bar, ...] | list[Bar],
-    *,
-    tp_fraction: float,
-    sl_fraction: float | None,
-    time_stop_minutes: int,
-) -> ExitResult:
-    """Evaluate joint first exit and path extrema only through actual exit."""
+def simulate_exit(event, entry, path, *, tp_fraction, sl_fraction, time_stop_minutes):
     if not entry.executed or entry.timestamp is None or entry.price is None:
-        raise Stage4BError("exit requires an executed entry")
-    if entry.r_at_entry is not None and entry.r_at_entry >= tp_fraction:
+        raise Stage4BError("exit requires executed entry")
+    if target_already_passed(entry, tp_fraction):
         raise Stage4BError("target_already_passed_at_entry")
-    deadline = entry.timestamp + timedelta(minutes=time_stop_minutes)
-    path = [b for b in bars if entry.timestamp < b.available_at <= deadline]
-    mae = mfe = 0.0
-    tmae = tmfe = 0
     direction = int(event.signal.direction)
+    certain_mae = certain_mfe = 0.0
+    tmae = tmfe = 0
+    deadline = entry.timestamp + timedelta(minutes=time_stop_minutes)
     for bar in path:
+        if bar.available_at > deadline:
+            break
         fav_r, adv_r = _extremes(event.signal, bar)
-        favorable = max(
-            0.0,
-            direction * (bar.high - entry.price),
-            direction * (bar.low - entry.price),
-        )
-        adverse = max(
-            0.0,
-            -direction * (bar.high - entry.price),
-            -direction * (bar.low - entry.price),
-        )
-        minute = int((bar.available_at - entry.timestamp).total_seconds() / 60)
-        if favorable > mfe:
-            mfe, tmfe = favorable, minute
-        if adverse > mae:
-            mae, tmae = adverse, minute
         tp = fav_r >= tp_fraction
         sl = sl_fraction is not None and adv_r <= -sl_fraction
+        minute = int((bar.available_at - entry.timestamp).total_seconds() / 60)
         if tp or sl:
             tp_price = event.signal.p0 + direction * tp_fraction * abs(event.signal.d0)
             sl_price = (
@@ -302,62 +386,127 @@ def simulate_exit(
             ambiguous = tp and sl
             adverse_price = sl_price if sl else tp_price
             favorable_price = tp_price
-            scale = pip_size(event.signal.instrument)
-
-            return ExitResult(
-                True,
+            # Exit-bar full extrema are bounds only; the barrier exit price is certain.
+            exit_fav = max(0.0, direction * (favorable_price - entry.price))
+            exit_adv = max(0.0, -direction * (adverse_price - entry.price))
+            full_fav = max(
+                0.0,
+                direction * (bar.high - entry.price),
+                direction * (bar.low - entry.price),
+            )
+            full_adv = max(
+                0.0,
+                -direction * (bar.high - entry.price),
+                -direction * (bar.low - entry.price),
+            )
+            return _result(
+                event,
+                entry,
                 bar.available_at,
-                "ambiguous" if ambiguous else ("tp" if tp else "sl"),
-                "ambiguous_same_minute" if ambiguous else "unambiguous",
+                "ambiguous" if ambiguous else "tp" if tp else "sl",
                 adverse_price,
                 favorable_price,
-                direction * (adverse_price - entry.price) / scale,
-                direction * (favorable_price - entry.price) / scale,
-                mae,
-                mfe,
+                certain_mae,
+                certain_mfe,
+                max(certain_mae, exit_adv, full_adv),
+                max(certain_mfe, exit_fav, full_fav),
                 tmae,
                 tmfe,
+                True,
+                "ambiguous_same_minute" if ambiguous else "unambiguous",
             )
-    exact = next((b for b in path if b.available_at == deadline), None)
-    if exact is None:
-        return ExitResult(
-            False, mae_price=mae, mfe_price=mfe, time_to_mae=tmae, time_to_mfe=tmfe
+        fav = max(
+            0.0,
+            direction * (bar.high - entry.price),
+            direction * (bar.low - entry.price),
         )
-    pnl = direction * (exact.close - entry.price) / pip_size(event.signal.instrument)
+        adv = max(
+            0.0,
+            -direction * (bar.high - entry.price),
+            -direction * (bar.low - entry.price),
+        )
+        if fav > certain_mfe:
+            certain_mfe, tmfe = fav, minute
+        if adv > certain_mae:
+            certain_mae, tmae = adv, minute
+        if bar.available_at == deadline:
+            return _result(
+                event,
+                entry,
+                deadline,
+                "time_stop",
+                bar.close,
+                bar.close,
+                certain_mae,
+                certain_mfe,
+                certain_mae,
+                certain_mfe,
+                tmae,
+                tmfe,
+                False,
+                "unambiguous",
+            )
     return ExitResult(
-        True,
-        deadline,
-        "time_stop",
-        "unambiguous",
-        exact.close,
-        exact.close,
-        pnl,
-        pnl,
-        mae,
-        mfe,
-        tmae,
-        tmfe,
+        False,
+        mae_price_certain=certain_mae,
+        mfe_price_certain=certain_mfe,
+        time_to_mae_certain=tmae,
+        time_to_mfe_certain=tmfe,
     )
 
 
-def target_already_passed(entry: Entry, tp_fraction: float) -> bool:
-    return (
-        entry.executed
-        and entry.r_at_entry is not None
-        and entry.r_at_entry >= tp_fraction
+def _result(
+    event,
+    entry,
+    ts,
+    reason,
+    adverse_price,
+    favorable_price,
+    mae,
+    mfe,
+    mae_bound,
+    mfe_bound,
+    tmae,
+    tmfe,
+    path_ambiguous,
+    ordering,
+):
+    direction = int(event.signal.direction)
+    scale = pip_size(event.signal.instrument)
+
+    def values(price):
+        raw = direction * (price - entry.price)
+        return raw, raw / scale, raw / entry.price * 10000, raw / abs(event.signal.d0)
+
+    a = values(adverse_price)
+    f = values(favorable_price)
+    return ExitResult(
+        complete=True,
+        exit_timestamp=ts,
+        exit_reason=reason,
+        exit_ordering=ordering,
+        exit_price_adverse_first=adverse_price,
+        exit_price_favorable_first=favorable_price,
+        gross_return_price_adverse_first=a[0],
+        gross_return_pips_adverse_first=a[1],
+        gross_return_bp_adverse_first=a[2],
+        gross_return_fraction_d0_adverse_first=a[3],
+        gross_return_price_favorable_first=f[0],
+        gross_return_pips_favorable_first=f[1],
+        gross_return_bp_favorable_first=f[2],
+        gross_return_fraction_d0_favorable_first=f[3],
+        holding_minutes=int((ts - entry.timestamp).total_seconds() / 60),
+        mae_price_certain=mae,
+        mae_price_upper_bound=mae_bound,
+        mae_pips_certain=mae / scale,
+        mae_bp_certain=mae / entry.price * 10_000,
+        mae_fraction_d0_certain=mae / abs(event.signal.d0),
+        mfe_price_certain=mfe,
+        mfe_price_upper_bound=mfe_bound,
+        mfe_pips_certain=mfe / scale,
+        mfe_bp_certain=mfe / entry.price * 10_000,
+        mfe_fraction_d0_certain=mfe / abs(event.signal.d0),
+        time_to_mae_certain=tmae,
+        time_to_mfe_certain=tmfe,
+        exit_bar_path_ambiguous=path_ambiguous,
     )
-
-
-def methodology_id() -> str:
-    frozen = {
-        "threshold": SIGNAL_THRESHOLD,
-        "entry_modes": ENTRY_MODES,
-        "tp": TP_FRACTIONS,
-        "sl": SL_FRACTIONS,
-        "time_stops": TIME_STOPS_MINUTES,
-        "schema": STAGE4B_REPORT_SCHEMA_VERSION,
-    }
-    return "sha256:" + sha256(json.dumps(frozen, sort_keys=True).encode()).hexdigest()
-
-
-STAGE4B_METHODOLOGY_ID = methodology_id()

@@ -158,6 +158,7 @@ jobs:
         with:
           name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-review-source-${{ env.ARTIFACT_ID }}
           path: |
+            result/entry-diagnostics.csv
             result/trade-matrix.csv
             result/summary.json
             result/report.md
