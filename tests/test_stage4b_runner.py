@@ -1,0 +1,202 @@
+from pathlib import Path
+
+import pytest
+
+from mr_lab.stage4a_runner import (
+    Stage4ARunnerError,
+    load_corpus_registry,
+    select_verified_registry_entries,
+)
+from mr_lab.stage4b_runner import (
+    GROUP_FIELDS,
+    OUTPUTS,
+    Aggregate,
+    _aggregate_diagnostics,
+    _aggregate_row,
+    _entry_wait_distributions,
+    _filter_provenance,
+    _first_passage_distributions,
+    _json,
+    _long_distributions,
+    _quantile,
+)
+
+
+def test_gbpusd_pending_fails_closed():
+    registry = load_corpus_registry(Path("configs/stage4a-2024-corpus-registry.json"))
+    with pytest.raises(Stage4ARunnerError, match="not verified"):
+        select_verified_registry_entries(registry, "GBPUSD")
+
+
+def test_workflow_has_only_instrument_input_and_review_diagnostics():
+    text = Path(".github/workflows/run-stage-4b-real-2024.yml").read_text()
+    head = text.split("permissions:", 1)[0]
+    assert head.count("type: choice") == 1
+    assert all(
+        name not in head
+        for name in ("threshold:", "tp:", "sl:", "time_stop:", "entry_mode:")
+    )
+    compact = text.split("review-source", 1)[1]
+    assert "result/entry-diagnostics.csv" in compact
+
+
+def test_deterministic_json_and_output_contract():
+    assert _json({"b": 1, "a": 2}) == '{"a":2,"b":1}'
+    assert set(OUTPUTS) == {
+        "candidate-events.jsonl",
+        "trades.jsonl",
+        "entry-diagnostics.csv",
+        "trade-matrix.csv",
+        "summary.json",
+        "report.md",
+        "first-passage-distributions.csv",
+        "conditional-hit.csv",
+        "entry-wait-distributions.csv",
+        "stage4b-distributions.csv",
+    }
+
+
+def test_tp_target_is_not_overwritten_by_observed_hit_fraction():
+    key = (
+        "EURUSD",
+        "vwap",
+        "15m",
+        "london",
+        "LONG",
+        20,
+        2.0,
+        "none",
+        "none-v1",
+        "immediate",
+        0.5,
+        None,
+        30,
+    )
+    aggregate = Aggregate(complete=4, tp=1)
+    row = _aggregate_row(key, aggregate)
+    assert GROUP_FIELDS[10] == "tp_target_fraction"
+    assert row["tp_target_fraction"] == 0.5
+    assert row["tp_exit_fraction"] == 0.25
+
+
+def test_diagnostics_preserve_session_direction_and_lookback():
+    base = {
+        "instrument": "EURUSD",
+        "benchmark_family": "vwap",
+        "signal_timeframe": "15m",
+        "lookback": 20,
+        "horizon_minutes": 5,
+        "reversion25_hit": True,
+        "extension25_hit": False,
+        "time_to_reversion25": 2,
+        "time_to_extension25": None,
+        "ordering_25": "reversion",
+        "reversion50_hit": False,
+        "extension50_hit": False,
+        "time_to_reversion50": None,
+        "time_to_extension50": None,
+        "ordering_50": "none",
+    }
+    rows = _aggregate_diagnostics(
+        [
+            base | {"session": "london", "direction": "LONG"},
+            base | {"session": "new_york", "direction": "SHORT"},
+        ]
+    )
+    assert len(rows) == 2
+    assert {(r["session"], r["direction"]) for r in rows} == {
+        ("london", "LONG"),
+        ("new_york", "SHORT"),
+    }
+
+
+def test_audit_filter_provenance_uses_actual_identity():
+    assert _filter_provenance({("future-ou", "ou-v1")}) == {
+        "filter_family": "future-ou",
+        "filter_spec_id": "ou-v1",
+    }
+
+
+def _diagnostic(event_id, hit):
+    return {
+        "candidate_event_id": event_id,
+        "instrument": "EURUSD",
+        "benchmark_family": "vwap",
+        "signal_timeframe": "15m",
+        "session": "london",
+        "direction": "LONG",
+        "lookback": 20,
+        "horizon_minutes": 30,
+        "time_to_reversion25": hit,
+        "time_to_reversion50": None,
+        "time_to_extension25": None,
+        "time_to_extension50": None,
+    }
+
+
+def test_first_passage_distributions_preserve_observations_and_no_hits():
+    # A secondary arithmetic mean may be 30, but no quantile invents a 30m hit.
+    assert _quantile([15, 45], 0.5) == 15
+    assert _quantile([15, 45], 0.9) == 45
+    rows = [_diagnostic("a", 5), _diagnostic("b", 15), _diagnostic("c", None)]
+    distributions, conditional = _first_passage_distributions(rows)
+    reversion = next(r for r in distributions if r["barrier"] == "R>=+0.25")
+    assert reversion["candidate_event_count"] == 3
+    assert reversion["hit_count"] == 2
+    assert reversion["hit_fraction"] == pytest.approx(2 / 3)
+    assert reversion["time_to_hit_median"] == 5
+    assert reversion["mean_time_to_hit"] == 10
+    second = next(
+        r
+        for r in conditional
+        if r["barrier"] == "R>=+0.25" and r["interval_start_minutes"] == 10
+    )
+    assert second["events_at_risk_at_interval_start"] == 2
+    assert second["new_hits_in_interval"] == 1
+    assert second["conditional_hit_fraction"] == 0.5
+
+
+def test_entry_wait_distribution_keeps_no_entry_separate():
+    common = {
+        "instrument": "EURUSD",
+        "benchmark_family": "vwap",
+        "signal_timeframe": "15m",
+        "session": "london",
+        "direction": "LONG",
+        "lookback": 20,
+        "mode": "m1-reclaim-p0",
+    }
+    rows = [
+        common | {"executed": True, "wait_minutes": 1},
+        common | {"executed": True, "wait_minutes": 10},
+        common | {"executed": False, "wait_minutes": None},
+    ]
+    result = _entry_wait_distributions(rows)[0]
+    assert result["candidate_event_count"] == 3
+    assert result["executed_entry_count"] == 2
+    assert result["no_entry_count"] == 1
+    assert result["wait_median"] == 1
+
+
+def test_long_distribution_uses_certain_mae_mfe_and_is_deterministic():
+    key = (
+        "EURUSD",
+        "vwap",
+        "15m",
+        "london",
+        "LONG",
+        20,
+        2.0,
+        "none",
+        "none-v1",
+        "immediate",
+        0.5,
+        None,
+        30,
+    )
+    aggregate = Aggregate(mae=[3, 15], mfe=[2, 8], pips=[-5, 4], holding=[5, 20])
+    first = _long_distributions({key: aggregate})
+    second = _long_distributions({key: aggregate})
+    assert first == second
+    mae = [r for r in first if r["metric"] == "mae_certain_pips"]
+    assert {r["value"] for r in mae} <= {3, 15}
