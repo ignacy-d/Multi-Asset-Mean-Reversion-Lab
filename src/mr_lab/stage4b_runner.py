@@ -82,7 +82,7 @@ GROUP_FIELDS = (
     "filter_family",
     "filter_spec_id",
     "entry_mode",
-    "tp_fraction",
+    "tp_target_fraction",
     "sl_extension_fraction",
     "time_stop_minutes",
 )
@@ -291,7 +291,7 @@ def _aggregate_row(key, a):
         "ambiguous_same_minute_count": a.ambiguous,
         "ambiguous_fraction": _fraction(a.ambiguous, n),
         "tp_count": a.tp,
-        "tp_fraction": _fraction(a.tp, n),
+        "tp_exit_fraction": _fraction(a.tp, n),
         "sl_count": a.sl,
         "sl_fraction": _fraction(a.sl, n),
         "time_stop_count": a.time_stop,
@@ -355,6 +355,7 @@ def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=No
     groups = defaultdict(Aggregate)
     diagnostics = []
     filter_ = eligibility_filter or NoEntryEligibilityFilter()
+    filter_identities = set()
     totals = defaultdict(int)
     with (output_dir / "trades.jsonl").open("w") as trades:
         for event in events:
@@ -364,11 +365,15 @@ def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=No
                     "instrument": instrument,
                     "signal_timeframe": str(event.signal.signal_timeframe),
                     "benchmark_family": event.signal.benchmark_family,
+                    "session": event.signal.session,
+                    "direction": event.signal.direction.name,
+                    "lookback": event.signal.lookback,
                     **d,
                 }
                 for d in path_diagnostic(event, index)
             )
             decision, entries = construct_eligible_entries(event, index, filter_)
+            filter_identities.add((decision.filter_family, decision.filter_spec_id))
             if not decision.eligible:
                 totals["filter_ineligible"] += 1
                 continue
@@ -441,12 +446,12 @@ def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=No
         totals,
         registry,
         registry_entry,
-        filter_,
+        filter_identities,
     )
     return {p.name: p for p in output_dir.iterdir() if p.is_file()}
 
 
-def _write_outputs(out, events, groups, diagnostics, totals, registry, entry, filter_):
+def _aggregate_diagnostics(diagnostics):
     # Aggregate descriptive diagnostics by stable dimensions and horizon.
     dg = defaultdict(list)
     for row in diagnostics:
@@ -455,6 +460,9 @@ def _write_outputs(out, events, groups, diagnostics, totals, registry, entry, fi
                 row["instrument"],
                 row["benchmark_family"],
                 row["signal_timeframe"],
+                row["session"],
+                row["direction"],
+                row["lookback"],
                 row["horizon_minutes"],
             )
         ].append(row)
@@ -466,6 +474,9 @@ def _write_outputs(out, events, groups, diagnostics, totals, registry, entry, fi
                     "instrument",
                     "benchmark_family",
                     "signal_timeframe",
+                    "session",
+                    "direction",
+                    "lookback",
                     "horizon_minutes",
                 ),
                 key,
@@ -486,6 +497,25 @@ def _write_outputs(out, events, groups, diagnostics, totals, registry, entry, fi
                     sum(r[f"ordering_{level}"] == ordering for r in rows), len(rows)
                 )
         drows.append(result)
+    return drows
+
+
+def _filter_provenance(identities):
+    ordered = sorted(identities)
+    if not ordered:
+        raise ValueError("at least one actual filter identity is required")
+    families = sorted({family for family, _spec in ordered})
+    specs = sorted({spec for _family, spec in ordered})
+    return {
+        "filter_family": families[0] if len(families) == 1 else families,
+        "filter_spec_id": specs[0] if len(specs) == 1 else specs,
+    }
+
+
+def _write_outputs(
+    out, events, groups, diagnostics, totals, registry, entry, filter_identities
+):
+    drows = _aggregate_diagnostics(diagnostics)
     _csv(out / "entry-diagnostics.csv", drows)
     matrix = [
         _aggregate_row(k, a) for k, a in sorted(groups.items(), key=lambda x: str(x[0]))
@@ -500,6 +530,7 @@ def _write_outputs(out, events, groups, diagnostics, totals, registry, entry, fi
         "executed_trade_configuration_count": totals["executed"],
         "incomplete_count": totals["incomplete"],
         "ambiguous_count": totals["ambiguous"],
+        "filter_ineligible_count": totals["filter_ineligible"],
     }
     (out / "summary.json").write_text(_json(summary) + "\n")
     (out / "report.md").write_text(_report(matrix, summary))
@@ -518,8 +549,7 @@ def _write_outputs(out, events, groups, diagnostics, totals, registry, entry, fi
         "assembled_dataset_id": entry["assembled_dataset_id"],
         "requested_start_date": entry["requested_start_date"],
         "requested_end_date": entry["requested_end_date"],
-        "filter_family": "none",
-        "filter_spec_id": "none-v1",
+        **_filter_provenance(filter_identities),
         "output_sha256": hashes,
     }
     (out / "execution-audit.json").write_text(_json(audit) + "\n")

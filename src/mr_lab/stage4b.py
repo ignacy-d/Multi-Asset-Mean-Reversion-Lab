@@ -385,10 +385,18 @@ def simulate_exit(event, entry, path, *, tp_fraction, sl_fraction, time_stop_min
             )
             ambiguous = tp and sl
             adverse_price = sl_price if sl else tp_price
-            favorable_price = tp_price
+            favorable_price = tp_price if tp else sl_price
             # Exit-bar full extrema are bounds only; the barrier exit price is certain.
-            exit_fav = max(0.0, direction * (favorable_price - entry.price))
-            exit_adv = max(0.0, -direction * (adverse_price - entry.price))
+            exit_fav = (
+                max(0.0, direction * (tp_price - entry.price))
+                if tp and not ambiguous
+                else 0.0
+            )
+            exit_adv = (
+                max(0.0, -direction * (sl_price - entry.price))
+                if sl and not ambiguous
+                else 0.0
+            )
             full_fav = max(
                 0.0,
                 direction * (bar.high - entry.price),
@@ -406,12 +414,12 @@ def simulate_exit(event, entry, path, *, tp_fraction, sl_fraction, time_stop_min
                 "ambiguous" if ambiguous else "tp" if tp else "sl",
                 adverse_price,
                 favorable_price,
-                certain_mae,
-                certain_mfe,
+                max(certain_mae, exit_adv),
+                max(certain_mfe, exit_fav),
                 max(certain_mae, exit_adv, full_adv),
                 max(certain_mfe, exit_fav, full_fav),
-                tmae,
-                tmfe,
+                minute if exit_adv > certain_mae else tmae,
+                minute if exit_fav > certain_mfe else tmfe,
                 True,
                 "ambiguous_same_minute" if ambiguous else "unambiguous",
             )

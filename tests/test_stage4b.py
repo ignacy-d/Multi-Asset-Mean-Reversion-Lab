@@ -174,6 +174,12 @@ def test_tp_sl_and_ambiguity_first_exit():
         and sl.exit_reason == "sl"
         and both.exit_ordering == "ambiguous_same_minute"
     )
+    assert tp.gross_return_pips_adverse_first == tp.gross_return_pips_favorable_first
+    assert sl.gross_return_pips_adverse_first == sl.gross_return_pips_favorable_first
+    assert both.gross_return_pips_adverse_first < 0
+    assert both.gross_return_pips_favorable_first > 0
+    assert tp.mfe_price_certain == pytest.approx(0.0025)
+    assert sl.mae_price_certain == pytest.approx(0.005)
 
 
 def test_time_stop_exact_close_and_missing_is_incomplete():
@@ -202,7 +208,8 @@ def test_exit_bar_extrema_are_bounds_not_claimed_exact():
         sl_fraction=None,
         time_stop_minutes=30,
     )
-    assert x.mfe_price_certain == 0 and x.mfe_price_upper_bound == pytest.approx(0.009)
+    assert x.mfe_price_certain == pytest.approx(0.0025)
+    assert x.mfe_price_upper_bound == pytest.approx(0.009)
     assert x.exit_bar_path_ambiguous
 
 
