@@ -23,15 +23,15 @@
       "verification_status": "verified"
     },
     "EURUSD": {
-      "assembled_dataset_id": null,
-      "corpus_id": null,
+      "assembled_dataset_id": "sha256:af4c1e166e94c4a10e40586ef33319aa134531d93f84c59922b746aca559c916",
+      "corpus_id": "sha256:ce14fc8557b11afd11f81c928370452eca4f023b1d9d72c296ff69d7cb073009",
       "instrument": "EURUSD",
       "requested_end_date": "2024-12-31",
       "requested_start_date": "2024-01-01",
-      "source_artifact_id": null,
+      "source_artifact_id": 9461322006,
       "source_artifact_name": "dukascopy-EURUSD-m1-bid-2024-full-year",
-      "source_workflow_run_id": null,
-      "verification_status": "pending-reviewer-verification"
+      "source_workflow_run_id": 32523318565,
+      "verification_status": "verified"
     },
     "GBPUSD": {
       "assembled_dataset_id": null,
