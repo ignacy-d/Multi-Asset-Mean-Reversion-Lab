@@ -70,6 +70,10 @@ OUTPUTS = (
     "trade-matrix.csv",
     "summary.json",
     "report.md",
+    "first-passage-distributions.csv",
+    "conditional-hit.csv",
+    "entry-wait-distributions.csv",
+    "stage4b-distributions.csv",
 )
 GROUP_FIELDS = (
     "instrument",
@@ -266,7 +270,7 @@ def _mean(x):
 
 
 def _median(x):
-    return statistics.median(x) if x else ""
+    return _quantile(x, 0.5)
 
 
 def _fraction(n, d):
@@ -274,7 +278,15 @@ def _fraction(n, d):
 
 
 def _p90(x):
-    return sorted(x)[max(0, math.ceil(0.9 * len(x)) - 1)] if x else ""
+    return _quantile(x, 0.9)
+
+
+def _quantile(values, probability):
+    """Return an observed empirical nearest-rank quantile without interpolation."""
+    if not values:
+        return ""
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(probability * len(ordered)) - 1)]
 
 
 def _aggregate_row(key, a):
@@ -298,6 +310,10 @@ def _aggregate_row(key, a):
         "time_stop_fraction": _fraction(a.time_stop, n),
         "mean_gross_pips": _mean(a.pips),
         "median_gross_pips": _median(a.pips),
+        "gross_pips_p10": _quantile(a.pips, 0.10),
+        "gross_pips_p25": _quantile(a.pips, 0.25),
+        "gross_pips_p75": _quantile(a.pips, 0.75),
+        "gross_pips_p90": _quantile(a.pips, 0.90),
         "mean_gross_bp": _mean(a.bps),
         "median_gross_bp": _median(a.bps),
         "win_fraction": _fraction(wins, n),
@@ -308,8 +324,21 @@ def _aggregate_row(key, a):
         "mean_gross_pips_favorable_first": _mean(a.optimistic_pips),
         "mean_mae_pips": _mean(a.mae),
         "median_mae_pips": _median(a.mae),
+        "mae_pips_p10": _quantile(a.mae, 0.10),
+        "mae_pips_p25": _quantile(a.mae, 0.25),
+        "mae_pips_p75": _quantile(a.mae, 0.75),
+        "mae_pips_p90": _quantile(a.mae, 0.90),
+        "mae_pips_p95": _quantile(a.mae, 0.95),
         "mean_mfe_pips": _mean(a.mfe),
         "median_mfe_pips": _median(a.mfe),
+        "mfe_pips_p10": _quantile(a.mfe, 0.10),
+        "mfe_pips_p25": _quantile(a.mfe, 0.25),
+        "mfe_pips_p75": _quantile(a.mfe, 0.75),
+        "mfe_pips_p90": _quantile(a.mfe, 0.90),
+        "mfe_pips_p95": _quantile(a.mfe, 0.95),
+        "holding_minutes_p10": _quantile(a.holding, 0.10),
+        "holding_minutes_p25": _quantile(a.holding, 0.25),
+        "holding_minutes_p75": _quantile(a.holding, 0.75),
         "median_holding_minutes": _median(a.holding),
         "p90_holding_minutes": _p90(a.holding),
         "median_entry_wait": _median(a.waits),
@@ -354,6 +383,7 @@ def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=No
     )
     groups = defaultdict(Aggregate)
     diagnostics = []
+    entry_observations = []
     filter_ = eligibility_filter or NoEntryEligibilityFilter()
     filter_identities = set()
     totals = defaultdict(int)
@@ -382,6 +412,20 @@ def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=No
                 for e in entries.values()
                 if e.executed and e.timestamp is not None
             }
+            entry_observations.extend(
+                {
+                    "instrument": instrument,
+                    "benchmark_family": event.signal.benchmark_family,
+                    "signal_timeframe": str(event.signal.signal_timeframe),
+                    "session": event.signal.session,
+                    "direction": event.signal.direction.name,
+                    "lookback": event.signal.lookback,
+                    "candidate_event_id": event.candidate_event_id,
+                    **asdict(constructed),
+                }
+                for constructed in entries.values()
+                if constructed.mode != "immediate"
+            )
             for mode, constructed in entries.items():
                 base = (
                     instrument,
@@ -447,6 +491,7 @@ def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=No
         registry,
         registry_entry,
         filter_identities,
+        entry_observations,
     )
     return {p.name: p for p in output_dir.iterdir() if p.is_file()}
 
@@ -512,15 +557,185 @@ def _filter_provenance(identities):
     }
 
 
+DIAGNOSTIC_GROUP_FIELDS = (
+    "instrument",
+    "benchmark_family",
+    "signal_timeframe",
+    "session",
+    "direction",
+    "lookback",
+)
+_BARRIERS = (
+    ("reversion25", "R>=+0.25"),
+    ("reversion50", "R>=+0.50"),
+    ("extension25", "R<=-0.25"),
+    ("extension50", "R<=-0.50"),
+)
+_INTERVALS = ((0, 5), (5, 10), (10, 15), (15, 20), (20, 30))
+
+
+def _first_passage_distributions(diagnostics):
+    """Summarize candidate first passage without interpolating M1 hit times."""
+    groups = defaultdict(list)
+    for row in diagnostics:
+        if row["horizon_minutes"] == 30:
+            groups[tuple(row[field] for field in DIAGNOSTIC_GROUP_FIELDS)].append(row)
+    distributions = []
+    conditional = []
+    for key, rows in sorted(groups.items(), key=lambda item: str(item[0])):
+        identity = dict(zip(DIAGNOSTIC_GROUP_FIELDS, key, strict=True))
+        for barrier_field, barrier in _BARRIERS:
+            times = [
+                row[f"time_to_{barrier_field}"]
+                for row in rows
+                if row[f"time_to_{barrier_field}"] is not None
+            ]
+            distributions.append(
+                identity
+                | {
+                    "barrier": barrier,
+                    "candidate_event_count": len(rows),
+                    "hit_count": len(times),
+                    "hit_fraction": _fraction(len(times), len(rows)),
+                    "time_to_hit_p10": _quantile(times, 0.10),
+                    "time_to_hit_p25": _quantile(times, 0.25),
+                    "time_to_hit_median": _median(times),
+                    "time_to_hit_p75": _quantile(times, 0.75),
+                    "time_to_hit_p90": _quantile(times, 0.90),
+                    "mean_time_to_hit": _mean(times),
+                    **{
+                        f"hit_by_{minute}m_fraction": _fraction(
+                            sum(time <= minute for time in times), len(rows)
+                        )
+                        for minute in (5, 10, 15, 20, 30)
+                    },
+                }
+            )
+            for start, end in _INTERVALS:
+                at_risk = sum(
+                    time is None or time > start
+                    for time in (row[f"time_to_{barrier_field}"] for row in rows)
+                )
+                new_hits = sum(start < time <= end for time in times)
+                conditional.append(
+                    identity
+                    | {
+                        "barrier": barrier,
+                        "interval_start_minutes": start,
+                        "interval_end_minutes": end,
+                        "events_at_risk_at_interval_start": at_risk,
+                        "new_hits_in_interval": new_hits,
+                        "conditional_hit_fraction": _fraction(new_hits, at_risk),
+                    }
+                )
+    return distributions, conditional
+
+
+def _entry_wait_distributions(observations):
+    fields = (*DIAGNOSTIC_GROUP_FIELDS, "mode")
+    groups = defaultdict(list)
+    for row in observations:
+        groups[tuple(row[field] for field in fields)].append(row)
+    output = []
+    for key, rows in sorted(groups.items(), key=lambda item: str(item[0])):
+        executed = [row for row in rows if row["executed"]]
+        waits = [row["wait_minutes"] for row in executed]
+        result = dict(zip(fields, key, strict=True)) | {
+            "candidate_event_count": len(rows),
+            "executed_entry_count": len(executed),
+            "no_entry_count": len(rows) - len(executed),
+            "no_entry_fraction": _fraction(len(rows) - len(executed), len(rows)),
+            "wait_p10": _quantile(waits, 0.10),
+            "wait_p25": _quantile(waits, 0.25),
+            "wait_median": _median(waits),
+            "wait_p75": _quantile(waits, 0.75),
+            "wait_p90": _quantile(waits, 0.90),
+            "mean_wait": _mean(waits),
+        }
+        for minute in (1, 5, 10, 15):
+            result[f"entry_by_{minute}m_fraction"] = _fraction(
+                sum(wait <= minute for wait in waits), len(rows)
+            )
+        if key[-1] == "extension25-then-reclaim-p0":
+            for name, source in (
+                ("time_to_extension25", "time_to_extension25"),
+                ("time_extension25_to_reclaim", "time_from_extension25_to_entry"),
+            ):
+                values = [row[source] for row in executed if row[source] is not None]
+                for label, probability in (
+                    ("p10", 0.10),
+                    ("p25", 0.25),
+                    ("median", 0.50),
+                    ("p75", 0.75),
+                    ("p90", 0.90),
+                ):
+                    result[f"{name}_{label}"] = _quantile(values, probability)
+                result[f"{name}_mean"] = _mean(values)
+            result["same_m1_extension_reclaim_fraction"] = _fraction(
+                sum(row["time_from_extension25_to_entry"] == 0 for row in executed),
+                len(executed),
+            )
+        output.append(result)
+    return output
+
+
+def _long_distributions(groups):
+    rows = []
+    metrics = (
+        ("gross_pips_adverse_first", "pips"),
+        ("mae_certain_pips", "mae"),
+        ("mfe_certain_pips", "mfe"),
+        ("holding_minutes", "holding"),
+    )
+    for key, aggregate in sorted(groups.items(), key=lambda item: str(item[0])):
+        identity = dict(zip(GROUP_FIELDS, key, strict=True))
+        for metric, attribute in metrics:
+            values = getattr(aggregate, attribute)
+            for label, probability in (
+                ("p10", 0.10),
+                ("p25", 0.25),
+                ("median", 0.50),
+                ("p75", 0.75),
+                ("p90", 0.90),
+                ("p95", 0.95),
+            ):
+                rows.append(
+                    identity
+                    | {
+                        "metric": metric,
+                        "quantile": label,
+                        "value": _quantile(values, probability),
+                        "sample_count": len(values),
+                    }
+                )
+    return rows
+
+
 def _write_outputs(
-    out, events, groups, diagnostics, totals, registry, entry, filter_identities
+    out,
+    events,
+    groups,
+    diagnostics,
+    totals,
+    registry,
+    entry,
+    filter_identities,
+    entry_observations,
 ):
     drows = _aggregate_diagnostics(diagnostics)
     _csv(out / "entry-diagnostics.csv", drows)
+    first_passage, conditional = _first_passage_distributions(diagnostics)
+    _csv(out / "first-passage-distributions.csv", first_passage)
+    _csv(out / "conditional-hit.csv", conditional)
+    _csv(
+        out / "entry-wait-distributions.csv",
+        _entry_wait_distributions(entry_observations),
+    )
     matrix = [
         _aggregate_row(k, a) for k, a in sorted(groups.items(), key=lambda x: str(x[0]))
     ]
     _csv(out / "trade-matrix.csv", matrix)
+    _csv(out / "stage4b-distributions.csv", _long_distributions(groups))
     summary = {
         "reporting_schema_version": STAGE4B_REPORT_SCHEMA_VERSION,
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
@@ -584,6 +799,14 @@ def _report(matrix, summary):
         "## Entry-mode and exit behavior\n"
         "The matrix reports no-entry, ambiguity, TP, SL, and time-stop rates for "
         "each frozen entry mode and exit combination.\n\n"
+        "## Distributional path shape\n"
+        "Mean timing and mean excursion values must not be interpreted as typical "
+        "entry/exit parameters. Timing and excursion distributions may be "
+        "multimodal or strongly skewed. Stage 4B interpretation should prioritize "
+        "first-passage distributions, quantiles, and cumulative/conditional hit "
+        "behavior. The interpretation hierarchy remains M15, frozen z=2, session, "
+        "direction, benchmark and lookback robustness, entry mode, frozen exits, "
+        "then distributional path shape.\n\n"
         "## M5/H1 robustness\n"
         f"M5: {robust['5m']}; H1: {robust['1h']}. These are robustness/regime "
         "evidence.\n\n## Research caveats\n"

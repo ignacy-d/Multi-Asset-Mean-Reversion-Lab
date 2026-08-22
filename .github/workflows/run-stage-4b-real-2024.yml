@@ -125,7 +125,7 @@ jobs:
           df -h || true
           ulimit -a || true
           /usr/bin/time -v uv run mr-lab-stage4b --instrument "$INSTRUMENT" --corpus-dir "$CORPUS_DIR" --output-dir result --registry configs/stage4a-2024-corpus-registry.json
-          test "$(find result -maxdepth 1 -type f | wc -l)" -eq 7
+          test "$(find result -maxdepth 1 -type f | wc -l)" -eq 11
           echo '=== Stage 4B runner resources after successful CLI ==='
           free -h || true
           df -h || true
@@ -148,6 +148,10 @@ jobs:
             result/candidate-events.jsonl
             result/trades.jsonl
             result/entry-diagnostics.csv
+            result/first-passage-distributions.csv
+            result/conditional-hit.csv
+            result/entry-wait-distributions.csv
+            result/stage4b-distributions.csv
             result/trade-matrix.csv
             result/summary.json
             result/report.md
@@ -159,6 +163,10 @@ jobs:
           name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-review-source-${{ env.ARTIFACT_ID }}
           path: |
             result/entry-diagnostics.csv
+            result/first-passage-distributions.csv
+            result/conditional-hit.csv
+            result/entry-wait-distributions.csv
+            result/stage4b-distributions.csv
             result/trade-matrix.csv
             result/summary.json
             result/report.md
