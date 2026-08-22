@@ -512,7 +512,7 @@ def _aggregate_diagnostics(diagnostics):
             )
         ].append(row)
     drows = []
-    for key, rows in sorted(dg.items()):
+    for key, rows in sorted(dg.items(), key=lambda item: str(item[0])):
         result = dict(
             zip(
                 (

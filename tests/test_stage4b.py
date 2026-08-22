@@ -247,3 +247,33 @@ def test_filter_is_invoked_before_entry_construction():
     filter_ = Reject()
     decision, entries = construct_eligible_entries(event(), M1Index(()), filter_)
     assert filter_.calls == 1 and not decision.eligible and entries == {}
+
+
+def test_dedup_sort_accepts_none_and_named_sessions():
+    def bollinger_state(session):
+        return SignalState(
+            "EURUSD",
+            T,
+            "bollinger",
+            Timeframe("5m"),
+            session,
+            Direction.LONG,
+            20,
+            1.0,
+            1.01,
+            -2.1,
+            "corpus",
+            "dataset",
+            "spec",
+            True,
+        )
+
+    events = deduplicate_states(
+        (
+            bollinger_state("london"),
+            bollinger_state(None),
+        )
+    )
+
+    assert len(events) == 2
+    assert {event.signal.session for event in events} == {None, "london"}

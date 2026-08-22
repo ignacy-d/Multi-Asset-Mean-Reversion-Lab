@@ -200,3 +200,30 @@ def test_long_distribution_uses_certain_mae_mfe_and_is_deterministic():
     assert first == second
     mae = [r for r in first if r["metric"] == "mae_certain_pips"]
     assert {r["value"] for r in mae} <= {3, 15}
+
+
+def test_diagnostic_aggregation_accepts_none_and_named_sessions():
+    common = {
+        "instrument": "EURUSD",
+        "benchmark_family": "bollinger",
+        "signal_timeframe": "15m",
+        "direction": "LONG",
+        "lookback": 20,
+        "horizon_minutes": 30,
+        "time_to_reversion25": 5,
+        "time_to_extension25": None,
+        "ordering_25": "reversion",
+        "time_to_reversion50": None,
+        "time_to_extension50": None,
+        "ordering_50": "none",
+    }
+
+    rows = _aggregate_diagnostics(
+        [
+            common | {"session": None},
+            common | {"session": "london"},
+        ]
+    )
+
+    assert len(rows) == 2
+    assert {row["session"] for row in rows} == {None, "london"}
