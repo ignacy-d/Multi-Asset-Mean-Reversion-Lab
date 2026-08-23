@@ -17,6 +17,7 @@ mr-lab-vwap-m1-robustness = "mr_lab.vwap_m1_robustness:main"
 mr-lab-replicate = "mr_lab.replication:main"
 mr-lab-stage4a = "mr_lab.stage4a_runner:main"
 mr-lab-stage4b = "mr_lab.stage4b_runner:main"
+mr-lab-stage4b-reduce = "mr_lab.stage4b_reducer:main"
 
 [dependency-groups]
 dev = [

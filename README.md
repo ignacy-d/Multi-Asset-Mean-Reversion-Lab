@@ -656,3 +656,23 @@ late-December paths.
 Pins are immutable and fail closed. If a pinned GitHub artifact expires, a
 reviewed registry replacement or reacquisition is required; the workflow never
 selects a latest or substitute artifact automatically.
+
+## Stage 4B runtime sharding
+
+`mr-lab-stage4b` remains the canonical unsharded local command. Its optional
+`--shard-index` and `--shard-count` flags are operational execution controls,
+not research parameters: the runner always assembles every signal state and
+performs the frozen global deduplication/re-arm pass before selecting a shard.
+Candidates are grouped by instrument, benchmark family, signal timeframe,
+session, direction, and lookback. The deterministically sorted group sequence
+is divided into contiguous ranges, approximately balanced by candidate count;
+a group is never split.
+
+The real-2024 workflow fixes the operational count at four and does not expose
+it through `workflow_dispatch`. Each completed shard is independently retained
+with raw candidate and trade rows plus compact reports and a hash-bearing
+manifest. `mr-lab-stage4b-reduce` requires and verifies the complete ordered
+shard set. It concatenates group-complete aggregate and distribution rows rather
+than averaging medians or quantiles. The ordered, verified shard artifacts are
+the canonical raw result; the reducer creates the canonical combined review
+artifact without constructing another giant `trades.jsonl`.
