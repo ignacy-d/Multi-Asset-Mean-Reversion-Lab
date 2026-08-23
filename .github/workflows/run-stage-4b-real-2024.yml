@@ -117,7 +117,7 @@ jobs:
           find result -maxdepth 1 -type f -printf '%f %s bytes\n' | sort || true
       - uses: actions/upload-artifact@v4
         with:
-          name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-shard-${{ matrix.shard_index }}-${{ env.ARTIFACT_ID }}
+          name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}-${{ env.ARTIFACT_ID }}
           path: result/
           if-no-files-found: error
           retention-days: 90

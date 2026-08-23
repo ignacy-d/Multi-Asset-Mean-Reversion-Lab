@@ -42,6 +42,8 @@ def test_workflow_has_only_instrument_input_and_review_diagnostics():
     assert 'STAGE4B_SHARD_COUNT: "4"' in text
     assert "shard_index: [0, 1, 2, 3]" in text
     assert '--shard-count "$STAGE4B_SHARD_COUNT"' in text
+    assert "shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}" in text
+    assert "pattern: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-shard-*" in text
     assert "stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-combined-review" in text
 
 
