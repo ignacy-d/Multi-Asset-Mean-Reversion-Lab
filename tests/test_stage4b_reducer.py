@@ -5,6 +5,7 @@ import json
 import pytest
 
 from mr_lab.stage4b_reducer import COMPACT_CSVS, ShardReductionError, reduce_shards
+from mr_lab.stage4b_runner import _sha256_file
 
 
 def _make_shard(root, index, groups, full_groups):
@@ -36,6 +37,8 @@ def _make_shard(root, index, groups, full_groups):
         "filter_ineligible_count": 0,
     }
     (directory / "summary.json").write_text(json.dumps(summary))
+    (directory / "report.md").write_text("fixture report\n")
+    (directory / "execution-audit.json").write_text("{}\n")
     (directory / "candidate-events.jsonl").write_text("{}\n" * len(groups))
     (directory / "trades.jsonl").write_text("{}\n" * len(groups))
     files = sorted(directory.iterdir())
@@ -52,19 +55,28 @@ def _make_shard(root, index, groups, full_groups):
         "full_candidate_count": len(full_groups),
         "shard_candidate_count": len(groups),
         "shard_index": index,
+        "raw_artifact_name": f"raw-shard-{index}",
+        "compact_artifact_name": f"compact-shard-{index}",
         "full_group_keys": full_groups,
         "group_keys": groups,
-        "file_sha256": {
-            path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files
-        },
+        "file_sha256": {path.name: _sha256_file(path) for path in files},
         "row_counts": {
-            path.name: len(path.read_bytes().splitlines())
+            path.name: sum(1 for _ in path.open("rb"))
             for path in files
             if path.suffix in {".csv", ".jsonl"}
         },
     }
     (directory / "shard-manifest.json").write_text(json.dumps(manifest))
+    (directory / "candidate-events.jsonl").unlink()
+    (directory / "trades.jsonl").unlink()
     return directory
+
+
+def test_streaming_sha256_matches_whole_content_digest(tmp_path):
+    content = (bytes(range(256)) * 8193) + b"final"
+    path = tmp_path / "large-enough-for-chunks.bin"
+    path.write_bytes(content)
+    assert _sha256_file(path) == hashlib.sha256(content).hexdigest()
 
 
 def test_reducer_concatenates_group_complete_quantile_rows(tmp_path):

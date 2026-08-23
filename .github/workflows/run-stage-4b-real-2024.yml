@@ -107,6 +107,8 @@ jobs:
         run: |
           set -euo pipefail
           echo '=== resources before shard ==='; free -h; df -h
+          export STAGE4B_RAW_ARTIFACT_NAME="stage-4b-${INSTRUMENT_LOWER}-2024-raw-shard-${SHARD_INDEX}-attempt-${GITHUB_RUN_ATTEMPT}-${ARTIFACT_ID}"
+          export STAGE4B_COMPACT_ARTIFACT_NAME="stage-4b-${INSTRUMENT_LOWER}-2024-compact-shard-${SHARD_INDEX}-attempt-${GITHUB_RUN_ATTEMPT}-${ARTIFACT_ID}"
           /usr/bin/time -v uv run mr-lab-stage4b --instrument "$INSTRUMENT" --corpus-dir "$CORPUS_DIR" --output-dir result --registry configs/stage4a-2024-corpus-registry.json --shard-index "$SHARD_INDEX" --shard-count "$STAGE4B_SHARD_COUNT"
           test -f result/shard-manifest.json
           echo '=== resources after shard ==='; free -h; df -h
@@ -117,8 +119,26 @@ jobs:
           find result -maxdepth 1 -type f -printf '%f %s bytes\n' | sort || true
       - uses: actions/upload-artifact@v4
         with:
-          name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}-${{ env.ARTIFACT_ID }}
-          path: result/
+          name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-raw-shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}-${{ env.ARTIFACT_ID }}
+          path: |
+            result/candidate-events.jsonl
+            result/trades.jsonl
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-compact-shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}-${{ env.ARTIFACT_ID }}
+          path: |
+            result/shard-manifest.json
+            result/entry-diagnostics.csv
+            result/trade-matrix.csv
+            result/first-passage-distributions.csv
+            result/conditional-hit.csv
+            result/entry-wait-distributions.csv
+            result/stage4b-distributions.csv
+            result/summary.json
+            result/report.md
+            result/execution-audit.json
           if-no-files-found: error
           retention-days: 90
 
@@ -137,7 +157,7 @@ jobs:
         run: echo "INSTRUMENT_LOWER=${INSTRUMENT,,}" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
-          pattern: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-shard-*
+          pattern: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-compact-shard-*
           path: shards
       - run: uv run mr-lab-stage4b-reduce --shard-root shards --output-dir review --shard-count "$STAGE4B_SHARD_COUNT"
       - uses: actions/upload-artifact@v4

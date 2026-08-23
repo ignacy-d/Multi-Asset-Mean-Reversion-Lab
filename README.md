@@ -669,10 +669,13 @@ is divided into contiguous ranges, approximately balanced by candidate count;
 a group is never split.
 
 The real-2024 workflow fixes the operational count at four and does not expose
-it through `workflow_dispatch`. Each completed shard is independently retained
-with raw candidate and trade rows plus compact reports and a hash-bearing
-manifest. `mr-lab-stage4b-reduce` requires and verifies the complete ordered
-shard set. It concatenates group-complete aggregate and distribution rows rather
-than averaging medians or quantiles. The ordered, verified shard artifacts are
-the canonical raw result; the reducer creates the canonical combined review
-artifact without constructing another giant `trades.jsonl`.
+it through `workflow_dispatch`. Each completed shard independently uploads a raw
+artifact containing candidate and trade rows and a compact artifact containing
+reports and its hash-bearing manifest. Raw hashes are computed by the shard with
+streaming SHA-256. `mr-lab-stage4b-reduce` downloads only compact artifacts,
+independently verifies their files, and requires the manifest's raw hashes and
+row counts without materializing raw files. It concatenates group-complete
+aggregate and distribution rows rather than averaging medians or quantiles. The
+immutable raw artifacts and their manifest commitments are the canonical raw
+result; the reducer creates the canonical combined review artifact without
+constructing or downloading giant `trades.jsonl` files.

@@ -76,6 +76,11 @@ OUTPUTS = (
     "entry-wait-distributions.csv",
     "stage4b-distributions.csv",
 )
+RAW_SHARD_OUTPUTS = ("candidate-events.jsonl", "trades.jsonl")
+COMPACT_SHARD_OUTPUTS = (
+    *(name for name in OUTPUTS if name not in RAW_SHARD_OUTPUTS),
+    "execution-audit.json",
+)
 SHARD_SCHEMA_VERSION = "stage4b-runtime-shard-v1"
 STABLE_GROUP_FIELDS = (
     "instrument",
@@ -104,6 +109,12 @@ GROUP_FIELDS = (
 
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _sha256_file(path):
+    """Hash a file with memory bounded independently of file size."""
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
 
 
 def _state(
@@ -645,7 +656,7 @@ def _write_shard_manifest(
     shard_count,
 ):
     files = sorted(path for path in out.iterdir() if path.is_file())
-    hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+    hashes = {p.name: _sha256_file(p) for p in files}
     row_counts = {
         p.name: _line_count(p) for p in files if p.suffix in {".csv", ".jsonl"}
     }
@@ -655,13 +666,20 @@ def _write_shard_manifest(
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "source_commit_sha": _commit_sha(),
         "instrument": entry["instrument"],
-        "registry_identity": hashlib.sha256(registry_path.read_bytes()).hexdigest(),
+        "registry_identity": _sha256_file(registry_path),
         "registry_schema": registry["registry_schema_version"],
         "corpus_id": corpus_manifest["corpus_id"],
         "assembled_dataset_id": corpus_manifest["assembled_dataset_id"],
         "source_workflow_run_id": entry["source_workflow_run_id"],
         "source_artifact_id": entry["source_artifact_id"],
         "source_artifact_name": entry["source_artifact_name"],
+        "raw_artifact_name": os.environ.get(
+            "STAGE4B_RAW_ARTIFACT_NAME", f"local-stage4b-raw-shard-{shard_index}"
+        ),
+        "compact_artifact_name": os.environ.get(
+            "STAGE4B_COMPACT_ARTIFACT_NAME",
+            f"local-stage4b-compact-shard-{shard_index}",
+        ),
         "shard_count": shard_count,
         "shard_index": shard_index,
         "full_candidate_count": len(full_events),
@@ -933,9 +951,7 @@ def _write_outputs(
     }
     (out / "summary.json").write_text(_json(summary) + "\n")
     (out / "report.md").write_text(_report(matrix, summary))
-    hashes = {
-        name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in OUTPUTS
-    }
+    hashes = {name: _sha256_file(out / name) for name in OUTPUTS}
     audit = {
         **summary,
         "source_commit_sha": _commit_sha(),

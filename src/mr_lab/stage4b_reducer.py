@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 from pathlib import Path
 
-from mr_lab.stage4b_runner import _json, _report
+from mr_lab.stage4b_runner import (
+    COMPACT_SHARD_OUTPUTS,
+    RAW_SHARD_OUTPUTS,
+    _json,
+    _report,
+    _sha256_file,
+)
 
 COMPACT_CSVS = (
     "entry-diagnostics.csv",
@@ -79,24 +84,28 @@ def reduce_shards(shard_dirs, output_dir, expected_shard_count):
         for field in IDENTICAL_FIELDS:
             if manifest.get(field) != reference.get(field):
                 raise ShardReductionError(f"provenance mismatch: {field}")
-        for name, expected_hash in manifest["file_sha256"].items():
+        for name in COMPACT_SHARD_OUTPUTS:
+            expected_hash = manifest["file_sha256"].get(name)
             path = directory / name
             if (
-                not path.is_file()
-                or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash
+                not expected_hash
+                or not path.is_file()
+                or _sha256_file(path) != expected_hash
             ):
                 raise ShardReductionError(f"shard file hash mismatch: {name}")
-        required = {
-            *COMPACT_CSVS,
-            "summary.json",
-            "candidate-events.jsonl",
-            "trades.jsonl",
-        }
-        if not required <= manifest["file_sha256"].keys():
+        if not all(
+            manifest["file_sha256"].get(name) and name in manifest["row_counts"]
+            for name in RAW_SHARD_OUTPUTS
+        ):
             raise ShardReductionError(
-                "shard manifest omits required raw or compact file"
+                "shard manifest omits required raw hash or row-count commitment"
             )
-        for name, expected_rows in manifest["row_counts"].items():
+        if not manifest.get("raw_artifact_name") or not manifest.get(
+            "compact_artifact_name"
+        ):
+            raise ShardReductionError("shard artifact identity is required")
+        for name in COMPACT_CSVS:
+            expected_rows = manifest["row_counts"][name]
             with (directory / name).open("rb") as file:
                 actual_rows = sum(1 for _ in file)
             if actual_rows != expected_rows:
@@ -144,12 +153,27 @@ def reduce_shards(shard_dirs, output_dir, expected_shard_count):
     audit = {
         "schema_version": "stage4b-shard-reduction-v1",
         "canonical_raw_result": (
-            "ordered verified shard candidate-events.jsonl and trades.jsonl artifacts"
+            "ordered immutable raw shard artifacts committed by shard-generated "
+            "streaming SHA-256 and row counts; reducer did not download or rehash "
+            "raw files"
         ),
+        "raw_shard_artifacts": [
+            {
+                "shard_index": manifest["shard_index"],
+                "artifact_name": manifest["raw_artifact_name"],
+                "file_sha256": {
+                    name: manifest["file_sha256"][name] for name in RAW_SHARD_OUTPUTS
+                },
+                "row_counts": {
+                    name: manifest["row_counts"][name] for name in RAW_SHARD_OUTPUTS
+                },
+            }
+            for _, manifest in records
+        ],
         **{field: reference[field] for field in IDENTICAL_FIELDS},
         "shards": [manifest for _, manifest in records],
         "combined_output_sha256": {
-            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            path.name: _sha256_file(path)
             for path in sorted(output_dir.iterdir())
             if path.is_file()
         },
