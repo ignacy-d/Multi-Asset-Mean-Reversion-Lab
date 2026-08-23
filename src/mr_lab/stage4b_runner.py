@@ -10,6 +10,7 @@ import math
 import os
 import statistics
 import subprocess
+import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -75,6 +76,20 @@ OUTPUTS = (
     "entry-wait-distributions.csv",
     "stage4b-distributions.csv",
 )
+RAW_SHARD_OUTPUTS = ("candidate-events.jsonl", "trades.jsonl")
+COMPACT_SHARD_OUTPUTS = (
+    *(name for name in OUTPUTS if name not in RAW_SHARD_OUTPUTS),
+    "execution-audit.json",
+)
+SHARD_SCHEMA_VERSION = "stage4b-runtime-shard-v1"
+STABLE_GROUP_FIELDS = (
+    "instrument",
+    "benchmark_family",
+    "signal_timeframe",
+    "session",
+    "direction",
+    "lookback",
+)
 GROUP_FIELDS = (
     "instrument",
     "benchmark_family",
@@ -94,6 +109,12 @@ GROUP_FIELDS = (
 
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _sha256_file(path):
+    """Hash a file with memory bounded independently of file size."""
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
 
 
 def _state(
@@ -359,7 +380,71 @@ def _commit_sha():
     return value
 
 
-def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=None):
+def stable_group_key(event):
+    """Return the frozen reporting group used only for runtime partitioning."""
+    return (
+        event.signal.instrument,
+        event.signal.benchmark_family,
+        str(event.signal.signal_timeframe),
+        event.signal.session,
+        event.signal.direction.name,
+        event.signal.lookback,
+    )
+
+
+def _group_sort_key(key):
+    # JSON gives None and named sessions one explicit, portable ordering.
+    return _json(key)
+
+
+def partition_candidate_groups(events, shard_count):
+    """Deterministically balance contiguous complete groups by event count."""
+    if shard_count < 1:
+        raise ValueError("shard_count must be positive")
+    grouped = defaultdict(list)
+    for event in events:
+        grouped[stable_group_key(event)].append(event)
+    ordered = sorted(grouped, key=_group_sort_key)
+    if shard_count > len(ordered):
+        raise ValueError("shard_count cannot exceed stable group count")
+    shards = []
+    cursor = 0
+    remaining_events = len(events)
+    for shard_index in range(shard_count):
+        remaining_shards = shard_count - shard_index
+        if remaining_shards == 1:
+            end = len(ordered)
+        else:
+            target = remaining_events / remaining_shards
+            end = cursor
+            count = 0
+            max_end = len(ordered) - (remaining_shards - 1)
+            while end < max_end:
+                next_count = len(grouped[ordered[end]])
+                if end > cursor and abs(count - target) <= abs(
+                    count + next_count - target
+                ):
+                    break
+                count += next_count
+                end += 1
+        keys = tuple(ordered[cursor:end])
+        selected = tuple(event for key in keys for event in grouped[key])
+        shards.append((keys, selected))
+        remaining_events -= len(selected)
+        cursor = end
+    return tuple(shards)
+
+
+def run(
+    corpus_dir,
+    output_dir,
+    instrument,
+    registry_path,
+    eligibility_filter=None,
+    *,
+    shard_index=None,
+    shard_count=None,
+):
     registry = load_corpus_registry(registry_path)
     registry_entry = validate_registry_entry(
         instrument, registry["instruments"][instrument], require_verified=True
@@ -371,24 +456,51 @@ def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=No
     dataset = load_offline_corpus(corpus_dir)
     index = M1Index(dataset.bars)
     print("STAGE4B_PROGRESS corpus_loaded m1_index_complete", flush=True)
-    events = deduplicate_states(assemble_signal_states(dataset, manifest))
+    # This ordering is methodology-critical: partition only the complete output
+    # of the existing global state assembly and global re-arm/deduplication.
+    full_events = deduplicate_states(assemble_signal_states(dataset, manifest))
     print(
         "STAGE4B_PROGRESS signal_generation_complete "
-        f"candidate_dedup_complete candidate_count={len(events)}",
+        f"candidate_dedup_complete candidate_count={len(full_events)}",
         flush=True,
     )
+    all_groups = partition_candidate_groups(full_events, 1)[0][0]
+    selected_group_keys = all_groups
+    events = full_events
+    if (shard_index is None) != (shard_count is None):
+        raise ValueError("shard_index and shard_count must be supplied together")
+    if shard_count is not None:
+        if not 0 <= shard_index < shard_count:
+            raise ValueError("shard_index must be in [0, shard_count)")
+        partitions = partition_candidate_groups(full_events, shard_count)
+        selected_group_keys, events = partitions[shard_index]
+        print(
+            "STAGE4B_PROGRESS "
+            f"full_candidate_count={len(full_events)} "
+            f"stable_group_count={len(all_groups)} "
+            f"shard={shard_index + 1}/{shard_count} "
+            f"shard_candidate_count={len(events)} group_range="
+            f"{_json([selected_group_keys[0], selected_group_keys[-1]])}",
+            flush=True,
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "candidate-events.jsonl").write_text(
-        "".join(_json(e.as_dict()) + "\n" for e in events)
-    )
+    with (output_dir / "candidate-events.jsonl").open("w") as candidates:
+        for event in events:
+            candidates.write(_json(event.as_dict()) + "\n")
     groups = defaultdict(Aggregate)
     diagnostics = []
     entry_observations = []
     filter_ = eligibility_filter or NoEntryEligibilityFilter()
     filter_identities = set()
     totals = defaultdict(int)
+    started = time.monotonic()
+    label = (
+        f"{shard_index + 1}/{shard_count}" if shard_count is not None else "unsharded"
+    )
+    print(f"STAGE4B_PROGRESS shard={label} simulation_start", flush=True)
+    trade_rows_written = 0
     with (output_dir / "trades.jsonl").open("w") as trades:
-        for event in events:
+        for processed, event in enumerate(events, 1):
             diagnostics.extend(
                 {
                     "candidate_event_id": event.candidate_event_id,
@@ -482,6 +594,20 @@ def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=No
                                 **asdict(result),
                             }
                             trades.write(_json(row) + "\n")
+                            trade_rows_written += 1
+            if processed % 1000 == 0 or processed == len(events):
+                elapsed = max(time.monotonic() - started, 1e-9)
+                print(
+                    "STAGE4B_PROGRESS "
+                    f"shard={label} processed={processed}/{len(events)} "
+                    f"pct={100 * processed / len(events):.1f} "
+                    f"elapsed_seconds={elapsed:.1f} "
+                    f"candidate_rate={processed / elapsed:.2f} "
+                    f"trade_rows_written={trade_rows_written} "
+                    f"trades_bytes_written={trades.tell()}",
+                    flush=True,
+                )
+    print(f"STAGE4B_PROGRESS shard={label} simulation_complete", flush=True)
     _write_outputs(
         output_dir,
         events,
@@ -493,7 +619,83 @@ def run(corpus_dir, output_dir, instrument, registry_path, eligibility_filter=No
         filter_identities,
         entry_observations,
     )
+    if shard_count is not None:
+        _write_shard_manifest(
+            output_dir,
+            registry_path,
+            registry,
+            registry_entry,
+            manifest,
+            full_events,
+            all_groups,
+            events,
+            selected_group_keys,
+            shard_index,
+            shard_count,
+        )
+        print(f"STAGE4B_PROGRESS shard={label} reporting_complete", flush=True)
     return {p.name: p for p in output_dir.iterdir() if p.is_file()}
+
+
+def _line_count(path):
+    with path.open("rb") as file:
+        return sum(1 for _ in file)
+
+
+def _write_shard_manifest(
+    out,
+    registry_path,
+    registry,
+    entry,
+    corpus_manifest,
+    full_events,
+    all_groups,
+    events,
+    selected_groups,
+    shard_index,
+    shard_count,
+):
+    files = sorted(path for path in out.iterdir() if path.is_file())
+    hashes = {p.name: _sha256_file(p) for p in files}
+    row_counts = {
+        p.name: _line_count(p) for p in files if p.suffix in {".csv", ".jsonl"}
+    }
+    audit = json.loads((out / "execution-audit.json").read_text())
+    value = {
+        "schema_version": SHARD_SCHEMA_VERSION,
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "source_commit_sha": _commit_sha(),
+        "instrument": entry["instrument"],
+        "registry_identity": _sha256_file(registry_path),
+        "registry_schema": registry["registry_schema_version"],
+        "corpus_id": corpus_manifest["corpus_id"],
+        "assembled_dataset_id": corpus_manifest["assembled_dataset_id"],
+        "source_workflow_run_id": entry["source_workflow_run_id"],
+        "source_artifact_id": entry["source_artifact_id"],
+        "source_artifact_name": entry["source_artifact_name"],
+        "raw_artifact_name": os.environ.get(
+            "STAGE4B_RAW_ARTIFACT_NAME", f"local-stage4b-raw-shard-{shard_index}"
+        ),
+        "compact_artifact_name": os.environ.get(
+            "STAGE4B_COMPACT_ARTIFACT_NAME",
+            f"local-stage4b-compact-shard-{shard_index}",
+        ),
+        "shard_count": shard_count,
+        "shard_index": shard_index,
+        "full_candidate_count": len(full_events),
+        "shard_candidate_count": len(events),
+        "full_group_keys": [list(key) for key in all_groups],
+        "group_keys": [list(key) for key in selected_groups],
+        "first_group_key": list(selected_groups[0]),
+        "last_group_key": list(selected_groups[-1]),
+        "first_candidate_event_id": events[0].candidate_event_id,
+        "last_candidate_event_id": events[-1].candidate_event_id,
+        "row_counts": row_counts,
+        "file_sha256": hashes,
+        "filter_family": audit["filter_family"],
+        "filter_spec_id": audit["filter_spec_id"],
+    }
+    (out / "shard-manifest.json").write_text(_json(value) + "\n")
 
 
 def _aggregate_diagnostics(diagnostics):
@@ -749,9 +951,7 @@ def _write_outputs(
     }
     (out / "summary.json").write_text(_json(summary) + "\n")
     (out / "report.md").write_text(_report(matrix, summary))
-    hashes = {
-        name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in OUTPUTS
-    }
+    hashes = {name: _sha256_file(out / name) for name in OUTPUTS}
     audit = {
         **summary,
         "source_commit_sha": _commit_sha(),
@@ -823,8 +1023,17 @@ def main(argv=None):
     p.add_argument("--corpus-dir", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--registry", type=Path, required=True)
+    p.add_argument("--shard-index", type=int)
+    p.add_argument("--shard-count", type=int)
     a = p.parse_args(argv)
-    run(a.corpus_dir, a.output_dir, a.instrument, a.registry)
+    run(
+        a.corpus_dir,
+        a.output_dir,
+        a.instrument,
+        a.registry,
+        shard_index=a.shard_index,
+        shard_count=a.shard_count,
+    )
     return 0
 
 

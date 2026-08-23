@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,8 @@ from mr_lab.stage4b_runner import (
     _json,
     _long_distributions,
     _quantile,
+    partition_candidate_groups,
+    stable_group_key,
 )
 
 
@@ -36,8 +39,27 @@ def test_workflow_has_only_instrument_input_and_review_diagnostics():
         name not in head
         for name in ("threshold:", "tp:", "sl:", "time_stop:", "entry_mode:")
     )
-    compact = text.split("review-source", 1)[1]
-    assert "result/entry-diagnostics.csv" in compact
+    assert 'STAGE4B_SHARD_COUNT: "4"' in text
+    assert "shard_index: [0, 1, 2, 3]" in text
+    assert '--shard-count "$STAGE4B_SHARD_COUNT"' in text
+    raw = "raw-shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}"
+    compact = (
+        "compact-shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}"
+    )
+    assert raw in text
+    assert compact in text
+    assert "result/candidate-events.jsonl" in text
+    assert "result/trades.jsonl" in text
+    reducer = text.split("  reducer:", 1)[1]
+    assert (
+        "pattern: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-compact-shard-*" in reducer
+    )
+    assert (
+        "pattern: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-raw-shard-*" not in reducer
+    )
+    assert "candidate-events.jsonl" not in reducer
+    assert "trades.jsonl" not in reducer
+    assert "stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-combined-review" in text
 
 
 def test_deterministic_json_and_output_contract():
@@ -227,3 +249,46 @@ def test_diagnostic_aggregation_accepts_none_and_named_sessions():
 
     assert len(rows) == 2
     assert {row["session"] for row in rows} == {None, "london"}
+
+
+def _event(event_id, family, session, direction="LONG", lookback=20):
+    signal = SimpleNamespace(
+        instrument="EURUSD",
+        benchmark_family=family,
+        signal_timeframe="15m",
+        session=session,
+        direction=SimpleNamespace(name=direction),
+        lookback=lookback,
+    )
+    return SimpleNamespace(candidate_event_id=event_id, signal=signal)
+
+
+def test_partition_is_deterministic_complete_and_supports_none_session():
+    events = tuple(
+        _event(f"a-{index}", "bollinger", None) for index in range(3)
+    ) + tuple(_event(f"b-{index}", "vwap", "london") for index in range(5))
+    first = partition_candidate_groups(events, 2)
+    assert first == partition_candidate_groups(events, 2)
+    selected = [event for _, shard in first for event in shard]
+    assert [event.candidate_event_id for event in selected] == [
+        event.candidate_event_id for event in events
+    ]
+    assert len({event.candidate_event_id for event in selected}) == len(events)
+    ownership = {
+        stable_group_key(event): shard_index
+        for shard_index, (_, shard) in enumerate(first)
+        for event in shard
+    }
+    assert len(ownership) == 2
+
+
+def test_partition_operates_on_post_dedup_candidate_events():
+    candidates = (
+        _event("before-rearm", "vwap", "london"),
+        _event("after-rearm", "vwap", "london"),
+    )
+    shards = partition_candidate_groups(candidates, 1)
+    assert [event.candidate_event_id for event in shards[0][1]] == [
+        "before-rearm",
+        "after-rearm",
+    ]
