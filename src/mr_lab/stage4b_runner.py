@@ -444,6 +444,7 @@ def run(
     *,
     shard_index=None,
     shard_count=None,
+    trade_row_consumer=None,
 ):
     registry = load_corpus_registry(registry_path)
     registry_entry = validate_registry_entry(
@@ -593,6 +594,11 @@ def run(
                                 ),
                                 **asdict(result),
                             }
+                            # Stage 4C's canonical route can consume each immutable
+                            # gross row here, before it is discarded.  The default
+                            # Stage 4B artifact remains byte-for-byte unchanged.
+                            if trade_row_consumer is not None:
+                                trade_row_consumer(row.copy())
                             trades.write(_json(row) + "\n")
                             trade_rows_written += 1
             if processed % 1000 == 0 or processed == len(events):
