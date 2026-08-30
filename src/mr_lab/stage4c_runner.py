@@ -93,6 +93,23 @@ def _group_owner(key, shard_count):
     return int.from_bytes(digest[:8], "big") % shard_count
 
 
+def _source_input_identity(source_mode, source_audit):
+    components = {
+        "source_mode": source_mode,
+        "instrument": source_audit.get("instrument"),
+        "corpus_id": source_audit["corpus_id"],
+        "assembled_dataset_id": source_audit["assembled_dataset_id"],
+        "source_trade_sha256": source_audit.get("source_trade_sha256"),
+        "registry_identity": source_audit.get("registry_identity"),
+    }
+    if not components["source_trade_sha256"]:
+        raise Stage4CError("source trade SHA-256 commitment is required")
+    if source_mode == "regenerated_stage4b" and not components["registry_identity"]:
+        raise Stage4CError("regenerated source registry identity is required")
+    commitment = "sha256:" + hashlib.sha256(_json(components).encode()).hexdigest()
+    return components, commitment
+
+
 def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
     """Externally group arbitrary input with uniqueness enforced on disk."""
     connection = sqlite3.connect(database)
@@ -102,7 +119,7 @@ def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
         "CREATE TABLE trades (group_key TEXT NOT NULL, identity TEXT PRIMARY KEY, "
         "row_json TEXT NOT NULL) WITHOUT ROWID"
     )
-    before = complete = 0
+    before = complete = owned = 0
     groups = set()
     try:
         for row in rows:
@@ -116,6 +133,7 @@ def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
                 and _group_owner(group, shard_count) != shard_index
             ):
                 continue
+            owned += 1
             group_json = _json(group)
             groups.add(group_json)
             try:
@@ -129,7 +147,7 @@ def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
     except Exception:
         connection.close()
         raise
-    return connection, before, complete, tuple(sorted(groups))
+    return connection, before, complete, owned, tuple(sorted(groups))
 
 
 def _iter_spooled_groups(connection):
@@ -251,6 +269,9 @@ def run_rows(
         if not source_audit.get(required):
             raise Stage4CError(f"missing expected input identity: {required}")
     profile = CostProfile.load(profile_path)
+    source_components, source_commitment = _source_input_identity(
+        source_mode, source_audit
+    )
     expected_matrix = {
         "spread_statistics": list(SPREAD_STATISTICS),
         "slippage_round_turn_pips": list(SLIPPAGES),
@@ -261,7 +282,7 @@ def run_rows(
         raise Stage4CError("invalid shard index")
     output_dir.mkdir(parents=True, exist_ok=True)
     database = output_dir / ".stage4c-spool.sqlite3"
-    connection, before, complete, owned_groups = _spool_rows(
+    connection, before, complete, owned_complete, owned_groups = _spool_rows(
         rows, database, shard_index=shard_index, shard_count=shard_count
     )
     expanded = 0
@@ -351,10 +372,13 @@ def run_rows(
             "slippage_round_turn_pips": list(SLIPPAGES),
         },
         "row_counts": {
-            "stage4b_input": before,
-            "complete": complete,
+            "source_rows_read": before,
+            "source_complete_rows": complete,
+            "owned_complete_rows": owned_complete,
             "scenario_evaluations": expanded,
         },
+        "source_input_components": source_components,
+        "source_input_commitment": source_commitment,
         "account_currency": "USD",
         "currency_conversion_adjustment": {
             "USDJPY/AUDJPY": (
@@ -380,9 +404,16 @@ def run_rows(
             "stage4b_source_commit": STAGE4B_SOURCE_COMMIT,
             "cost_profile_sha256": profile.sha256,
             "scenario_matrix": expected_matrix,
+            "source_mode": source_mode,
+            "source_input_components": source_components,
+            "source_input_commitment": source_commitment,
             "instrument": source_audit.get("instrument"),
             "corpus_id": source_audit["corpus_id"],
             "assembled_dataset_id": source_audit["assembled_dataset_id"],
+            "source_rows_read": before,
+            "source_complete_rows": complete,
+            "owned_complete_rows": owned_complete,
+            "scenario_evaluations": expanded,
             "state_row_count": sum(1 for _ in (output_dir / SHARD_STATE).open()),
             "state_sha256": sha256_file(output_dir / SHARD_STATE),
         }

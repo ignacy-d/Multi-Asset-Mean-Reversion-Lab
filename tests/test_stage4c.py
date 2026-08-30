@@ -9,6 +9,7 @@ import pytest
 
 from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
 from mr_lab.stage4c import (
+    CONFIG_FIELDS,
     SLIPPAGES,
     SPREAD_STATISTICS,
     CostProfile,
@@ -18,7 +19,7 @@ from mr_lab.stage4c import (
     transform_trade,
 )
 from mr_lab.stage4c_reducer import Stage4CReductionError, reduce_shards
-from mr_lab.stage4c_runner import run_regenerated, run_rows
+from mr_lab.stage4c_runner import _group_owner, run_regenerated, run_rows
 
 PROFILE = Path("configs/stage4c-ftmo-cost-profile-v1.json")
 
@@ -132,6 +133,8 @@ def test_streaming_matches_reference_and_sharded_equals_unsharded(
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
     }
     first, second = tmp_path / "one", tmp_path / "two"
     run_rows(
@@ -192,6 +195,8 @@ def test_duplicate_and_wrong_methodology_fail_closed(tmp_path, monkeypatch):
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
     }
     with pytest.raises(Stage4CError, match="duplicate"):
         run_rows(
@@ -217,6 +222,8 @@ def test_reports_required_metrics_and_no_2025_path(tmp_path, monkeypatch):
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
     }
     run_rows(
         iter([trade()]),
@@ -256,6 +263,8 @@ def test_bounded_processing_releases_independent_groups(tmp_path, monkeypatch):
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
     }
     rows = [trade(f"a-{index}") for index in range(20)] + [
         trade(f"b-{index}") | {"benchmark_family": "bollinger"} for index in range(3)
@@ -288,6 +297,8 @@ def test_real_independent_shards_reduce_exactly(tmp_path, monkeypatch):
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
     }
     rows = [
         trade("a", gross=2),
@@ -324,6 +335,61 @@ def test_real_independent_shards_reduce_exactly(tmp_path, monkeypatch):
         "stage4c-cost-scenarios.csv",
     ):
         assert (reduced / name).read_bytes() == (unsharded / name).read_bytes()
+    manifests = [
+        json.loads((directory / "stage4c-shard-manifest.json").read_text())
+        for directory in shards
+    ]
+    assert all(manifest["source_rows_read"] == 4 for manifest in manifests)
+    assert all(manifest["source_complete_rows"] == 4 for manifest in manifests)
+    assert sum(manifest["owned_complete_rows"] for manifest in manifests) == 4
+    assert sum(manifest["scenario_evaluations"] for manifest in manifests) == 64
+    reduced_audit = json.loads((reduced / "execution-audit.json").read_text())
+    assert reduced_audit["source_mode"] == "existing_stage4b_raw"
+    assert reduced_audit["row_counts"] == {
+        "source_rows_read": 4,
+        "source_complete_rows": 4,
+        "owned_complete_rows": 4,
+        "scenario_evaluations": 64,
+    }
+    assert reduced_audit["reduction"]["shard_state_commitments"] == [
+        {
+            "shard_index": manifest["shard_index"],
+            "state_row_count": manifest["state_row_count"],
+            "state_sha256": manifest["state_sha256"],
+        }
+        for manifest in manifests
+    ]
+
+
+def test_regenerated_shards_preserve_original_source_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"callback_stream": "c" * 64},
+        "registry_identity": "registry",
+    }
+    rows = [trade("a"), trade("b") | {"benchmark_family": "bollinger"}]
+    shards = []
+    for index in range(2):
+        directory = tmp_path / f"regenerated-{index}"
+        run_rows(
+            iter(rows),
+            directory,
+            PROFILE,
+            source_mode="regenerated_stage4b",
+            source_audit=audit,
+            shard_index=index,
+            shard_count=2,
+        )
+        shards.append(directory)
+    output = tmp_path / "reduced"
+    reduce_shards(shards, output, PROFILE, 2)
+    final_audit = json.loads((output / "execution-audit.json").read_text())
+    assert final_audit["source_mode"] == "regenerated_stage4b"
+    assert final_audit["source_input_components"]["registry_identity"] == "registry"
 
 
 def test_reducer_rejects_missing_duplicate_overlap_and_inconsistency(
@@ -335,6 +401,8 @@ def test_reducer_rejects_missing_duplicate_overlap_and_inconsistency(
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
     }
     rows = [trade("a"), trade("b") | {"benchmark_family": "bollinger"}]
     shards = []
@@ -371,12 +439,85 @@ def test_reducer_rejects_missing_duplicate_overlap_and_inconsistency(
         reduce_shards(shards, tmp_path / "inconsistent", PROFILE, 2)
 
 
+def test_reducer_rejects_source_commitment_count_and_state_ownership(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    rows = [trade("a"), trade("b") | {"benchmark_family": "bollinger"}]
+    shards = []
+    for index in range(2):
+        directory = tmp_path / f"shard-{index}"
+        run_rows(
+            iter(rows),
+            directory,
+            PROFILE,
+            source_mode="existing_stage4b_raw",
+            source_audit=audit,
+            shard_index=index,
+            shard_count=2,
+        )
+        shards.append(directory)
+    manifests = [directory / "stage4c-shard-manifest.json" for directory in shards]
+    originals = [json.loads(path.read_text()) for path in manifests]
+
+    manifests[1].write_text(
+        json.dumps(originals[1] | {"source_input_commitment": "sha256:" + "0" * 64})
+    )
+    with pytest.raises(Stage4CReductionError, match="source_input_commitment"):
+        reduce_shards(shards, tmp_path / "commitment", PROFILE, 2)
+    manifests[1].write_text(json.dumps(originals[1] | {"shard_count": 3}))
+    with pytest.raises(Stage4CReductionError, match="shard_count mismatch"):
+        reduce_shards(shards, tmp_path / "count", PROFILE, 2)
+    manifests[1].write_text(json.dumps(originals[1]))
+
+    populated = next(
+        index for index, value in enumerate(originals) if value["state_row_count"]
+    )
+    manifest_path = manifests[populated]
+    state_path = shards[populated] / "stage4c-shard-state.jsonl"
+    manifest = originals[populated]
+    manifest_path.write_text(json.dumps(manifest | {"group_ownership": []}))
+    with pytest.raises(Stage4CReductionError, match="absent from declared"):
+        reduce_shards(shards, tmp_path / "absent", PROFILE, 2)
+
+    state_original = state_path.read_text()
+    state_rows = [json.loads(line) for line in state_original.splitlines()]
+    changed = state_rows[0]
+    suffix = 0
+    while True:
+        changed["benchmark_family"] = f"wrong-owner-{suffix}"
+        group = tuple(changed.get(field) for field in CONFIG_FIELDS)
+        if _group_owner(group, 2) != populated:
+            break
+        suffix += 1
+    state_path.write_text("\n".join(json.dumps(row) for row in state_rows) + "\n")
+    changed_manifest = manifest | {
+        "group_ownership": [list(group)],
+        "state_sha256": __import__("hashlib")
+        .sha256(state_path.read_bytes())
+        .hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(changed_manifest))
+    with pytest.raises(Stage4CReductionError, match="another deterministic shard"):
+        reduce_shards(shards, tmp_path / "owner", PROFILE, 2)
+
+
 def test_audit_authority_and_currency_rule(tmp_path, monkeypatch):
     monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
     hostile = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
         "schema_version": "hostile",
         "account_currency": "EUR",
         "volume_bands_modeled": True,
@@ -412,6 +553,8 @@ def test_regenerated_route_uses_stage4b_callback(tmp_path, monkeypatch):
                     "instrument": instrument,
                     "corpus_id": "corpus",
                     "assembled_dataset_id": "dataset",
+                    "source_trade_sha256": {"fixture": "f" * 64},
+                    "registry_identity": "registry",
                 }
             )
         )
