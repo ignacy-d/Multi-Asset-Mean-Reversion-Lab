@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
+import sqlite3
 import statistics
 import subprocess
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -37,6 +40,17 @@ OUTPUTS = (
     "stage4c-summary.json",
     "stage4c-report.md",
     "execution-audit.json",
+)
+SHARD_STATE = "stage4c-shard-state.jsonl"
+SHARD_MANIFEST = "stage4c-shard-manifest.json"
+ALLOWED_SOURCE_AUDIT_FIELDS = (
+    "instrument",
+    "corpus_id",
+    "assembled_dataset_id",
+    "registry_identity",
+    "source_trade_sha256",
+    "source_shard_identities",
+    "expected_shard_count",
 )
 
 
@@ -72,6 +86,66 @@ def _profit_factor(values):
 
 def _key(row, fields):
     return tuple(row.get(field) for field in fields)
+
+
+def _group_owner(key, shard_count):
+    digest = hashlib.sha256(_json(key).encode()).digest()
+    return int.from_bytes(digest[:8], "big") % shard_count
+
+
+def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
+    """Externally group arbitrary input with uniqueness enforced on disk."""
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA journal_mode=OFF")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute(
+        "CREATE TABLE trades (group_key TEXT NOT NULL, identity TEXT PRIMARY KEY, "
+        "row_json TEXT NOT NULL) WITHOUT ROWID"
+    )
+    before = complete = 0
+    groups = set()
+    try:
+        for row in rows:
+            before += 1
+            if not validate_trade(row):
+                continue
+            complete += 1
+            group = _key(row, CONFIG_FIELDS)
+            if (
+                shard_count is not None
+                and _group_owner(group, shard_count) != shard_index
+            ):
+                continue
+            group_json = _json(group)
+            groups.add(group_json)
+            try:
+                connection.execute(
+                    "INSERT INTO trades VALUES (?, ?, ?)",
+                    (group_json, _json(trade_identity(row)), _json(row)),
+                )
+            except sqlite3.IntegrityError as error:
+                raise Stage4CError("duplicate original trade identity") from error
+        connection.commit()
+    except Exception:
+        connection.close()
+        raise
+    return connection, before, complete, tuple(sorted(groups))
+
+
+def _iter_spooled_groups(connection):
+    current_key = None
+    rows = []
+    cursor = connection.execute(
+        "SELECT group_key, row_json FROM trades ORDER BY group_key, identity"
+    )
+    for group_key, row_json in cursor:
+        if current_key is not None and group_key != current_key:
+            yield tuple(json.loads(current_key)), rows
+            rows = []
+        current_key = group_key
+        rows.append(json.loads(row_json))
+    if current_key is not None:
+        yield tuple(json.loads(current_key)), rows
 
 
 def _cell_row(key, rows, profile, statistic, slippage):
@@ -165,9 +239,10 @@ def run_rows(
     source_mode: str,
     source_audit: dict,
     debug_raw=False,
+    shard_index=None,
+    shard_count=None,
 ):
-    """Consume Stage 4B rows once. Only small per-cell samples needed for exact
-    frozen quantiles are retained; no 16x production raw artifact is created."""
+    """Externally group rows, retaining only the currently processed group in RAM."""
     if source_mode not in ("regenerated_stage4b", "existing_stage4b_raw"):
         raise Stage4CError("invalid source_mode")
     if source_audit.get("stage4b_methodology_id") != STAGE4B_METHODOLOGY_ID:
@@ -176,62 +251,56 @@ def run_rows(
         if not source_audit.get(required):
             raise Stage4CError(f"missing expected input identity: {required}")
     profile = CostProfile.load(profile_path)
-    supplied_profile_hash = source_audit.get("cost_profile_sha256")
-    if supplied_profile_hash and supplied_profile_hash != profile.sha256:
-        raise Stage4CError("inconsistent cost-profile SHA")
-    supplied_matrix = source_audit.get("scenario_matrix")
     expected_matrix = {
         "spread_statistics": list(SPREAD_STATISTICS),
         "slippage_round_turn_pips": list(SLIPPAGES),
     }
-    if supplied_matrix and supplied_matrix != expected_matrix:
-        raise Stage4CError("inconsistent scenario matrix")
-    shard_ids = source_audit.get("source_shard_identities", [])
-    if len(shard_ids) != len({_json(identity) for identity in shard_ids}):
-        raise Stage4CError("duplicate input identity")
-    expected_shards = source_audit.get("expected_shard_count")
-    if expected_shards is not None and len(shard_ids) != expected_shards:
-        raise Stage4CError("missing expected shard/input identity")
+    if (shard_index is None) != (shard_count is None):
+        raise Stage4CError("shard index and count must be supplied together")
+    if shard_count is not None and not 0 <= shard_index < shard_count:
+        raise Stage4CError("invalid shard index")
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Exact empirical quantiles need one pair of scalar gross observations per
-    # Stage 4B row. Scenario rows are ephemeral, so normal memory is O(N), not
-    # O(16N), and no expanded production artifact is written.
-    groups, seen = defaultdict(list), set()
-    before = complete = expanded = 0
+    database = output_dir / ".stage4c-spool.sqlite3"
+    connection, before, complete, owned_groups = _spool_rows(
+        rows, database, shard_index=shard_index, shard_count=shard_count
+    )
+    expanded = 0
+    matrix = []
     raw = (output_dir / "stage4c-debug-trades.jsonl").open("w") if debug_raw else None
+    state = (output_dir / SHARD_STATE).open("w") if shard_count is not None else None
     try:
-        for row in rows:
-            before += 1
-            if not validate_trade(row):
-                continue
-            complete += 1
-            original = trade_identity(row)
-            if original in seen:
-                raise Stage4CError("duplicate original trade identity")
-            seen.add(original)
-            gross_snapshot = (
-                row["gross_return_pips_adverse_first"],
-                row["gross_return_pips_favorable_first"],
-            )
-            for transformed in scenario_rows(row, profile):
-                expanded += 1
-                if raw:
-                    raw.write(_json(transformed) + "\n")
-            groups[_key(row, CONFIG_FIELDS)].append(row.copy())
-            if gross_snapshot != (
-                row["gross_return_pips_adverse_first"],
-                row["gross_return_pips_favorable_first"],
-            ):
-                raise Stage4CError("original gross fields mutated")
+        for group_key, group_rows in _iter_spooled_groups(connection):
+            for statistic in SPREAD_STATISTICS:
+                for slippage in SLIPPAGES:
+                    matrix.append(
+                        _cell_row(group_key, group_rows, profile, statistic, slippage)
+                    )
+                    expanded += len(group_rows)
+            if raw:
+                for row in group_rows:
+                    for transformed in scenario_rows(row, profile):
+                        raw.write(_json(transformed) + "\n")
+            if state:
+                for row in group_rows:
+                    compact = {field: row.get(field) for field in CONFIG_FIELDS}
+                    compact.update(
+                        candidate_event_id=row["candidate_event_id"],
+                        complete=True,
+                        gross_return_pips_adverse_first=row[
+                            "gross_return_pips_adverse_first"
+                        ],
+                        gross_return_pips_favorable_first=row[
+                            "gross_return_pips_favorable_first"
+                        ],
+                    )
+                    state.write(_json(compact) + "\n")
     finally:
+        connection.close()
+        database.unlink(missing_ok=True)
         if raw:
             raw.close()
-    matrix = [
-        _cell_row(key, values, profile, statistic, slippage)
-        for key, values in sorted(groups.items(), key=lambda item: _json(item[0]))
-        for statistic in SPREAD_STATISTICS
-        for slippage in SLIPPAGES
-    ]
+        if state:
+            state.close()
     regimes = _regime_rows(matrix)
     scenarios = [
         {
@@ -265,7 +334,12 @@ def run_rows(
         "case is an optimistic cost floor, not expected live P/L. Review broad "
         "net-positive plateaus; no maximum-mean cell is selected.\n"
     )
-    audit = {
+    permitted_source = {
+        field: source_audit[field]
+        for field in ALLOWED_SOURCE_AUDIT_FIELDS
+        if field in source_audit
+    }
+    audit = permitted_source | {
         "schema_version": SCHEMA_VERSION,
         "source_mode": source_mode,
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
@@ -282,14 +356,37 @@ def run_rows(
             "scenario_evaluations": expanded,
         },
         "account_currency": "USD",
+        "currency_conversion_adjustment": {
+            "USDJPY/AUDJPY": (
+                "after spread and slippage: positive x 0.993, negative x 1.007, "
+                "zero unchanged; then subtract commission"
+            ),
+            "EURUSD/AUDUSD": "no quote-currency adjustment",
+        },
         "volume_bands_modeled": False,
         "swaps_modeled": False,
-        **source_audit,
     }
     audit["output_sha256"] = {
         name: sha256_file(output_dir / name) for name in OUTPUTS[:5]
     }
     (output_dir / OUTPUTS[5]).write_text(_json(audit) + "\n")
+    if shard_count is not None:
+        manifest = {
+            "schema_version": "stage4c-compact-shard-v1",
+            "shard_index": shard_index,
+            "shard_count": shard_count,
+            "group_ownership": [json.loads(key) for key in owned_groups],
+            "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+            "stage4b_source_commit": STAGE4B_SOURCE_COMMIT,
+            "cost_profile_sha256": profile.sha256,
+            "scenario_matrix": expected_matrix,
+            "instrument": source_audit.get("instrument"),
+            "corpus_id": source_audit["corpus_id"],
+            "assembled_dataset_id": source_audit["assembled_dataset_id"],
+            "state_row_count": sum(1 for _ in (output_dir / SHARD_STATE).open()),
+            "state_sha256": sha256_file(output_dir / SHARD_STATE),
+        }
+        (output_dir / SHARD_MANIFEST).write_text(_json(manifest) + "\n")
     return summary
 
 
@@ -303,10 +400,70 @@ def iter_jsonl(paths):
                     raise Stage4CError(f"malformed JSONL {path}:{number}") from error
 
 
+def run_regenerated(
+    corpus_dir,
+    output_dir,
+    instrument,
+    registry_path,
+    profile_path,
+    *,
+    debug_raw=False,
+    shard_index=None,
+    shard_count=None,
+):
+    """Run frozen Stage 4B and feed its immutable callback rows into Stage 4C."""
+    from mr_lab.stage4b_runner import run as run_stage4b
+
+    with tempfile.TemporaryDirectory(prefix="stage4c-regenerated-") as temporary:
+        temporary = Path(temporary)
+        callback_rows = temporary / "callback-rows.jsonl"
+        with callback_rows.open("w") as stream:
+            run_stage4b(
+                corpus_dir,
+                temporary / "stage4b",
+                instrument,
+                registry_path,
+                trade_row_consumer=lambda row: stream.write(_json(row) + "\n"),
+            )
+        stage4b_audit = json.loads(
+            (temporary / "stage4b" / "execution-audit.json").read_text()
+        )
+        source_audit = {
+            "stage4b_methodology_id": stage4b_audit["stage4b_methodology_id"],
+            "instrument": stage4b_audit["instrument"],
+            "corpus_id": stage4b_audit["corpus_id"],
+            "assembled_dataset_id": stage4b_audit["assembled_dataset_id"],
+            "registry_identity": sha256_file(Path(registry_path)),
+            "source_trade_sha256": {"callback_stream": sha256_file(callback_rows)},
+        }
+        return run_rows(
+            iter_jsonl((callback_rows,)),
+            Path(output_dir),
+            Path(profile_path),
+            source_mode="regenerated_stage4b",
+            source_audit=source_audit,
+            debug_raw=debug_raw,
+            shard_index=shard_index,
+            shard_count=shard_count,
+        )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage4b-trades", type=Path, action="append", required=True)
-    parser.add_argument("--stage4b-audit", type=Path, required=True)
+    parser.add_argument(
+        "--source-mode",
+        choices=("regenerated_stage4b", "existing_stage4b_raw"),
+        default="regenerated_stage4b",
+    )
+    parser.add_argument("--stage4b-trades", type=Path, action="append")
+    parser.add_argument("--stage4b-audit", type=Path)
+    parser.add_argument("--corpus-dir", type=Path)
+    parser.add_argument("--instrument")
+    parser.add_argument(
+        "--registry",
+        type=Path,
+        default=Path("configs/stage4a-2024-corpus-registry.json"),
+    )
     parser.add_argument(
         "--cost-profile",
         type=Path,
@@ -314,7 +471,25 @@ def main(argv=None):
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--debug-raw", action="store_true")
+    parser.add_argument("--shard-index", type=int)
+    parser.add_argument("--shard-count", type=int)
     args = parser.parse_args(argv)
+    if args.source_mode == "regenerated_stage4b":
+        if not args.corpus_dir or not args.instrument:
+            parser.error("regenerated route requires --corpus-dir and --instrument")
+        run_regenerated(
+            args.corpus_dir,
+            args.output_dir,
+            args.instrument,
+            args.registry,
+            args.cost_profile,
+            debug_raw=args.debug_raw,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
+        )
+        return 0
+    if not args.stage4b_trades or not args.stage4b_audit:
+        parser.error("existing raw route requires --stage4b-trades and --stage4b-audit")
     source = json.loads(args.stage4b_audit.read_text())
     source["source_trade_sha256"] = {
         str(p): sha256_file(p) for p in args.stage4b_trades
@@ -326,6 +501,8 @@ def main(argv=None):
         source_mode="existing_stage4b_raw",
         source_audit=source,
         debug_raw=args.debug_raw,
+        shard_index=args.shard_index,
+        shard_count=args.shard_count,
     )
     return 0
 

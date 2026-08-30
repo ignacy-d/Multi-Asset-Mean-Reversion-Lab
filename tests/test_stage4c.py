@@ -17,7 +17,8 @@ from mr_lab.stage4c import (
     scenario_rows,
     transform_trade,
 )
-from mr_lab.stage4c_runner import run_rows
+from mr_lab.stage4c_reducer import Stage4CReductionError, reduce_shards
+from mr_lab.stage4c_runner import run_regenerated, run_rows
 
 PROFILE = Path("configs/stage4c-ftmo-cost-profile-v1.json")
 
@@ -237,3 +238,187 @@ def test_reports_required_metrics_and_no_2025_path(tmp_path, monkeypatch):
     } <= set(row)
     assert "2025" not in Path("src/mr_lab/stage4c.py").read_text()
     assert "2025" not in Path("src/mr_lab/stage4c_runner.py").read_text()
+
+
+def test_cost_profile_is_strict_json_and_malformed_fails(tmp_path):
+    assert json.loads(PROFILE.read_text())["schema_version"] == (
+        "stage4c-ftmo-cost-profile-v1"
+    )
+    malformed = tmp_path / "profile.json"
+    malformed.write_text(PROFILE.read_text()[:-1])
+    with pytest.raises(Stage4CError, match="malformed cost-profile JSON"):
+        CostProfile.load(malformed)
+
+
+def test_bounded_processing_releases_independent_groups(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+    }
+    rows = [trade(f"a-{index}") for index in range(20)] + [
+        trade(f"b-{index}") | {"benchmark_family": "bollinger"} for index in range(3)
+    ]
+    import mr_lab.stage4c_runner as runner
+
+    original = runner._cell_row
+    observed_group_sizes = []
+
+    def observe(key, group, profile, statistic, slippage):
+        observed_group_sizes.append(len(group))
+        return original(key, group, profile, statistic, slippage)
+
+    monkeypatch.setattr(runner, "_cell_row", observe)
+    run_rows(
+        iter(rows),
+        tmp_path,
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=audit,
+    )
+    assert set(observed_group_sizes) == {3, 20}
+    assert not (tmp_path / ".stage4c-spool.sqlite3").exists()
+
+
+def test_real_independent_shards_reduce_exactly(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+    }
+    rows = [
+        trade("a", gross=2),
+        trade("b", gross=-1),
+        trade("c", gross=4) | {"benchmark_family": "bollinger"},
+        trade("d", gross=-3) | {"entry_mode": "m1-reclaim-p0"},
+    ]
+    unsharded = tmp_path / "unsharded"
+    run_rows(
+        iter(rows),
+        unsharded,
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=audit,
+    )
+    shards = []
+    for index in range(2):
+        directory = tmp_path / f"shard-{index}"
+        run_rows(
+            iter(rows),
+            directory,
+            PROFILE,
+            source_mode="existing_stage4b_raw",
+            source_audit=audit,
+            shard_index=index,
+            shard_count=2,
+        )
+        shards.append(directory)
+    reduced = tmp_path / "reduced"
+    reduce_shards(shards, reduced, PROFILE, 2)
+    for name in (
+        "stage4c-trade-matrix.csv",
+        "stage4c-regime-breadth.csv",
+        "stage4c-cost-scenarios.csv",
+    ):
+        assert (reduced / name).read_bytes() == (unsharded / name).read_bytes()
+
+
+def test_reducer_rejects_missing_duplicate_overlap_and_inconsistency(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+    }
+    rows = [trade("a"), trade("b") | {"benchmark_family": "bollinger"}]
+    shards = []
+    for index in range(2):
+        directory = tmp_path / f"s{index}"
+        run_rows(
+            iter(rows),
+            directory,
+            PROFILE,
+            source_mode="existing_stage4b_raw",
+            source_audit=audit,
+            shard_index=index,
+            shard_count=2,
+        )
+        shards.append(directory)
+    with pytest.raises(Stage4CReductionError, match="missing"):
+        reduce_shards(shards[:1], tmp_path / "missing", PROFILE, 2)
+    manifest_path = shards[1] / "stage4c-shard-manifest.json"
+    original = json.loads(manifest_path.read_text())
+    manifest_path.write_text(json.dumps(original | {"shard_index": 0}))
+    with pytest.raises(Stage4CReductionError, match="duplicate"):
+        reduce_shards(shards, tmp_path / "duplicate", PROFILE, 2)
+    first_manifest_path = shards[0] / "stage4c-shard-manifest.json"
+    first_original = json.loads(first_manifest_path.read_text())
+    first_manifest_path.write_text(
+        json.dumps(first_original | {"group_ownership": [["overlap"]]})
+    )
+    manifest_path.write_text(json.dumps(original | {"group_ownership": [["overlap"]]}))
+    with pytest.raises(Stage4CReductionError, match="overlapping"):
+        reduce_shards(shards, tmp_path / "overlap", PROFILE, 2)
+    first_manifest_path.write_text(json.dumps(first_original))
+    manifest_path.write_text(json.dumps(original | {"cost_profile_sha256": "wrong"}))
+    with pytest.raises(Stage4CReductionError, match="inconsistent"):
+        reduce_shards(shards, tmp_path / "inconsistent", PROFILE, 2)
+
+
+def test_audit_authority_and_currency_rule(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    hostile = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "schema_version": "hostile",
+        "account_currency": "EUR",
+        "volume_bands_modeled": True,
+    }
+    run_rows(
+        iter([trade()]),
+        tmp_path,
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=hostile,
+    )
+    audit = json.loads((tmp_path / "execution-audit.json").read_text())
+    assert audit["schema_version"] == "stage-4c-report-v1"
+    assert audit["account_currency"] == "USD"
+    assert audit["volume_bands_modeled"] is False
+    assert (
+        "positive x 0.993" in audit["currency_conversion_adjustment"]["USDJPY/AUDJPY"]
+    )
+
+
+def test_regenerated_route_uses_stage4b_callback(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    registry = tmp_path / "registry.json"
+    registry.write_text("{}")
+
+    def fake_run(_corpus, output, instrument, _registry, trade_row_consumer=None):
+        output.mkdir()
+        trade_row_consumer(trade(instrument=instrument))
+        (output / "execution-audit.json").write_text(
+            json.dumps(
+                {
+                    "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+                    "instrument": instrument,
+                    "corpus_id": "corpus",
+                    "assembled_dataset_id": "dataset",
+                }
+            )
+        )
+
+    monkeypatch.setattr("mr_lab.stage4b_runner.run", fake_run)
+    output = tmp_path / "output"
+    run_regenerated(tmp_path / "corpus", output, "EURUSD", registry, PROFILE)
+    audit = json.loads((output / "execution-audit.json").read_text())
+    assert audit["source_mode"] == "regenerated_stage4b"
+    assert audit["corpus_id"] == "corpus"

@@ -19,6 +19,7 @@ mr-lab-stage4a = "mr_lab.stage4a_runner:main"
 mr-lab-stage4b = "mr_lab.stage4b_runner:main"
 mr-lab-stage4b-reduce = "mr_lab.stage4b_reducer:main"
 mr-lab-stage4c = "mr_lab.stage4c_runner:main"
+mr-lab-stage4c-reduce = "mr_lab.stage4c_reducer:main"
 
 [dependency-groups]
 dev = [

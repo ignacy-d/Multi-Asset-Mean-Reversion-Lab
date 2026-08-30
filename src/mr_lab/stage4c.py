@@ -53,14 +53,10 @@ class CostProfile:
 
     @classmethod
     def load(cls, path: Path):
-        text = path.read_text()
-        # The frozen v1 byte commitment predates implementation and its committed
-        # serialization is missing one final object terminator.  Preserve those
-        # authoritative bytes (and their SHA) and only complete that unambiguous
-        # EOF terminator in memory.  Any other malformed shape still fails closed.
-        if text.count("{") == text.count("}") + 1 and text.rstrip().endswith("}"):
-            text += "}"
-        raw = json.loads(text)
+        try:
+            raw = json.loads(path.read_text())
+        except json.JSONDecodeError as error:
+            raise Stage4CError("malformed cost-profile JSON") from error
         if raw.get("schema_version") != "stage4c-ftmo-cost-profile-v1":
             raise Stage4CError("unexpected cost-profile schema")
         matrix = raw.get("cost_scenarios", {})
