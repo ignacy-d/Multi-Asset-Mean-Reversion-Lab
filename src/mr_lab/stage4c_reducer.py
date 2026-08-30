@@ -22,6 +22,7 @@ from mr_lab.stage4c_runner import (
     SHARD_MANIFEST,
     SHARD_STATE,
     _group_owner,
+    _source_input_identity,
     iter_jsonl,
     run_rows,
 )
@@ -73,6 +74,27 @@ def reduce_shards(shard_dirs, output_dir, profile_path, expected_shard_count):
         for field in IDENTICAL_FIELDS:
             if manifest.get(field) != reference.get(field):
                 raise Stage4CReductionError(f"inconsistent shard field: {field}")
+        components = manifest.get("source_input_components")
+        if not isinstance(components, dict):
+            raise Stage4CReductionError("malformed source input components")
+        for component, manifest_field in (
+            ("source_mode", "source_mode"),
+            ("instrument", "instrument"),
+            ("corpus_id", "corpus_id"),
+            ("assembled_dataset_id", "assembled_dataset_id"),
+        ):
+            if components.get(component) != manifest.get(manifest_field):
+                raise Stage4CReductionError(f"source component mismatch: {component}")
+        try:
+            canonical_components, commitment = _source_input_identity(
+                manifest["source_mode"], components
+            )
+        except (KeyError, Stage4CError) as error:
+            raise Stage4CReductionError("malformed source input components") from error
+        if canonical_components != components:
+            raise Stage4CReductionError("non-canonical source input components")
+        if commitment != manifest.get("source_input_commitment"):
+            raise Stage4CReductionError("source input commitment mismatch")
     if reference["stage4b_methodology_id"] != STAGE4B_METHODOLOGY_ID:
         raise Stage4CReductionError("inconsistent Stage 4B methodology")
     if reference["stage4b_source_commit"] != STAGE4B_SOURCE_COMMIT:
@@ -102,6 +124,16 @@ def reduce_shards(shard_dirs, output_dir, profile_path, expected_shard_count):
             "owned_complete_rows", -1
         ):
             raise Stage4CReductionError("inconsistent scenario evaluation count")
+    owned_total = sum(manifest["owned_complete_rows"] for _, manifest in records)
+    if owned_total != reference["source_complete_rows"]:
+        raise Stage4CReductionError(
+            "incomplete global shard coverage: owned rows do not equal source rows"
+        )
+    scenario_total = sum(manifest["scenario_evaluations"] for _, manifest in records)
+    if scenario_total != 16 * reference["source_complete_rows"]:
+        raise Stage4CReductionError(
+            "incomplete global scenario coverage for complete source rows"
+        )
 
     def states():
         for directory, manifest in records:
@@ -111,6 +143,8 @@ def reduce_shards(shard_dirs, output_dir, profile_path, expected_shard_count):
             }
             observed = set()
             for row in iter_jsonl((directory / SHARD_STATE,)):
+                if row.get("instrument") != manifest["instrument"]:
+                    raise Stage4CReductionError("state row instrument mismatch")
                 for field in (
                     "gross_return_pips_adverse_first",
                     "gross_return_pips_favorable_first",
@@ -166,8 +200,6 @@ def reduce_shards(shard_dirs, output_dir, profile_path, expected_shard_count):
         source_mode=reference["source_mode"],
         source_audit=source_audit,
     )
-    owned_total = sum(manifest["owned_complete_rows"] for _, manifest in records)
-    scenario_total = sum(manifest["scenario_evaluations"] for _, manifest in records)
     summary.update(
         stage4b_rows_read=reference["source_rows_read"],
         complete_stage4b_trade_count=reference["source_complete_rows"],

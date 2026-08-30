@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -501,13 +502,131 @@ def test_reducer_rejects_source_commitment_count_and_state_ownership(
     state_path.write_text("\n".join(json.dumps(row) for row in state_rows) + "\n")
     changed_manifest = manifest | {
         "group_ownership": [list(group)],
-        "state_sha256": __import__("hashlib")
-        .sha256(state_path.read_bytes())
-        .hexdigest(),
+        "state_sha256": hashlib.sha256(state_path.read_bytes()).hexdigest(),
     }
     manifest_path.write_text(json.dumps(changed_manifest))
     with pytest.raises(Stage4CReductionError, match="another deterministic shard"):
         reduce_shards(shards, tmp_path / "owner", PROFILE, 2)
+
+
+def test_reducer_rejects_missing_complete_group_and_wrong_instrument(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    rows = [
+        trade("a"),
+        trade("b") | {"benchmark_family": "bollinger"},
+        trade("c") | {"entry_mode": "m1-reclaim-p0"},
+    ]
+
+    def make_shards(root):
+        result = []
+        for index in range(2):
+            directory = root / f"shard-{index}"
+            run_rows(
+                iter(rows),
+                directory,
+                PROFILE,
+                source_mode="existing_stage4b_raw",
+                source_audit=audit,
+                shard_index=index,
+                shard_count=2,
+            )
+            result.append(directory)
+        return result
+
+    coverage_shards = make_shards(tmp_path / "coverage")
+    for directory in coverage_shards:
+        manifest_path = directory / "stage4c-shard-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        if not manifest["group_ownership"]:
+            continue
+        removed = manifest["group_ownership"][0]
+        state_path = directory / "stage4c-shard-state.jsonl"
+        state_rows = [json.loads(line) for line in state_path.read_text().splitlines()]
+        kept = [
+            row
+            for row in state_rows
+            if [row.get(field) for field in CONFIG_FIELDS] != removed
+        ]
+        removed_count = len(state_rows) - len(kept)
+        if not removed_count:
+            continue
+        state_path.write_text("".join(json.dumps(row) + "\n" for row in kept))
+        manifest.update(
+            group_ownership=[
+                group for group in manifest["group_ownership"] if group != removed
+            ],
+            state_row_count=len(kept),
+            owned_complete_rows=manifest["owned_complete_rows"] - removed_count,
+            scenario_evaluations=(
+                manifest["scenario_evaluations"] - 16 * removed_count
+            ),
+            state_sha256=hashlib.sha256(state_path.read_bytes()).hexdigest(),
+        )
+        manifest_path.write_text(json.dumps(manifest))
+        break
+    with pytest.raises(Stage4CReductionError, match="incomplete global shard coverage"):
+        reduce_shards(coverage_shards, tmp_path / "coverage-output", PROFILE, 2)
+
+    instrument_shards = make_shards(tmp_path / "instrument")
+    populated = next(
+        directory
+        for directory in instrument_shards
+        if json.loads((directory / "stage4c-shard-manifest.json").read_text())[
+            "state_row_count"
+        ]
+    )
+    state_path = populated / "stage4c-shard-state.jsonl"
+    state_rows = [json.loads(line) for line in state_path.read_text().splitlines()]
+    state_rows[0]["instrument"] = "AUDUSD"
+    state_path.write_text("".join(json.dumps(row) + "\n" for row in state_rows))
+    manifest_path = populated / "stage4c-shard-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["state_sha256"] = hashlib.sha256(state_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(Stage4CReductionError, match="state row instrument mismatch"):
+        reduce_shards(instrument_shards, tmp_path / "instrument-output", PROFILE, 2)
+
+
+def test_reducer_recomputes_source_provenance_commitment(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    shards = []
+    for index in range(2):
+        directory = tmp_path / f"shard-{index}"
+        run_rows(
+            iter([trade("a"), trade("b") | {"benchmark_family": "bollinger"}]),
+            directory,
+            PROFILE,
+            source_mode="existing_stage4b_raw",
+            source_audit=audit,
+            shard_index=index,
+            shard_count=2,
+        )
+        shards.append(directory)
+    for directory in shards:
+        path = directory / "stage4c-shard-manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["source_input_components"]["corpus_id"] = "tampered"
+        path.write_text(json.dumps(manifest))
+    with pytest.raises(Stage4CReductionError, match="source component mismatch"):
+        reduce_shards(shards, tmp_path / "output", PROFILE, 2)
 
 
 def test_audit_authority_and_currency_rule(tmp_path, monkeypatch):
