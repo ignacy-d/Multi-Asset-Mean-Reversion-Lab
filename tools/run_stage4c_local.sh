@@ -17,8 +17,9 @@ MR_ROOT="${MR_ROOT:-/mnt/e/mr-lab}"
 CORPUS_DIR="$MR_ROOT/corpora/2024/$INSTRUMENT"
 RESULTS_ROOT="$MR_ROOT/results/stage4c"
 HEAVY_TMP="$MR_ROOT/tmp"
+STAGE4C_SPOOL_ROOT="${STAGE4C_SPOOL_ROOT:-$HOME/.cache/mr-lab/stage4c-spool}"
 
-mkdir -p "$RESULTS_ROOT" "$HEAVY_TMP"
+mkdir -p "$RESULTS_ROOT" "$HEAVY_TMP" "$STAGE4C_SPOOL_ROOT"
 
 if [[ ! -s "$CORPUS_DIR/corpus-manifest.json" ]]; then
   echo "Missing corpus manifest: $CORPUS_DIR/corpus-manifest.json" >&2
@@ -71,6 +72,7 @@ echo "repo:   $REPO_ROOT"
 echo "corpus: $CORPUS_DIR"
 echo "output: $OUT"
 echo "tmp:    $TMPDIR"
+echo "spool:  $STAGE4C_SPOOL_ROOT"
 echo "============================================================"
 
 /usr/bin/time -v \
@@ -80,6 +82,7 @@ echo "============================================================"
     --instrument "$INSTRUMENT" \
     --corpus-dir "$CORPUS_DIR" \
     --output-dir "$OUT" \
+    --spool-dir "$STAGE4C_SPOOL_ROOT" \
   2>&1 | tee "$OUT/run.log"
 
 for file in \
