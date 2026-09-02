@@ -23,6 +23,14 @@ from mr_lab.stage4c_reducer import Stage4CReductionError, reduce_shards
 from mr_lab.stage4c_runner import _group_owner, run_regenerated, run_rows
 
 PROFILE = Path("configs/stage4c-ftmo-cost-profile-v1.json")
+FINAL_OUTPUTS = (
+    "stage4c-trade-matrix.csv",
+    "stage4c-regime-breadth.csv",
+    "stage4c-cost-scenarios.csv",
+    "stage4c-summary.json",
+    "stage4c-report.md",
+    "execution-audit.json",
+)
 
 
 def trade(
@@ -51,6 +59,13 @@ def trade(
         "gross_return_pips_adverse_first": gross,
         "gross_return_pips_favorable_first": favorable,
     }
+
+
+def _source_input_commitment(components):
+    payload = json.dumps(
+        components, sort_keys=True, separators=(",", ":"), default=str
+    ).encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 @pytest.fixture
@@ -158,12 +173,87 @@ def test_streaming_matches_reference_and_sharded_equals_unsharded(
     profile = CostProfile.load(PROFILE)
     expected = [result for row in rows for result in scenario_rows(row, profile)]
     assert actual == expected
-    for name in (
-        "stage4c-trade-matrix.csv",
-        "stage4c-regime-breadth.csv",
-        "stage4c-cost-scenarios.csv",
-    ):
+    for name in FINAL_OUTPUTS[:3]:
         assert (first / name).read_bytes() == (second / name).read_bytes()
+
+
+def test_default_and_external_spool_are_byte_identical(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    rows = [
+        trade("a", gross=2),
+        trade("b", gross=-1),
+        trade("c", session="new_york", gross=4, favorable=5),
+    ]
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    default_output = tmp_path / "default"
+    external_output = tmp_path / "external"
+    spool_root = tmp_path / "spool-root"
+    run_rows(
+        iter(rows),
+        default_output,
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=audit,
+    )
+    run_rows(
+        iter(rows),
+        external_output,
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=audit,
+        spool_dir=spool_root,
+    )
+    for name in FINAL_OUTPUTS:
+        assert (default_output / name).read_bytes() == (
+            external_output / name
+        ).read_bytes()
+    default_audit = json.loads((default_output / "execution-audit.json").read_text())
+    external_audit = json.loads((external_output / "execution-audit.json").read_text())
+    expected_components = {
+        "source_mode": "existing_stage4b_raw",
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    assert default_audit["source_input_components"] == expected_components
+    assert external_audit["source_input_components"] == expected_components
+    assert default_audit["source_input_commitment"] == _source_input_commitment(
+        expected_components
+    )
+    assert external_audit["source_input_commitment"] == default_audit[
+        "source_input_commitment"
+    ]
+
+
+def test_external_spool_directory_is_empty_after_success(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    spool_root = tmp_path / "spool-root"
+    run_rows(
+        iter([trade("a"), trade("b", gross=-1)]),
+        tmp_path / "output",
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=audit,
+        spool_dir=spool_root,
+    )
+    assert spool_root.exists()
+    assert list(spool_root.iterdir()) == []
 
 
 def test_usd_break_even_fixture(profile):
@@ -214,6 +304,59 @@ def test_duplicate_and_wrong_methodology_fail_closed(tmp_path, monkeypatch):
             PROFILE,
             source_mode="existing_stage4b_raw",
             source_audit=audit | {"stage4b_methodology_id": "wrong"},
+        )
+
+
+def test_external_spool_is_cleaned_after_spooling_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    spool_root = tmp_path / "spool-root"
+    with pytest.raises(Stage4CError, match="duplicate"):
+        run_rows(
+            iter([trade(), trade()]),
+            tmp_path / "duplicate",
+            PROFILE,
+            source_mode="existing_stage4b_raw",
+            source_audit=audit,
+            spool_dir=spool_root,
+        )
+    assert spool_root.exists()
+    assert list(spool_root.iterdir()) == []
+
+
+def test_cleanup_failure_does_not_mask_original_spooling_exception(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    original_unlink = Path.unlink
+
+    def failing_unlink(self, missing_ok=False):
+        if self.name == ".stage4c-spool.sqlite3":
+            raise OSError("forced unlink failure")
+        return original_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    with pytest.raises(Stage4CError, match="duplicate"):
+        run_rows(
+            iter([trade(), trade()]),
+            tmp_path / "duplicate",
+            PROFILE,
+            source_mode="existing_stage4b_raw",
+            source_audit=audit,
+            spool_dir=tmp_path / "spool-root",
         )
 
 
@@ -655,6 +798,71 @@ def test_audit_authority_and_currency_rule(tmp_path, monkeypatch):
     assert (
         "positive x 0.993" in audit["currency_conversion_adjustment"]["USDJPY/AUDJPY"]
     )
+
+
+def test_existing_stage4b_raw_provenance_is_unchanged_with_external_spool(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    source_audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    output = tmp_path / "output"
+    run_rows(
+        iter([trade("a"), trade("b", gross=-1)]),
+        output,
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=source_audit,
+        spool_dir=tmp_path / "spool-root",
+    )
+    audit = json.loads((output / "execution-audit.json").read_text())
+    expected_components = {
+        "source_mode": "existing_stage4b_raw",
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    assert audit["source_mode"] == "existing_stage4b_raw"
+    assert audit["stage4b_methodology_id"] == STAGE4B_METHODOLOGY_ID
+    assert audit["source_input_components"] == expected_components
+    assert audit["source_input_commitment"] == _source_input_commitment(
+        expected_components
+    )
+    assert audit["source_trade_sha256"] == {"fixture": "f" * 64}
+
+
+def test_default_spool_path_remains_backward_compatible(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    import mr_lab.stage4c_runner as runner
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("TemporaryDirectory should not be used without spool_dir")
+
+    monkeypatch.setattr(runner.tempfile, "TemporaryDirectory", fail_if_called)
+    output = tmp_path / "output"
+    run_rows(
+        iter([trade("a"), trade("b", gross=-1)]),
+        output,
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=audit,
+    )
+    assert not (output / ".stage4c-spool.sqlite3").exists()
 
 
 def test_regenerated_route_uses_stage4b_callback(tmp_path, monkeypatch):

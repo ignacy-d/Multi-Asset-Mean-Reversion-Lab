@@ -11,6 +11,7 @@ import os
 import sqlite3
 import statistics
 import subprocess
+import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -150,6 +151,15 @@ def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
     return connection, before, complete, owned, tuple(sorted(groups))
 
 
+def _prepare_spool_database(output_dir, spool_dir):
+    if spool_dir is None:
+        return output_dir / ".stage4c-spool.sqlite3", None
+    root = Path(spool_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.TemporaryDirectory(prefix="stage4c-spool-", dir=root)
+    return Path(temporary.name) / ".stage4c-spool.sqlite3", temporary
+
+
 def _iter_spooled_groups(connection):
     current_key = None
     rows = []
@@ -259,6 +269,7 @@ def run_rows(
     debug_raw=False,
     shard_index=None,
     shard_count=None,
+    spool_dir: Path | None = None,
 ):
     """Externally group rows, retaining only the currently processed group in RAM."""
     if source_mode not in ("regenerated_stage4b", "existing_stage4b_raw"):
@@ -281,15 +292,22 @@ def run_rows(
     if shard_count is not None and not 0 <= shard_index < shard_count:
         raise Stage4CError("invalid shard index")
     output_dir.mkdir(parents=True, exist_ok=True)
-    database = output_dir / ".stage4c-spool.sqlite3"
-    connection, before, complete, owned_complete, owned_groups = _spool_rows(
-        rows, database, shard_index=shard_index, shard_count=shard_count
-    )
-    expanded = 0
-    matrix = []
-    raw = (output_dir / "stage4c-debug-trades.jsonl").open("w") if debug_raw else None
-    state = (output_dir / SHARD_STATE).open("w") if shard_count is not None else None
+    database, spool_temporary = _prepare_spool_database(output_dir, spool_dir)
+    connection = None
+    raw = None
+    state = None
     try:
+        connection, before, complete, owned_complete, owned_groups = _spool_rows(
+            rows, database, shard_index=shard_index, shard_count=shard_count
+        )
+        expanded = 0
+        matrix = []
+        raw = (
+            (output_dir / "stage4c-debug-trades.jsonl").open("w") if debug_raw else None
+        )
+        state = (
+            (output_dir / SHARD_STATE).open("w") if shard_count is not None else None
+        )
         for group_key, group_rows in _iter_spooled_groups(connection):
             for statistic in SPREAD_STATISTICS:
                 for slippage in SLIPPAGES:
@@ -316,12 +334,28 @@ def run_rows(
                     )
                     state.write(_json(compact) + "\n")
     finally:
-        connection.close()
-        database.unlink(missing_ok=True)
-        if raw:
-            raw.close()
-        if state:
-            state.close()
+        cleanup_error = None
+        for handle in (raw, state, connection):
+            if handle is None:
+                continue
+            try:
+                handle.close()
+            except Exception as error:  # pragma: no cover - defensive cleanup
+                if cleanup_error is None:
+                    cleanup_error = error
+        try:
+            database.unlink(missing_ok=True)
+        except Exception as error:  # pragma: no cover - defensive cleanup
+            if cleanup_error is None:
+                cleanup_error = error
+        if spool_temporary is not None:
+            try:
+                spool_temporary.cleanup()
+            except Exception as error:  # pragma: no cover - defensive cleanup
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None and sys.exc_info()[1] is None:
+            raise cleanup_error
     regimes = _regime_rows(matrix)
     scenarios = [
         {
@@ -441,6 +475,7 @@ def run_regenerated(
     debug_raw=False,
     shard_index=None,
     shard_count=None,
+    spool_dir: Path | None = None,
 ):
     """Run frozen Stage 4B and feed its immutable callback rows into Stage 4C."""
     from mr_lab.stage4b_runner import run as run_stage4b
@@ -476,6 +511,7 @@ def run_regenerated(
             debug_raw=debug_raw,
             shard_index=shard_index,
             shard_count=shard_count,
+            spool_dir=spool_dir,
         )
 
 
@@ -501,6 +537,7 @@ def main(argv=None):
         default=Path("configs/stage4c-ftmo-cost-profile-v1.json"),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--spool-dir", type=Path)
     parser.add_argument("--debug-raw", action="store_true")
     parser.add_argument("--shard-index", type=int)
     parser.add_argument("--shard-count", type=int)
@@ -517,6 +554,7 @@ def main(argv=None):
             debug_raw=args.debug_raw,
             shard_index=args.shard_index,
             shard_count=args.shard_count,
+            spool_dir=args.spool_dir,
         )
         return 0
     if not args.stage4b_trades or not args.stage4b_audit:
@@ -534,6 +572,7 @@ def main(argv=None):
         debug_raw=args.debug_raw,
         shard_index=args.shard_index,
         shard_count=args.shard_count,
+        spool_dir=args.spool_dir,
     )
     return 0
 
