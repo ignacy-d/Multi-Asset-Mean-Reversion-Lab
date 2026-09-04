@@ -19,6 +19,7 @@ from pathlib import Path
 from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
 from mr_lab.stage4c import (
     CONFIG_FIELDS,
+    INSTRUMENTS,
     REGIME_FIELDS,
     SCHEMA_VERSION,
     SLIPPAGES,
@@ -52,6 +53,13 @@ ALLOWED_SOURCE_AUDIT_FIELDS = (
     "source_trade_sha256",
     "source_shard_identities",
     "expected_shard_count",
+    "source_bundle_id",
+    "source_bundle_manifest_sha256",
+    "approved_source_registry_sha256",
+    "source_workflow_run_id",
+    "stage4b_source_commit",
+    "combined_audit_sha256",
+    "source_authentication",
 )
 
 
@@ -103,6 +111,18 @@ def _source_input_identity(source_mode, source_audit):
         "source_trade_sha256": source_audit.get("source_trade_sha256"),
         "registry_identity": source_audit.get("registry_identity"),
     }
+    if source_mode == "authenticated_stage4b_bundle":
+        components.update(
+            source_bundle_id=source_audit.get("source_bundle_id"),
+            source_bundle_manifest_sha256=source_audit.get(
+                "source_bundle_manifest_sha256"
+            ),
+            approved_source_registry_sha256=source_audit.get(
+                "approved_source_registry_sha256"
+            ),
+            source_shard_identities=source_audit.get("source_shard_identities"),
+            combined_audit_sha256=source_audit.get("combined_audit_sha256"),
+        )
     if not components["source_trade_sha256"]:
         raise Stage4CError("source trade SHA-256 commitment is required")
     if source_mode == "regenerated_stage4b" and not components["registry_identity"]:
@@ -111,7 +131,7 @@ def _source_input_identity(source_mode, source_audit):
     return components, commitment
 
 
-def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
+def _spool_rows(rows, database, *, instrument, shard_index=None, shard_count=None):
     """Externally group arbitrary input with uniqueness enforced on disk."""
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA journal_mode=OFF")
@@ -128,6 +148,10 @@ def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
             if not validate_trade(row):
                 continue
             complete += 1
+            if row.get("instrument") != instrument:
+                raise Stage4CError(
+                    "source trade instrument disagrees with source audit"
+                )
             group = _key(row, CONFIG_FIELDS)
             if (
                 shard_count is not None
@@ -272,10 +296,23 @@ def run_rows(
     spool_dir: Path | None = None,
 ):
     """Externally group rows, retaining only the currently processed group in RAM."""
-    if source_mode not in ("regenerated_stage4b", "existing_stage4b_raw"):
+    if source_mode not in (
+        "regenerated_stage4b",
+        "authenticated_stage4b_bundle",
+        "development_existing_stage4b_raw",
+        "existing_stage4b_raw",  # deprecated API alias; never authenticated
+    ):
         raise Stage4CError("invalid source_mode")
     if source_audit.get("stage4b_methodology_id") != STAGE4B_METHODOLOGY_ID:
         raise Stage4CError("inconsistent Stage 4B methodology")
+    if source_audit.get("instrument") not in INSTRUMENTS:
+        raise Stage4CError("missing or invalid source audit instrument")
+    if (
+        source_mode == "authenticated_stage4b_bundle"
+        and source_audit.get("source_authentication")
+        != "approved_registry_manifest_and_local_bytes_verified"
+    ):
+        raise Stage4CError("authenticated source bundle verification is required")
     for required in ("corpus_id", "assembled_dataset_id"):
         if not source_audit.get(required):
             raise Stage4CError(f"missing expected input identity: {required}")
@@ -298,7 +335,11 @@ def run_rows(
     state = None
     try:
         connection, before, complete, owned_complete, owned_groups = _spool_rows(
-            rows, database, shard_index=shard_index, shard_count=shard_count
+            rows,
+            database,
+            instrument=source_audit["instrument"],
+            shard_index=shard_index,
+            shard_count=shard_count,
         )
         expanded = 0
         matrix = []
@@ -519,11 +560,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--source-mode",
-        choices=("regenerated_stage4b", "existing_stage4b_raw"),
+        choices=(
+            "regenerated_stage4b",
+            "authenticated_stage4b_bundle",
+            "development_existing_stage4b_raw",
+        ),
         default="regenerated_stage4b",
     )
     parser.add_argument("--stage4b-trades", type=Path, action="append")
     parser.add_argument("--stage4b-audit", type=Path)
+    parser.add_argument("--source-bundle-dir", type=Path)
+    parser.add_argument("--approved-source-registry", type=Path)
     parser.add_argument("--corpus-dir", type=Path)
     parser.add_argument("--instrument")
     parser.add_argument(
@@ -557,8 +604,30 @@ def main(argv=None):
             spool_dir=args.spool_dir,
         )
         return 0
+    if args.source_mode == "authenticated_stage4b_bundle":
+        if not args.source_bundle_dir or not args.approved_source_registry:
+            parser.error("authenticated route requires bundle and approved registry")
+        from mr_lab.stage4b_source_bundle import authenticate_source_bundle
+
+        paths, source = authenticate_source_bundle(
+            args.source_bundle_dir, args.approved_source_registry
+        )
+        run_rows(
+            iter_jsonl(paths),
+            args.output_dir,
+            args.cost_profile,
+            source_mode="authenticated_stage4b_bundle",
+            source_audit=source,
+            debug_raw=args.debug_raw,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
+            spool_dir=args.spool_dir,
+        )
+        return 0
     if not args.stage4b_trades or not args.stage4b_audit:
-        parser.error("existing raw route requires --stage4b-trades and --stage4b-audit")
+        parser.error(
+            "development raw route requires --stage4b-trades and --stage4b-audit"
+        )
     source = json.loads(args.stage4b_audit.read_text())
     source["source_trade_sha256"] = {
         str(p): sha256_file(p) for p in args.stage4b_trades
@@ -567,7 +636,7 @@ def main(argv=None):
         iter_jsonl(args.stage4b_trades),
         args.output_dir,
         args.cost_profile,
-        source_mode="existing_stage4b_raw",
+        source_mode="development_existing_stage4b_raw",
         source_audit=source,
         debug_raw=args.debug_raw,
         shard_index=args.shard_index,

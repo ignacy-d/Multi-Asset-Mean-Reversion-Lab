@@ -190,8 +190,25 @@ def reduce_shards(shard_dirs, output_dir, profile_path, expected_shard_count):
         "assembled_dataset_id": reference["assembled_dataset_id"],
         "source_trade_sha256": components["source_trade_sha256"],
         "registry_identity": components.get("registry_identity"),
-        "source_shard_identities": shard_commitments,
+        "source_shard_identities": (
+            components.get("source_shard_identities")
+            if reference["source_mode"] == "authenticated_stage4b_bundle"
+            else shard_commitments
+        ),
         "expected_shard_count": expected_shard_count,
+        "source_bundle_id": components.get("source_bundle_id"),
+        "source_bundle_manifest_sha256": components.get(
+            "source_bundle_manifest_sha256"
+        ),
+        "approved_source_registry_sha256": components.get(
+            "approved_source_registry_sha256"
+        ),
+        "combined_audit_sha256": components.get("combined_audit_sha256"),
+        "source_authentication": (
+            "approved_registry_manifest_and_local_bytes_verified"
+            if reference["source_mode"] == "authenticated_stage4b_bundle"
+            else None
+        ),
     }
     summary = run_rows(
         states(),

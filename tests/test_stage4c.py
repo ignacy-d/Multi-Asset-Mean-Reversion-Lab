@@ -147,6 +147,7 @@ def test_streaming_matches_reference_and_sharded_equals_unsharded(
     rows = [trade("a", gross=2), trade("b", gross=-1)]
     audit = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
         "source_trade_sha256": {"fixture": "f" * 64},
@@ -229,15 +230,17 @@ def test_default_and_external_spool_are_byte_identical(tmp_path, monkeypatch):
     assert default_audit["source_input_commitment"] == _source_input_commitment(
         expected_components
     )
-    assert external_audit["source_input_commitment"] == default_audit[
-        "source_input_commitment"
-    ]
+    assert (
+        external_audit["source_input_commitment"]
+        == default_audit["source_input_commitment"]
+    )
 
 
 def test_external_spool_directory_is_empty_after_success(tmp_path, monkeypatch):
     monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
     audit = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
         "source_trade_sha256": {"fixture": "f" * 64},
@@ -284,6 +287,7 @@ def test_duplicate_and_wrong_methodology_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
     audit = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
         "source_trade_sha256": {"fixture": "f" * 64},
@@ -311,6 +315,7 @@ def test_external_spool_is_cleaned_after_spooling_failure(tmp_path, monkeypatch)
     monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
     audit = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
         "source_trade_sha256": {"fixture": "f" * 64},
@@ -336,6 +341,7 @@ def test_cleanup_failure_does_not_mask_original_spooling_exception(
     monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
     audit = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
         "source_trade_sha256": {"fixture": "f" * 64},
@@ -364,6 +370,7 @@ def test_reports_required_metrics_and_no_2025_path(tmp_path, monkeypatch):
     monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
     audit = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
         "source_trade_sha256": {"fixture": "f" * 64},
@@ -405,6 +412,7 @@ def test_bounded_processing_releases_independent_groups(tmp_path, monkeypatch):
     monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
     audit = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
         "source_trade_sha256": {"fixture": "f" * 64},
@@ -776,6 +784,7 @@ def test_audit_authority_and_currency_rule(tmp_path, monkeypatch):
     monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
     hostile = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
         "source_trade_sha256": {"fixture": "f" * 64},
@@ -843,6 +852,7 @@ def test_default_spool_path_remains_backward_compatible(tmp_path, monkeypatch):
     monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
     audit = {
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
         "source_trade_sha256": {"fixture": "f" * 64},
