@@ -1,5 +1,12 @@
 # Frozen Stage 4B artifact recovery
 
+> [!WARNING]
+> These recovered 2024 Stage 4B artifacts are historical
+> **VWAP-normalization-v1** artifacts. After the September 2026 VWAP-v2
+> methodology correction, they **MUST NOT** be used as production Stage 4C
+> inputs. Preserve and recover them for provenance, audit, and comparison only.
+> This recovery tool does not upgrade, reinterpret, or recompute them.
+
 `mr-lab-stage4b-artifacts` only reads existing GitHub Actions runs. It cannot
 dispatch, rerun, modify, or delete a workflow. The frozen mapping is:
 
