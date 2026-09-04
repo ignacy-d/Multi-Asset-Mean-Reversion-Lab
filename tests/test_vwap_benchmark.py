@@ -1,6 +1,7 @@
 import hashlib
 import json
 import lzma
+import statistics
 import struct
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -17,6 +18,8 @@ from mr_lab.research import (
 )
 from mr_lab.sessions import DEFAULT_SESSION_SPEC, SessionSpec, TimeWindow
 from mr_lab.vwap_benchmark import (
+    LEGACY_NORMALIZATION_DEFINITION,
+    LEGACY_STRATEGY_SCHEMA_VERSION,
     NORMALIZATION_DEFINITION,
     RESET_MODE,
     VWAP_PRICE_DEFINITION,
@@ -145,6 +148,80 @@ def test_prefix_invariance_deviation_and_trailing_volatility() -> None:
     assert latest.vwap_deviation_z == pytest.approx(
         latest.relative_deviation / expected_volatility
     )
+
+
+@pytest.mark.parametrize("timeframe", ["5m", "15m", "1h"])
+def test_only_exactly_adjacent_bars_enter_volatility(timeframe: str) -> None:
+    duration = Timeframe(timeframe).duration
+    start = datetime(2024, 1, 2, 8, tzinfo=UTC)
+    bars = tuple(
+        bar(start + duration * i, close=100 + i * i, timeframe=timeframe)
+        for i in range(4)
+    )
+    output = build_vwap_features(observations(*bars), DEFAULT_SESSION_SPEC, 2)
+    by_bar = {
+        item.observation.bar: item
+        for item in output
+        if item.anchor_session == "london"
+    }
+    expected = statistics.stdev(
+        (bars[2].close / bars[1].close - 1, bars[3].close / bars[2].close - 1)
+    )
+    assert by_bar[bars[3]].rolling_volatility == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("missing_bars", [1, 3, 12 * 24 * 3])
+def test_gap_resets_and_requires_complete_new_return_window(missing_bars: int) -> None:
+    duration = Timeframe("5m").duration
+    start = datetime(2024, 1, 2, 8, tzinfo=UTC)
+    offsets = (0, 1, 2 + missing_bars, 3 + missing_bars, 4 + missing_bars)
+    bars = tuple(
+        bar(start + duration * offset, close=100 + index * index)
+        for index, offset in enumerate(offsets)
+    )
+    output = build_vwap_features(observations(*bars), DEFAULT_SESSION_SPEC, 2)
+    volatility = {
+        item.observation.bar: item.rolling_volatility
+        for item in output
+        if item.anchor_session == "london"
+    }
+    assert volatility[bars[2]] is None
+    assert volatility[bars[3]] is None
+    assert volatility[bars[4]] is not None
+
+
+def test_inactive_observation_resets_return_window() -> None:
+    start = datetime(2024, 1, 2, 8, tzinfo=UTC)
+    bars = tuple(
+        bar(
+            start + timedelta(minutes=5 * i),
+            close=value,
+            volume=0 if i == 2 else 1,
+        )
+        for i, value in enumerate((100, 101, 101, 102, 104, 107))
+    )
+    output = build_vwap_features(observations(*bars), DEFAULT_SESSION_SPEC, 2)
+    volatility = [
+        item.rolling_volatility for item in output if item.anchor_session == "london"
+    ]
+    assert volatility[2:5] == [None, None, None]
+    assert volatility[5] is not None
+
+
+def test_v2_identity_does_not_reuse_historical_v1_identity() -> None:
+    current = VwapStrategySpec(20, 1.5)
+    historical = {
+        **current.as_dict(),
+        "strategy_schema_version": LEGACY_STRATEGY_SCHEMA_VERSION,
+        "normalized_deviation_definition": LEGACY_NORMALIZATION_DEFINITION,
+    }
+    historical_id = "sha256:" + hashlib.sha256(
+        json.dumps(historical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert historical_id == (
+        "sha256:6aca0e037562736c266ebcf1e8a518383b1a32961dad47082c02d423ad3ce7eb"
+    )
+    assert current.strategy_spec_id != historical_id
 
 
 def test_warmup_and_strict_signal_boundaries() -> None:

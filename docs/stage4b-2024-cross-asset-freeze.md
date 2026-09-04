@@ -2,6 +2,13 @@
 
 Status: **FROZEN BEFORE STAGE 4C COSTS**
 
+> **September 2026 correction status:** This document is retained as the historical
+> pre-cost interpretation produced under VWAP normalization v1. The confirmed
+> gap-compression defect invalidates every VWAP-dependent conclusion below. It must
+> not be used as a Stage 4C input until the v2 recomputation and a new, separately
+> versioned cross-asset interpretation freeze are complete. Bollinger-only evidence
+> is mathematically unaffected; no statement below is silently rewritten.
+
 This document freezes the interpretation of the completed Stage 4B real-2024 results before transaction-cost modelling. It is not a trading-rule optimization and must not be edited in response to Stage 4C or sealed-2025 outcomes except through an explicitly versioned later-stage decision record.
 
 ## Scope and provenance

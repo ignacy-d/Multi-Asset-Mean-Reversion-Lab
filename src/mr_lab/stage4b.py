@@ -21,8 +21,14 @@ SL_FRACTIONS = (0.25, 0.50, 1.00, None)
 TIME_STOPS_MINUTES = (30, 60, 120)
 DIAGNOSTIC_HORIZONS = (5, 15, 30)
 STAGE4B_REPORT_SCHEMA_VERSION = "stage-4b-report-v1"
+LEGACY_STAGE4B_METHODOLOGY_ID = (
+    "sha256:2d0d68ade809aef35cfce0cc39c515c3c1833a3c5aa7da506dd3b765af3ce42d"
+)
 
 SEMANTICS = {
+    "upstream_vwap_normalization": (
+        "exactly-adjacent-canonical-timeframe-returns-reset-on-gap-or-inactive-v2"
+    ),
     "threshold_qualification": "existing-stage3b-signal-direction-abs-z-ge-2-v1",
     "dedup_rearm": "per-spec-first-qualifier-rearm-only-valid-abs-z-lt-2-v2",
     "reversion_fraction": "direction-times-price-minus-p0-over-abs-d0-v1",
