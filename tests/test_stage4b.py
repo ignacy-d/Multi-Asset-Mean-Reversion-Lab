@@ -6,6 +6,7 @@ from mr_lab.data import Bar, PriceBasis, Timeframe
 from mr_lab.research import Direction
 from mr_lab.stage4b import (
     ENTRY_MODES,
+    LEGACY_STAGE4B_METHODOLOGY_ID,
     SIGNAL_THRESHOLD,
     STAGE4B_METHODOLOGY_ID,
     EligibilityDecision,
@@ -70,6 +71,7 @@ def event():
 def test_frozen_matrix_and_methodology_identity():
     assert SIGNAL_THRESHOLD == 2.0 and len(ENTRY_MODES) == 3
     assert STAGE4B_METHODOLOGY_ID.startswith("sha256:")
+    assert STAGE4B_METHODOLOGY_ID != LEGACY_STAGE4B_METHODOLOGY_ID
 
 
 def test_continuous_above_is_one_candidate():

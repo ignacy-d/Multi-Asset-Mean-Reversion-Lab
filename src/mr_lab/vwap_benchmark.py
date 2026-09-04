@@ -33,12 +33,17 @@ from mr_lab.research import (
 )
 from mr_lab.sessions import DEFAULT_SESSION_SPEC, SessionSpec, TimeWindow
 
-STRATEGY_SCHEMA_VERSION = "stage-2b-vwap-benchmark-v1"
+LEGACY_STRATEGY_SCHEMA_VERSION = "stage-2b-vwap-benchmark-v1"
+STRATEGY_SCHEMA_VERSION = "stage-2b-vwap-benchmark-v2"
 VWAP_PRICE_DEFINITION = "hlc3"
 WEIGHT_SEMANTICS = "quote_activity"
 RESET_MODE = "major_session_instance"
-NORMALIZATION_DEFINITION = (
+LEGACY_NORMALIZATION_DEFINITION = (
     "relative_deviation_divided_by_sample_stddev_of_consecutive_bar_returns_v1"
+)
+NORMALIZATION_DEFINITION = (
+    "relative_deviation_divided_by_sample_stddev_of_exactly_adjacent_bar_returns_"
+    "reset_on_gap_or_inactive-v2"
 )
 DEFAULT_THRESHOLDS = (1.0, 1.5, 2.0, 2.5)
 DEFAULT_VOLATILITY_LOOKBACKS = (20, 40)
@@ -89,8 +94,9 @@ def build_vwap_features(
 
     Volatility is the sample standard deviation of exactly ``lookback`` consecutive
     close-to-close arithmetic bar returns ending at the current bar. A return is
-    unavailable when either adjacent canonical observation is inactive; the rolling
-    denominator then remains unavailable until a complete consecutive window exists.
+    unavailable when either adjacent canonical observation is inactive or the bars
+    are not exactly adjacent bars of the same canonical timeframe. Either condition
+    clears the window, which then requires ``lookback`` new consecutive returns.
     """
     if type(volatility_lookback) is not int or volatility_lookback < 2:
         raise VwapBenchmarkError("volatility_lookback must be an integer of at least 2")
@@ -102,7 +108,21 @@ def build_vwap_features(
     previous: ResearchObservation | None = None
     for observation in items:
         current_return = None
-        if previous and previous.is_research_active and observation.is_research_active:
+        adjacent = bool(
+            previous
+            and previous.bar.timeframe == observation.bar.timeframe
+            and previous.bar.close_time == observation.bar.open_time
+        )
+        if not adjacent or not (
+            previous
+            and previous.is_research_active
+            and observation.is_research_active
+        ):
+            # A bounded deque containing stale pre-gap returns would compress
+            # elapsed time. Clear it at the boundary and retain an unavailable
+            # marker for this observation; only subsequent adjacent pairs rebuild.
+            returns.clear()
+        else:
             if previous.bar.close == 0:
                 raise VwapBenchmarkError("bar return is undefined for zero close")
             current_return = observation.bar.close / previous.bar.close - 1.0

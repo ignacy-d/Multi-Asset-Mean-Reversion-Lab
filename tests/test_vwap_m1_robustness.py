@@ -18,6 +18,7 @@ from mr_lab.vwap_benchmark import (
 )
 from mr_lab.vwap_m1_robustness import (
     CANONICAL_M1,
+    LEGACY_ROBUSTNESS_SCHEMA_VERSION,
     NATIVE_TIMEFRAME,
     VwapRobustnessStrategySpec,
     build_canonical_m1_vwap_features,
@@ -148,6 +149,38 @@ def test_future_m1_and_research_prefixes_cannot_change_history() -> None:
     )
 
 
+def test_canonical_m1_uses_native_gap_safe_denominator() -> None:
+    start = datetime(2024, 1, 5, 8, tzinfo=UTC)  # Friday to Monday-like gap.
+    research_bars = [
+        bar(start, 100, timeframe="5m"),
+        bar(start + timedelta(minutes=5), 101, timeframe="5m"),
+        bar(start + timedelta(days=3), 103, timeframe="5m"),
+        bar(start + timedelta(days=3, minutes=5), 106, timeframe="5m"),
+        bar(start + timedelta(days=3, minutes=10), 110, timeframe="5m"),
+    ]
+    m1_bars = [
+        bar(item.open_time + timedelta(minutes=minute), item.close)
+        for item in research_bars
+        for minute in range(5)
+    ]
+    research = obs(research_bars)
+    native = build_vwap_features(research, DEFAULT_SESSION_SPEC, 2)
+    canonical = build_canonical_m1_vwap_features(
+        obs(m1_bars), research, DEFAULT_SESSION_SPEC, 2
+    )
+    native_denominator = [
+        item.rolling_volatility for item in native if item.anchor_session == "london"
+    ]
+    canonical_denominator = [
+        item.rolling_volatility
+        for item in canonical
+        if item.anchor_session == "london"
+    ]
+    assert canonical_denominator == native_denominator
+    assert native_denominator[2:4] == [None, None]
+    assert native_denominator[4] is not None
+
+
 def test_dst_membership_is_inherited_from_stage_1c() -> None:
     before = [
         bar(datetime(2024, 3, 29, 8, tzinfo=UTC) + timedelta(minutes=i), 10)
@@ -172,8 +205,8 @@ def test_robustness_identity_is_deterministic_source_sensitive_and_separate() ->
     assert canonical.strategy_spec_id == same.strategy_spec_id
     assert canonical.strategy_spec_id != native.strategy_spec_id
     assert canonical.strategy_spec_id != VwapStrategySpec(20, 1.5).strategy_spec_id
-    # Golden ID produced by the pre-PR Stage 2B implementation at base 942079c.
-    assert VwapStrategySpec(20, 1.5).strategy_spec_id == (
+    assert canonical.robustness_schema_version != LEGACY_ROBUSTNESS_SCHEMA_VERSION
+    assert VwapStrategySpec(20, 1.5).strategy_spec_id != (
         "sha256:6aca0e037562736c266ebcf1e8a518383b1a32961dad47082c02d423ad3ce7eb"
     )
     with pytest.raises(VwapBenchmarkError, match="construction"):

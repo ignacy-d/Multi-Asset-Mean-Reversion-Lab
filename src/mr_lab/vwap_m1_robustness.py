@@ -46,7 +46,8 @@ from mr_lab.vwap_benchmark import (
     typical_price,
 )
 
-ROBUSTNESS_SCHEMA_VERSION = "stage-2b-vwap-construction-robustness-v1"
+LEGACY_ROBUSTNESS_SCHEMA_VERSION = "stage-2b-vwap-construction-robustness-v1"
+ROBUSTNESS_SCHEMA_VERSION = "stage-2b-vwap-construction-robustness-v2"
 NATIVE_TIMEFRAME = "native_timeframe"
 CANONICAL_M1 = "canonical_m1"
 SUPPORTED_CONSTRUCTION_SOURCES = frozenset((NATIVE_TIMEFRAME, CANONICAL_M1))
