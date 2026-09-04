@@ -79,21 +79,29 @@ def expected_artifacts(
 
 
 class GitHubClient:
-    def __init__(self, token: str | None = None):
+    def __init__(
+        self,
+        token: str | None = None,
+        api_url: str = "https://api.github.com",
+    ):
         self.token = (
             token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
         )
+        self.api_url = api_url.rstrip("/")
 
     def _request(self, path: str) -> bytes:
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
         request = urllib.request.Request(
-            f"https://api.github.com/repos/{REPOSITORY}/{path}", headers=headers
+            f"{self.api_url}/repos/{REPOSITORY}/{path}", headers=headers
         )
+        # HTTPRedirectHandler builds redirected requests from ``headers`` but not
+        # ``unredirected_hdrs``.  Authenticate the API request without allowing
+        # urllib to copy the bearer credential to an artifact-storage host.
+        if self.token:
+            request.add_unredirected_header("Authorization", f"Bearer {self.token}")
         try:
             with urllib.request.urlopen(request) as response:
                 return response.read()

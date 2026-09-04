@@ -1,7 +1,10 @@
 import hashlib
 import io
 import json
+import threading
 import zipfile
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -26,6 +29,68 @@ ENTRY = {
     "corpus_id": "sha256:corpus",
     "assembled_dataset_id": "sha256:dataset",
 }
+
+
+@contextmanager
+def _http_server(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+class _QuietHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+
+def test_authenticated_api_request_receives_authorization():
+    received = []
+
+    class ApiHandler(_QuietHandler):
+        def do_GET(self):
+            received.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"api response")
+
+    with _http_server(ApiHandler) as api_url:
+        assert GitHubClient("secret-token", api_url).download(1) == b"api response"
+
+    assert received == ["Bearer secret-token"]
+
+
+def test_cross_host_artifact_redirect_drops_authorization_and_follows():
+    api_authorization = []
+    storage_authorization = []
+
+    class StorageHandler(_QuietHandler):
+        def do_GET(self):
+            storage_authorization.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"artifact archive")
+
+    with _http_server(StorageHandler) as storage_url:
+
+        class ApiHandler(_QuietHandler):
+            def do_GET(self):
+                api_authorization.append(self.headers.get("Authorization"))
+                self.send_response(302)
+                self.send_header("Location", f"{storage_url}/artifact.zip")
+                self.end_headers()
+
+        with _http_server(ApiHandler) as api_url:
+            result = GitHubClient("secret-token", api_url).download(1)
+
+    assert result == b"artifact archive"
+    assert api_authorization == ["Bearer secret-token"]
+    assert storage_authorization == [None]
 
 
 def _metadata(expired=False, sha=HEAD_SHA):
