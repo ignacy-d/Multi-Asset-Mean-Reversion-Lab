@@ -21,6 +21,7 @@ from mr_lab.stage4c import (
 )
 from mr_lab.stage4c_reducer import Stage4CReductionError, reduce_shards
 from mr_lab.stage4c_runner import _group_owner, run_regenerated, run_rows
+from mr_lab.stage4c_runner import main as stage4c_main
 
 PROFILE = Path("configs/stage4c-ftmo-cost-profile-v1.json")
 FINAL_OUTPUTS = (
@@ -229,9 +230,10 @@ def test_default_and_external_spool_are_byte_identical(tmp_path, monkeypatch):
     assert default_audit["source_input_commitment"] == _source_input_commitment(
         expected_components
     )
-    assert external_audit["source_input_commitment"] == default_audit[
-        "source_input_commitment"
-    ]
+    assert (
+        external_audit["source_input_commitment"]
+        == default_audit["source_input_commitment"]
+    )
 
 
 def test_external_spool_directory_is_empty_after_success(tmp_path, monkeypatch):
@@ -863,6 +865,92 @@ def test_default_spool_path_remains_backward_compatible(tmp_path, monkeypatch):
         source_audit=audit,
     )
     assert not (output / ".stage4c-spool.sqlite3").exists()
+
+
+def test_existing_raw_hashes_exact_source_bytes_in_single_ingestion_pass(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    source_path = tmp_path / "trades.jsonl"
+    source_bytes = (
+        json.dumps(trade("b"), sort_keys=False).encode()
+        + b"\r\n"
+        + json.dumps(trade("a"), sort_keys=False).encode()
+        + b"\n"
+    )
+    source_path.write_bytes(source_bytes)
+    source_audit = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "registry_identity": "registry",
+    }
+    audit_path = tmp_path / "stage4b-audit.json"
+    audit_path.write_text(json.dumps(source_audit))
+    output = tmp_path / "streamed"
+
+    assert (
+        stage4c_main(
+            [
+                "--source-mode",
+                "existing_stage4b_raw",
+                "--stage4b-trades",
+                str(source_path),
+                "--stage4b-audit",
+                str(audit_path),
+                "--cost-profile",
+                str(PROFILE),
+                "--output-dir",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    audit = json.loads((output / "execution-audit.json").read_text())
+    expected_hash = hashlib.sha256(source_bytes).hexdigest()
+    assert audit["source_trade_sha256"] == {str(source_path): expected_hash}
+    components = audit["source_input_components"]
+    assert components["source_trade_sha256"] == {str(source_path): expected_hash}
+    assert audit["source_input_commitment"] == _source_input_commitment(components)
+
+
+def test_streaming_malformed_input_fails_closed_and_cleans_external_spool(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    source_path = tmp_path / "trades.jsonl"
+    source_path.write_text(json.dumps(trade()) + "\n{malformed\n")
+    audit_path = tmp_path / "stage4b-audit.json"
+    audit_path.write_text(
+        json.dumps(
+            {
+                "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+                "instrument": "EURUSD",
+                "corpus_id": "corpus",
+                "assembled_dataset_id": "dataset",
+            }
+        )
+    )
+    spool_root = tmp_path / "spool-root"
+    with pytest.raises(Stage4CError, match=r"malformed JSONL .*:2"):
+        stage4c_main(
+            [
+                "--source-mode",
+                "existing_stage4b_raw",
+                "--stage4b-trades",
+                str(source_path),
+                "--stage4b-audit",
+                str(audit_path),
+                "--cost-profile",
+                str(PROFILE),
+                "--output-dir",
+                str(tmp_path / "output"),
+                "--spool-dir",
+                str(spool_root),
+            ]
+        )
+    assert list(spool_root.iterdir()) == []
 
 
 def test_regenerated_route_uses_stage4b_callback(tmp_path, monkeypatch):
