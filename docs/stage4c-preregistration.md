@@ -230,7 +230,13 @@ version-controlled `configs/stage4b-approved-source-registry.json`; a hash suppl
 by the caller beside arbitrary bytes is not approval. Each registry entry pins a
 bundle ID, instrument, and canonical `stage4b-source-bundle.json` SHA-256.
 
-The bundle manifest binds the instrument, Stage 4B methodology and historical
+The candidate builder reads the reducer audit, original shard manifests, and raw
+trade files independently. It hashes and counts each raw JSONL in one bounded-memory
+sequential pass. All manifest-controlled paths must be non-empty bundle-relative
+paths; absolute paths, traversal, malformed components, and symlink escapes are
+rejected before file access.
+
+The bundle manifest binds the instrument, current corrected Stage 4B methodology and historical
 source commit, corpus and assembled-dataset identities, corpus-registry identity,
 source workflow run, combined/reducer audit, exact ordered shard universe, source
 artifact names and IDs, raw filenames/hashes/row counts, and shard-manifest
@@ -249,9 +255,21 @@ To migrate frozen inputs, artifact recovery must place each raw `trades.jsonl` a
 its original `shard-manifest.json` under stable, unique bundle-relative filenames,
 include the frozen reduction `execution-audit.json`, generate the canonical bundle
 manifest, and submit that manifest hash plus instrument under a reviewed registry
-entry. Run `uv run python tools/verify_stage4b_source_bundle.py BUNDLE_DIR` before
+entry. First run
+`uv run python tools/build_stage4b_source_bundle.py BUNDLE_DIR --source-provenance PROVENANCE.json`.
+This emits only an **unapproved candidate** and its deterministic SHA-256; it cannot
+read or modify the approval registry. The production trust sequence is: Stage 4B
+output → candidate bundle build → independent review → approval-registry commit →
+authentication → Stage 4C. Run
+`uv run python tools/verify_stage4b_source_bundle.py BUNDLE_DIR` before
 Stage 4C. The registry intentionally starts empty: no pre-audit or recomputed VWAP
 artifact is silently grandfathered. After the September methodology repair and
 Stage 4B recomputation, approve each instrument's recovered bundle in a reviewable
 commit, then invoke Stage 4C with `--source-mode authenticated_stage4b_bundle`,
 `--source-bundle-dir`, and `--approved-source-registry`.
+
+Historical v1 artifacts remain readable and checkable with their original Stage 4B
+audit/reducer tooling, but cannot be built or authenticated as current production
+bundles: both candidate construction and Stage 4C authentication require the
+imported current `STAGE4B_METHODOLOGY_ID`. An approved manifest carrying an older
+identity therefore still fails closed.

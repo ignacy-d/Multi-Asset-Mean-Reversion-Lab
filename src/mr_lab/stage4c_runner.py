@@ -56,7 +56,7 @@ ALLOWED_SOURCE_AUDIT_FIELDS = (
     "source_bundle_id",
     "source_bundle_manifest_sha256",
     "approved_source_registry_sha256",
-    "source_workflow_run_id",
+    "source_provenance",
     "stage4b_source_commit",
     "combined_audit_sha256",
     "source_authentication",
