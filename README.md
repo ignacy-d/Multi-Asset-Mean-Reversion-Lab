@@ -5,6 +5,12 @@ systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
 not assert that an edge exists.
 
+The additive **MR Lab V2 experimental architecture** for native BID/ASK data,
+causal spreads and structure, observed-side Stage 4C-B research, independent
+decoder checks, and optional microstructure/Nautilus boundaries is documented in
+[`docs/MR_LAB_V2.md`](docs/MR_LAB_V2.md). Frozen historical methodologies remain
+separate and unchanged.
+
 ## Current stage: Stage 3A multi-asset data enablement
 
 Completed work comprises Stage 0A–1D foundation, canonical data, validation,
