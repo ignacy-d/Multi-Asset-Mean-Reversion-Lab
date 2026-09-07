@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from mr_lab.data import PriceBasis
 from mr_lab.providers.instruments import (
     ProviderInstrumentSpec,
     get_candidate_instrument_spec,
@@ -33,17 +34,21 @@ class ProviderNoData(AcquisitionError):
     """Raised only when the provider explicitly reports that a day is absent."""
 
 
-def build_url(instrument: str, day: date) -> str:
+def build_url(instrument: str, day: date, side: PriceBasis = PriceBasis.BID) -> str:
     """Build the public M1 BID candle URL (provider months are zero based)."""
     spec = get_instrument_spec(instrument)
-    return _build_url(spec, day)
+    return _build_url(spec, day, side)
 
 
-def _build_url(spec: ProviderInstrumentSpec, day: date) -> str:
+def _build_url(
+    spec: ProviderInstrumentSpec, day: date, side: PriceBasis = PriceBasis.BID
+) -> str:
+    if side not in (PriceBasis.BID, PriceBasis.ASK):
+        raise AcquisitionError("Dukascopy candle acquisition supports BID or ASK")
     normalized = spec.provider_symbol
     return (
         f"https://{HOST}/datafeed/{normalized}/{day.year:04d}/"
-        f"{day.month - 1:02d}/{day.day:02d}/BID_candles_min_1.bi5"
+        f"{day.month - 1:02d}/{day.day:02d}/{side.value.upper()}_candles_min_1.bi5"
     )
 
 
@@ -133,6 +138,7 @@ def acquire(
     sleeper: Callable[[float], None] = time.sleep,
     logger: Callable[[str], None] = print,
     instrument: str = "EURUSD",
+    side: PriceBasis = PriceBasis.BID,
 ) -> tuple[Path, Path]:
     """GET one frozen day and write its payload and provenance."""
     return _acquire_with_spec(
@@ -144,6 +150,7 @@ def acquire(
         getter=getter,
         sleeper=sleeper,
         logger=logger,
+        side=side,
     )
 
 
@@ -181,10 +188,14 @@ def _acquire_with_spec(
     getter: Callable[[str, float], tuple[int, bytes]],
     sleeper: Callable[[float], None],
     logger: Callable[[str], None],
+    side: PriceBasis = PriceBasis.BID,
 ) -> tuple[Path, Path]:
     if retries < 0:
         raise ValueError("retries must be non-negative")
-    url = _build_url(spec, requested_day)
+    # The protected OOS interval is rejected before URL construction or I/O.
+    if requested_day.year == 2025:
+        raise AcquisitionError("the protected 2025 holdout may not be acquired")
+    url = _build_url(spec, requested_day, side)
     total_attempts = retries + 1
     for attempt in range(total_attempts):
         try:
@@ -231,8 +242,9 @@ def _acquire_with_spec(
         decoded_byte_length,
         spec,
     )
+    metadata["price_side"] = side.value.upper()
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{spec.instrument}-{requested_day.isoformat()}-M1-BID"
+    stem = f"{spec.instrument}-{requested_day.isoformat()}-M1-{side.value.upper()}"
     raw_path = output_dir / f"{stem}.bi5"
     metadata_path = output_dir / f"{stem}.json"
     if raw_path.exists() or metadata_path.exists():

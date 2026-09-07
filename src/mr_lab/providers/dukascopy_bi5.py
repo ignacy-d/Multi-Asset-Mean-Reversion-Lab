@@ -65,13 +65,27 @@ def parse_decoded_m1_bid_bars(
 ) -> tuple[Bar, ...]:
     """Convert records using a production-verified instrument spec."""
     return _parse_decoded_m1_bid_bars(
-        decoded, requested_day, get_instrument_spec(instrument)
+        decoded, requested_day, get_instrument_spec(instrument), PriceBasis.BID
+    )
+
+
+def parse_decoded_m1_ask_bars(
+    decoded: bytes, requested_day: date, instrument: str = INSTRUMENT
+) -> tuple[Bar, ...]:
+    """Convert a native Dukascopy ASK candle payload without side inference."""
+    return _parse_decoded_m1_bid_bars(
+        decoded, requested_day, get_instrument_spec(instrument), PriceBasis.ASK
     )
 
 
 def _parse_decoded_m1_bid_bars(
-    decoded: bytes, requested_day: date, spec: ProviderInstrumentSpec
+    decoded: bytes,
+    requested_day: date,
+    spec: ProviderInstrumentSpec,
+    price_basis: PriceBasis = PriceBasis.BID,
 ) -> tuple[Bar, ...]:
+    if price_basis not in (PriceBasis.BID, PriceBasis.ASK):
+        raise Bi5ParseError("Dukascopy candle side must be BID or ASK")
     if not isinstance(requested_day, date) or isinstance(requested_day, datetime):
         raise Bi5ParseError("requested_day must be a date")
     if not decoded:
@@ -123,7 +137,7 @@ def _parse_decoded_m1_bid_bars(
                 high=high_price,
                 low=low_price,
                 close=close_price,
-                price_basis=PriceBasis.BID,
+                price_basis=price_basis,
                 volume=float(volume),
                 # JForex IBar defines volume as the sum of best-price volumes
                 # for each tick, which is quote activity rather than executed
@@ -141,6 +155,50 @@ def parse_m1_bid_bars(
     """Decode raw BI5 bytes and return verified M1 BID bars."""
     return parse_decoded_m1_bid_bars(
         decode_m1_bid_payload(payload), requested_day, instrument
+    )
+
+
+def parse_m1_ask_bars(
+    payload: bytes, requested_day: date, instrument: str = INSTRUMENT
+) -> tuple[Bar, ...]:
+    """Decode a raw native ASK BI5 payload into explicitly ASK-based bars."""
+    return parse_decoded_m1_ask_bars(
+        decode_m1_bid_payload(payload), requested_day, instrument
+    )
+
+
+def build_side_dataset_metadata(
+    payload: bytes,
+    requested_day: date,
+    instrument: str,
+    side: PriceBasis,
+) -> DatasetMetadata:
+    """Build V2 side-aware provenance while preserving the legacy BID identity."""
+    if side is PriceBasis.BID:
+        return build_dataset_metadata(payload, requested_day, instrument)
+    if side is not PriceBasis.ASK:
+        raise Bi5ParseError("side metadata supports BID or ASK")
+    spec = get_instrument_spec(instrument)
+    inputs = {
+        "canonical_schema_version": "bar-v2-side-aware",
+        "instrument_spec": spec.as_dict(),
+        "price_basis": side.value,
+        "raw_sha256": hashlib.sha256(payload).hexdigest(),
+        "requested_day": requested_day.isoformat(),
+        "source_timezone": SOURCE_TIMEZONE,
+        "timeframe": M1.value,
+        "volume_semantics": VOLUME_SEMANTICS.value,
+    }
+    serialized = json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
+    return DatasetMetadata(
+        source=spec.provider,
+        instrument=spec.instrument,
+        price_basis=side,
+        volume_semantics=VOLUME_SEMANTICS,
+        schema_version="bar-v2-side-aware",
+        dataset_id=f"sha256:{hashlib.sha256(serialized).hexdigest()}",
+        native_timeframe=M1,
+        source_timezone=SOURCE_TIMEZONE,
     )
 
 

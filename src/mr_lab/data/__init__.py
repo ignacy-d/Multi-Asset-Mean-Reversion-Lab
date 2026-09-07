@@ -17,9 +17,17 @@ from mr_lab.data.models import (
     Timeframe,
     VolumeSemantics,
 )
+from mr_lab.data.quotes import (
+    SPREAD_METHODOLOGY_ID,
+    QuoteStatus,
+    SynchronizationDiagnostics,
+    SynchronizedQuote,
+    synchronize_quotes,
+)
 from mr_lab.data.resampling import IncompleteWindow, ResamplingResult, resample_bars
 
 __all__ = [
+    "SPREAD_METHODOLOGY_ID",
     "Bar",
     "DataContractError",
     "DatasetMetadata",
@@ -29,11 +37,15 @@ __all__ = [
     "IncompleteWindow",
     "ObservationIdentity",
     "PriceBasis",
+    "QuoteStatus",
     "ResamplingResult",
+    "SynchronizationDiagnostics",
+    "SynchronizedQuote",
     "Timeframe",
     "VolumeSemantics",
     "available_bars",
     "observation_identity",
     "resample_bars",
+    "synchronize_quotes",
     "validate_dataset",
 ]
