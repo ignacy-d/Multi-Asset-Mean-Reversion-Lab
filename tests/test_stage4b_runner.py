@@ -31,10 +31,15 @@ def test_gbpusd_pending_fails_closed():
         select_verified_registry_entries(registry, "GBPUSD")
 
 
-def test_workflow_has_only_instrument_input_and_review_diagnostics():
+def test_workflow_artifact_upload_contract():
     text = Path(".github/workflows/run-stage-4b-real-2024.yml").read_text()
     head = text.split("permissions:", 1)[0]
     assert head.count("type: choice") == 1
+    assert "upload_raw:" in head
+    upload_raw_input = head.split("upload_raw:", 1)[1]
+    assert "required: true" in upload_raw_input
+    assert "type: boolean" in upload_raw_input
+    assert "default: false" in upload_raw_input
     assert all(
         name not in head
         for name in ("threshold:", "tp:", "sl:", "time_stop:", "entry_mode:")
@@ -50,6 +55,18 @@ def test_workflow_has_only_instrument_input_and_review_diagnostics():
     assert compact in text
     assert "result/candidate-events.jsonl" in text
     assert "result/trades.jsonl" in text
+    compact_upload = text.index(
+        "name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-compact-shard-"
+    )
+    raw_upload = text.index(
+        "name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-raw-shard-"
+    )
+    assert compact_upload < raw_upload
+    compact_block = text[compact_upload:raw_upload]
+    raw_block = text[raw_upload : text.index("\n\n  reducer:")]
+    assert "retention-days: 30" in compact_block
+    assert "if: ${{ inputs.upload_raw == true }}" in text[compact_upload:raw_upload]
+    assert "retention-days: 7" in raw_block
     reducer = text.split("  reducer:", 1)[1]
     assert (
         "pattern: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-compact-shard-*" in reducer
@@ -60,6 +77,7 @@ def test_workflow_has_only_instrument_input_and_review_diagnostics():
     assert "candidate-events.jsonl" not in reducer
     assert "trades.jsonl" not in reducer
     assert "stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-combined-review" in text
+    assert "retention-days: 90" in reducer
 
 
 def test_deterministic_json_and_output_contract():

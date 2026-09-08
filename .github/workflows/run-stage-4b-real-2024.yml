@@ -9,6 +9,11 @@ on:
         type: choice
         default: EURUSD
         options: [EURUSD, GBPUSD, USDJPY, AUDUSD, AUDJPY]
+      upload_raw:
+        description: Upload large raw Stage4B JSONL artifacts
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -119,14 +124,6 @@ jobs:
           find result -maxdepth 1 -type f -printf '%f %s bytes\n' | sort || true
       - uses: actions/upload-artifact@v4
         with:
-          name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-raw-shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}-${{ env.ARTIFACT_ID }}
-          path: |
-            result/candidate-events.jsonl
-            result/trades.jsonl
-          if-no-files-found: error
-          retention-days: 90
-      - uses: actions/upload-artifact@v4
-        with:
           name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-compact-shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}-${{ env.ARTIFACT_ID }}
           path: |
             result/shard-manifest.json
@@ -140,7 +137,16 @@ jobs:
             result/report.md
             result/execution-audit.json
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 30
+      - if: ${{ inputs.upload_raw == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-4b-${{ env.INSTRUMENT_LOWER }}-2024-raw-shard-${{ matrix.shard_index }}-attempt-${{ github.run_attempt }}-${{ env.ARTIFACT_ID }}
+          path: |
+            result/candidate-events.jsonl
+            result/trades.jsonl
+          if-no-files-found: error
+          retention-days: 7
 
   reducer:
     needs: [registry-preflight, shard]
