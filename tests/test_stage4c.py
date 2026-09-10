@@ -12,10 +12,12 @@ from mr_lab.ornstein_uhlenbeck import frozen_ou_eligibility_spec
 from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
 from mr_lab.stage4c import (
     CONFIG_FIELDS,
+    INSTRUMENTS,
     SLIPPAGES,
     SPREAD_STATISTICS,
     CostProfile,
     Stage4CError,
+    adjusted_execution_pips,
     break_even_total_slippage,
     scenario_rows,
     transform_trade,
@@ -89,6 +91,78 @@ def test_audusd_commission_is_half_pip(profile):
         ]
         == 0.5
     )
+
+
+def _profile_with_gbpusd_spreads(profile):
+    """Add deterministic test spreads without claiming historical evidence."""
+    raw = deepcopy(profile.raw)
+    raw["spread_measurement"]["profiles"]["GBPUSD"] = {
+        session: {
+            "mean_pips": 0.2,
+            "p75_pips": 0.3,
+            "p90_pips": 0.4,
+            "p95_pips": 0.5,
+        }
+        for session in ("asia", "london", "new_york", "overall")
+    }
+    return CostProfile(raw=raw, sha256="test-profile")
+
+
+def test_gbpusd_costs_use_usd_quote_commission(profile):
+    spread, commission = _profile_with_gbpusd_spreads(profile).costs(
+        "GBPUSD", "london", "mean"
+    )
+    assert spread == 0.2
+    assert commission == 0.5
+
+
+@pytest.mark.parametrize("gross", [4.0, -4.0])
+def test_gbpusd_has_no_quote_currency_conversion_adjustment(profile, gross):
+    result = transform_trade(
+        trade(instrument="GBPUSD", gross=gross),
+        _profile_with_gbpusd_spreads(profile),
+        "mean",
+        0.1,
+    )
+    assert adjusted_execution_pips(gross, "GBPUSD") == gross
+    assert result["net_pips_adverse_first"] == pytest.approx(gross - 0.2 - 0.1 - 0.5)
+
+
+def test_gbpusd_has_all_frozen_cost_scenarios(profile):
+    rows = list(
+        scenario_rows(trade(instrument="GBPUSD"), _profile_with_gbpusd_spreads(profile))
+    )
+    assert len(rows) == 16
+    assert {(row["spread_statistic"], row["slippage_pips"]) for row in rows} == {
+        (statistic, slippage)
+        for statistic in SPREAD_STATISTICS
+        for slippage in SLIPPAGES
+    }
+    assert {row["commission_pips"] for row in rows} == {0.5}
+
+
+def test_missing_gbpusd_spread_profile_fails_closed(profile):
+    assert "GBPUSD" in INSTRUMENTS
+    assert profile.raw["commission"]["usd_quote_pairs"]["GBPUSD"] == {
+        "commission_round_turn_pips": 0.5
+    }
+    with pytest.raises(Stage4CError, match="missing cost profile: GBPUSD/london"):
+        profile.costs("GBPUSD", "london", "mean")
+
+
+def test_existing_instrument_costs_and_adjustments_are_unchanged(profile):
+    expected = {
+        "EURUSD": (0.102395351, 0.5),
+        "USDJPY": (0.446729387, 0.795265089),
+        "AUDUSD": (0.330659493, 0.5),
+        "AUDJPY": (1.184803081, 0.795265089),
+    }
+    for instrument, costs in expected.items():
+        assert profile.costs(instrument, "london", "mean") == pytest.approx(costs)
+    assert adjusted_execution_pips(2.0, "EURUSD") == 2.0
+    assert adjusted_execution_pips(-2.0, "AUDUSD") == -2.0
+    assert adjusted_execution_pips(2.0, "USDJPY") == pytest.approx(1.986)
+    assert adjusted_execution_pips(-2.0, "AUDJPY") == pytest.approx(-2.014)
 
 
 def test_jpy_commission_and_conversion_adjustment(profile):
