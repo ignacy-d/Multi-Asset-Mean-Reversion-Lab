@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -113,8 +113,28 @@ class OrnsteinUhlenbeckProcessState:
 
 def residual_observations(states) -> tuple[ResidualObservation, ...]:
     """Collapse LONG/SHORT representations, failing closed on disagreement."""
-    unique: dict[tuple[object, ...], ResidualObservation] = {}
-    for state in states:
+    return tuple(_iter_residual_observations(states))
+
+
+def _residual_sort_key(state):
+    if not isinstance(state, SignalState):
+        raise OrnsteinUhlenbeckError("all inputs must be SignalState instances")
+    key = (
+        state.instrument,
+        state.benchmark_family,
+        str(state.signal_timeframe),
+        state.session,
+        state.lookback,
+        state.strategy_spec_id,
+    )
+    return (str(key), state.timestamp, state.direction.name)
+
+
+def _iter_residual_observations(states):
+    """Yield unique residuals in process/time order without retaining a copy."""
+    existing = None
+    existing_key = None
+    for state in sorted(states, key=_residual_sort_key):
         if not isinstance(state, SignalState):
             raise OrnsteinUhlenbeckError("all inputs must be SignalState instances")
         if not all(math.isfinite(value) for value in (state.p0, state.e0)):
@@ -131,21 +151,22 @@ def residual_observations(states) -> tuple[ResidualObservation, ...]:
             state.e0,
         )
         key = (*observation.process_key, observation.available_at)
-        existing = unique.get(key)
-        if existing is not None and (
-            existing.p0 != observation.p0
-            or existing.e0 != observation.e0
-            or existing.current_deviation != observation.current_deviation
-        ):
-            raise OrnsteinUhlenbeckError(
-                "conflicting duplicate residual process observation"
-            )
-        unique[key] = observation
-    return tuple(
-        sorted(
-            unique.values(), key=lambda item: (str(item.process_key), item.available_at)
-        )
-    )
+        if key == existing_key:
+            if (
+                existing.p0 != observation.p0
+                or existing.e0 != observation.e0
+                or existing.current_deviation != observation.current_deviation
+            ):
+                raise OrnsteinUhlenbeckError(
+                    "conflicting duplicate residual process observation"
+                )
+            continue
+        if existing is not None:
+            yield existing
+        existing = observation
+        existing_key = key
+    if existing is not None:
+        yield existing
 
 
 def _unavailable(observation, spec, transition_count, reason):
@@ -160,6 +181,19 @@ def _unavailable(observation, spec, transition_count, reason):
     )
 
 
+def _invalid(observation, spec, transition_count, reason):
+    return OrnsteinUhlenbeckProcessState(
+        observation.process_id,
+        spec.process_spec_id,
+        observation.available_at,
+        observation.current_deviation,
+        transition_count,
+        observation.signal_timeframe.duration.total_seconds() / 60,
+        status="invalid",
+        invalid_reason=reason,
+    )
+
+
 def fit_ou_state(observation, transitions, spec):
     """Fit OLS over supplied valid pairs, including the pair ending now."""
     count = len(transitions)
@@ -169,12 +203,12 @@ def fit_ou_state(observation, transitions, spec):
     previous = [pair[0] for pair in pairs]
     following = [pair[1] for pair in pairs]
     if not all(math.isfinite(value) for value in (*previous, *following)):
-        return _unavailable(observation, spec, count, "non_finite_input")
+        return _invalid(observation, spec, count, "non_finite_input")
     x_mean = math.fsum(previous) / len(previous)
     y_mean = math.fsum(following) / len(following)
     sxx = math.fsum((value - x_mean) ** 2 for value in previous)
     if not math.isfinite(sxx) or sxx <= 0:
-        return _unavailable(observation, spec, count, "degenerate_regression")
+        return _invalid(observation, spec, count, "degenerate_regression")
     phi = (
         math.fsum(
             (x - x_mean) * (y - y_mean)
@@ -192,7 +226,7 @@ def fit_ou_state(observation, transitions, spec):
     variance = sse / (len(pairs) - 2)
     values = (phi, intercept, sse, variance)
     if not all(math.isfinite(value) for value in values):
-        return _unavailable(observation, spec, count, "non_finite_estimate")
+        return _invalid(observation, spec, count, "non_finite_estimate")
     r_squared = 1 - sse / syy if syy > 0 else None
     innovation_sigma = math.sqrt(variance) if variance > 0 else None
     phi_se = math.sqrt(variance / sxx) if variance > 0 else None
@@ -251,35 +285,72 @@ def fit_ou_state(observation, transitions, spec):
     )
 
 
-def build_ou_states(states, spec) -> tuple[OrnsteinUhlenbeckProcessState, ...]:
-    """Build causal states with bounded windows of exact-adjacent transitions."""
-    observations = residual_observations(states)
-    grouped = defaultdict(list)
-    for observation in observations:
-        grouped[observation.process_key].append(observation)
+def _build_ou_states(states, spec, required_keys=None):
+    """Process every residual but retain only requested exact-time states."""
     output = []
-    for key in sorted(grouped, key=str):
-        previous = None
-        transitions = deque(maxlen=spec.window_transitions)
-        for observation in grouped[key]:
-            if previous is not None and (
-                observation.available_at - previous.available_at
-                == observation.signal_timeframe.duration
-            ):
-                transitions.append(
-                    (previous.current_deviation, observation.current_deviation)
-                )
+    previous = None
+    process_key = None
+    transitions = deque(maxlen=spec.window_transitions)
+    for observation in _iter_residual_observations(states):
+        if observation.process_key != process_key:
+            previous = None
+            transitions.clear()
+            process_key = observation.process_key
+        if previous is not None and (
+            observation.available_at - previous.available_at
+            == observation.signal_timeframe.duration
+        ):
+            transitions.append(
+                (previous.current_deviation, observation.current_deviation)
+            )
+        exact_key = (observation.process_id, observation.available_at)
+        if required_keys is None or exact_key in required_keys:
             output.append(fit_ou_state(observation, transitions, spec))
-            previous = observation
+        previous = observation
     return tuple(sorted(output, key=lambda item: (item.available_at, item.process_id)))
+
+
+def build_ou_states(states, spec) -> tuple[OrnsteinUhlenbeckProcessState, ...]:
+    """Build a causal state at every residual observation."""
+    return _build_ou_states(states, spec)
+
+
+def build_candidate_ou_states(states, spec, required_keys):
+    """Retain requested outputs while processing all intervening observations."""
+    return _build_ou_states(states, spec, frozenset(required_keys))
+
+
+def candidate_process_keys(events):
+    """Return direction-independent exact-time process keys for candidates."""
+    keys = set()
+    for event in events:
+        signal = event.signal
+        observation = ResidualObservation(
+            signal.instrument,
+            signal.benchmark_family,
+            signal.signal_timeframe,
+            signal.session,
+            signal.lookback,
+            signal.strategy_spec_id,
+            signal.signal_timestamp,
+            signal.p0,
+            signal.e0,
+        )
+        keys.add((observation.process_id, observation.available_at))
+    return frozenset(keys)
 
 
 def align_candidate_states(events, states):
     """Align only the state available at exactly the completed signal timestamp."""
-    index = {
-        (state.process_id, state.available_at, state.process_spec_id): state
-        for state in states
-    }
+    index = {}
+    for state in states:
+        exact_key = (state.process_id, state.available_at)
+        by_spec = index.setdefault(exact_key, {})
+        if state.process_spec_id in by_spec:
+            raise OrnsteinUhlenbeckError(
+                "duplicate exact-time process specification state"
+            )
+        by_spec[state.process_spec_id] = state
     rows = []
     for event in events:
         if not isinstance(event, CandidateEvent):
@@ -298,15 +369,10 @@ def align_candidate_states(events, states):
             signal.p0,
             signal.e0,
         )
-        matches = [
-            state
-            for (process_id, timestamp, _), state in index.items()
-            if process_id == observation.process_id
-            and timestamp == signal.signal_timestamp
-        ]
+        matches = index.get((observation.process_id, signal.signal_timestamp))
         if not matches:
             raise OrnsteinUhlenbeckError("candidate has no exact-time process state")
-        for state in sorted(matches, key=lambda item: item.process_spec_id):
+        for state in (matches[spec_id] for spec_id in sorted(matches)):
             rows.append(
                 {
                     "candidate_event_id": event.candidate_event_id,

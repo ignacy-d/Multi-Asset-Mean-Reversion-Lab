@@ -13,7 +13,8 @@ from pathlib import Path
 from mr_lab.ornstein_uhlenbeck import (
     OrnsteinUhlenbeckProcessSpec,
     align_candidate_states,
-    build_ou_states,
+    build_candidate_ou_states,
+    candidate_process_keys,
 )
 from mr_lab.providers.dukascopy_range import load_offline_corpus
 from mr_lab.stage4a_runner import (
@@ -59,8 +60,11 @@ def run(corpus_dir, output_dir, instrument, registry_path, windows):
     dataset = load_offline_corpus(corpus_dir)
     signal_states = assemble_signal_states(dataset, manifest)
     events = deduplicate_states(signal_states)
+    required_keys = candidate_process_keys(events)
     process_states = tuple(
-        state for spec in specs for state in build_ou_states(signal_states, spec)
+        state
+        for spec in specs
+        for state in build_candidate_ou_states(signal_states, spec, required_keys)
     )
     rows = align_candidate_states(events, process_states)
     output_dir.mkdir(parents=True, exist_ok=True)

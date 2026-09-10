@@ -67,9 +67,11 @@ collapsed, while disagreement in `p0`, `e0`, or deviation fails closed.
 
 ## Structural status
 
-Before a full window exists, status is unavailable with
-`insufficient_history`. Degenerate regressors, non-finite inputs or estimates,
-non-positive innovation variance, and undefined mappings are explicit reasons.
+`unavailable` means the estimator cannot yet be evaluated because a full valid
+transition window is not available, with reason `insufficient_history`. Once a
+full window exists, an unusable fit is `invalid`. Degenerate regressors,
+non-finite inputs or estimates, non-positive innovation variance, and undefined
+mappings are explicit invalid reasons.
 The standard continuous-time mapping is structurally valid only for
 `0 < phi < 1`; non-positive and at-least-one estimates remain recorded but are
 marked invalid. A `phi` close to one is mathematically valid here. This version
@@ -84,6 +86,14 @@ candidate generation, then writes candidate-aligned CSV diagnostics, a summary,
 and a provenance/hash audit. Alignment requires the process state at exactly the
 candidate's completed signal timestamp; later states are never substituted.
 Rows contain no trade return, exit, or other future outcome.
+
+For scalability, candidate process/timestamp keys are derived first. Every
+residual observation is still streamed through each requested specification and
+every exact-adjacent transition still updates its bounded deque, but a state is
+fitted and retained only at a requested candidate key. Candidate alignment uses
+a two-level `(process_id, available_at) -> process_spec_id -> state` index, making
+lookup constant-time per candidate/specification rather than scanning the state
+universe. Duplicate exact-time/specification states fail closed.
 
 The next research step may compare frozen Stage 4B candidate outcomes
 conditionally on these states using 2024 in-sample evidence, treating windows as

@@ -10,7 +10,9 @@ from mr_lab.ornstein_uhlenbeck import (
     OrnsteinUhlenbeckError,
     OrnsteinUhlenbeckProcessSpec,
     align_candidate_states,
+    build_candidate_ou_states,
     build_ou_states,
+    candidate_process_keys,
     fit_ou_state,
     residual_observations,
 )
@@ -133,7 +135,12 @@ def test_insufficient_and_degenerate_states_are_explicit():
         == "insufficient_history"
     )
     state = fit_ou_state(observation(), ((1, 2), (1, 3), (1, 4)), spec)
+    assert state.status == "invalid"
     assert state.invalid_reason == "degenerate_regression"
+
+    non_finite = fit_ou_state(observation(), ((1, 2), (2, 3), (3, math.inf)), spec)
+    assert non_finite.status == "invalid"
+    assert non_finite.invalid_reason == "non_finite_input"
 
 
 @pytest.mark.parametrize(
@@ -177,6 +184,54 @@ def test_candidate_alignment_requires_exact_time_and_never_uses_later_state():
     assert row["current_deviation"] == states[2].p0 - states[2].e0
     with pytest.raises(OrnsteinUhlenbeckError, match="no exact-time"):
         align_candidate_states((event,), fitted[3:])
+
+
+def test_candidate_targeted_states_exactly_equal_full_states():
+    states = []
+    for index in range(80):
+        item = signal(index, -0.01 + math.sin(index / 3) / 1_000)
+        states.append(replace(item, z=-1.0, qualifying=False) if index % 4 else item)
+    events = deduplicate_states(states)
+    required = candidate_process_keys(events)
+    for spec in (
+        OrnsteinUhlenbeckProcessSpec(8),
+        OrnsteinUhlenbeckProcessSpec(16),
+    ):
+        full = build_ou_states(states, spec)
+        expected = tuple(
+            state
+            for state in full
+            if (state.process_id, state.available_at) in required
+        )
+        assert build_candidate_ou_states(states, spec, required) == expected
+
+
+def test_large_multi_spec_candidate_flow_only_materializes_requested_states():
+    states = []
+    for index in range(2_000):
+        item = signal(index, -0.01 + math.sin(index / 7) / 1_000)
+        states.append(replace(item, z=-1.0, qualifying=False) if index % 2 else item)
+    events = deduplicate_states(states)
+    required = candidate_process_keys(events)
+    specs = tuple(OrnsteinUhlenbeckProcessSpec(size) for size in (8, 16, 32))
+    targeted = tuple(
+        state
+        for spec in specs
+        for state in build_candidate_ou_states(states, spec, required)
+    )
+    assert len(events) == 1_000
+    assert len(targeted) == len(events) * len(specs)
+    rows = align_candidate_states(events, targeted)
+    assert len(rows) == len(targeted)
+
+
+def test_candidate_alignment_fails_closed_on_duplicate_exact_state():
+    states = tuple(signal(i, value) for i, value in enumerate((0.1, -0.1, 0.05, -0.02)))
+    event = deduplicate_states((states[-1],))[0]
+    fitted = build_ou_states(states, OrnsteinUhlenbeckProcessSpec(3))
+    exact = fitted[-1]
+    with pytest.raises(OrnsteinUhlenbeckError, match="duplicate exact-time"):
+        align_candidate_states((event,), (exact, exact))
 
 
 def test_non_finite_residual_input_fails_closed():
