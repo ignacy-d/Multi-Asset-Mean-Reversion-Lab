@@ -73,8 +73,9 @@ def _authenticated_shard(directory, candidates, trades, registry, *, index=0, co
         "registry_identity": "registry-fixture",
         "corpus_id": identity["corpus_id"],
         "assembled_dataset_id": identity["assembled_dataset_id"],
-        "source_workflow_run_id": 123,
-        "source_artifact_id": 456,
+        "source_workflow_run_id": identity["source_workflow_run_id"],
+        "source_artifact_id": identity["source_artifact_id"],
+        "source_artifact_name": identity["source_artifact_name"],
         "raw_artifact_name": f"stage4b-raw-shard-{index}",
         "filter_family": "none",
         "filter_spec_id": "none-v1",
@@ -160,6 +161,59 @@ def test_baseline_authenticated_real_format_fixture_passes(tmp_path):
         ]
         == 1
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_workflow_run_id", 1),
+        ("source_artifact_id", 2),
+        ("source_artifact_name", "wrong-artifact"),
+    ],
+)
+def test_github_artifact_registry_provenance_mismatch_fails(tmp_path, field, value):
+    registry = json.loads(REGISTRY.read_text())
+    candidate = _candidate("bb", "bollinger", "2024-01-02T09:15:00+00:00", registry)
+    source = tmp_path / "source"
+    manifest = _authenticated_shard(
+        source, [candidate], [_trade("bb", "bollinger", 3)], registry
+    )
+    manifest[field] = value
+    (source / "shard-manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(BollingerIncrementalError, match=field):
+        run([source], tmp_path / "out", REGISTRY, COSTS)
+
+
+def test_local_checkpointed_registry_provenance_passes_and_commit_mismatch_fails(
+    tmp_path,
+):
+    registry = json.loads(REGISTRY.read_text())
+    entry = registry["instruments"]["EURUSD"]
+    entry.update(
+        source_mode="local-checkpointed",
+        source_acquisition_commit_sha="b" * 40,
+        source_workflow_run_id=None,
+        source_artifact_id=None,
+    )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(registry))
+    candidate = _candidate("bb", "bollinger", "2024-01-02T09:15:00+00:00", registry)
+    source = tmp_path / "source"
+    manifest = _authenticated_shard(
+        source, [candidate], [_trade("bb", "bollinger", 3)], registry
+    )
+    manifest.update(
+        source_mode="local-checkpointed",
+        source_acquisition_commit_sha=entry["source_acquisition_commit_sha"],
+    )
+    (source / "shard-manifest.json").write_text(json.dumps(manifest))
+    run([source], tmp_path / "valid", registry_path, COSTS)
+
+    manifest["source_acquisition_commit_sha"] = "c" * 40
+    (source / "shard-manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(BollingerIncrementalError, match="acquisition_commit"):
+        run([source], tmp_path / "invalid", registry_path, COSTS)
 
 
 @pytest.mark.parametrize("filename", ["candidate-events.jsonl", "trades.jsonl"])

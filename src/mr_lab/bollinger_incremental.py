@@ -117,23 +117,31 @@ def _authenticate_inputs(input_dirs, registry):
             raise BollingerIncrementalError(
                 "manifest source mode differs from registry"
             )
-        provenance_fields = (
-            ("source_workflow_run_id", "source_artifact_id")
-            if source_mode == "github-artifact"
-            else (
-                "source_workflow_run_id",
-                "source_artifact_id",
-                "source_acquisition_commit_sha",
-            )
-        )
-        for field in provenance_fields:
-            if source_mode == "github-artifact" and manifest.get(field) is None:
+        if source_mode == "github-artifact":
+            for field in ("source_workflow_run_id", "source_artifact_id"):
+                value = manifest.get(field)
+                if type(value) is not int or value <= 0:
+                    raise BollingerIncrementalError(
+                        f"manifest {field} must be a positive integer"
+                    )
+            if manifest.get("source_acquisition_commit_sha") is not None:
                 raise BollingerIncrementalError(
-                    f"manifest {field} must identify the GitHub artifact"
+                    "GitHub artifact acquisition commit SHA must be null"
                 )
+        elif any(
+            manifest.get(field) is not None
+            for field in ("source_workflow_run_id", "source_artifact_id")
+        ):
+            raise BollingerIncrementalError(
+                "local-checkpointed GitHub source IDs must be null"
+            )
+        for field in (
+            "source_workflow_run_id",
+            "source_artifact_id",
+            "source_artifact_name",
+            "source_acquisition_commit_sha",
+        ):
             if manifest.get(field) != entry.get(field):
-                if source_mode == "github-artifact":
-                    continue
                 raise BollingerIncrementalError(
                     f"manifest {field} differs from registry"
                 )
