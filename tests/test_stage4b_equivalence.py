@@ -5,11 +5,15 @@ import lzma
 import math
 import struct
 from collections import Counter
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
+import mr_lab.stage4b_runner as stage4b_runner
+from mr_lab.ornstein_uhlenbeck import residual_observations
 from mr_lab.providers.dukascopy_multiday import DailyPayload
 from mr_lab.providers.dukascopy_range import build_corpus_manifest
+from mr_lab.stage4b import ENTRY_MODES, SL_FRACTIONS, TIME_STOPS_MINUTES, TP_FRACTIONS
 from mr_lab.stage4b_reducer import COMPACT_CSVS, reduce_shards
 from mr_lab.stage4b_runner import STABLE_GROUP_FIELDS, run
 
@@ -126,6 +130,13 @@ def test_real_runner_unsharded_equals_two_shards_plus_reducer(tmp_path):
     reduce_shards(shard_dirs, reduced, 2)
 
     expected_candidates = _jsonl(unsharded / "candidate-events.jsonl")
+    assert all(
+        not (
+            {"eligibility", "filter_family", "filter_spec_id", "filter_metadata"}
+            & row.keys()
+        )
+        for row in expected_candidates
+    )
     actual_candidates = [
         row
         for directory in shard_dirs
@@ -159,6 +170,25 @@ def test_real_runner_unsharded_equals_two_shards_plus_reducer(tmp_path):
     assert len({row["tp_target_fraction"] for row in expected_trades}) > 1
     assert len({row["sl_extension_fraction"] for row in expected_trades}) > 1
     assert len({row["time_stop_minutes"] for row in expected_trades}) > 1
+    baseline_matrix = _csv_rows(unsharded / "trade-matrix.csv")
+    assert {row["entry_mode"] for row in baseline_matrix} == set(ENTRY_MODES)
+    assert {float(row["tp_target_fraction"]) for row in baseline_matrix} == set(
+        TP_FRACTIONS
+    )
+    assert {
+        None
+        if row["sl_extension_fraction"] == ""
+        else float(row["sl_extension_fraction"])
+        for row in baseline_matrix
+    } == set(SL_FRACTIONS)
+    assert {int(row["time_stop_minutes"]) for row in baseline_matrix} == set(
+        TIME_STOPS_MINUTES
+    )
+    baseline_audit = json.loads((unsharded / "execution-audit.json").read_text())
+    assert (baseline_audit["filter_family"], baseline_audit["filter_spec_id"]) == (
+        "none",
+        "none-v1",
+    )
     assert _csv_rows(unsharded / "first-passage-distributions.csv")
 
     for name in COMPACT_CSVS:
@@ -191,3 +221,121 @@ def test_real_runner_unsharded_equals_two_shards_plus_reducer(tmp_path):
     # Raw shard order is operationally group-contiguous, while the unsharded file
     # is time ordered. No research fields are excluded: complete parsed semantic
     # dictionaries are compared after deterministic canonical sorting.
+
+
+def test_filtered_runner_internal_state_slice_and_shard_reducer_parity(
+    tmp_path, monkeypatch
+):
+    corpus, registry = _write_offline_fixture(tmp_path)
+    original_builder = stage4b_runner.build_candidate_ou_states
+    original_assemble = stage4b_runner.assemble_signal_states
+    calls = []
+
+    def with_frozen_scope_candidate(dataset, manifest):
+        states = list(original_assemble(dataset, manifest))
+        selected = next(
+            index
+            for index, state in enumerate(states)
+            if str(state.signal_timeframe) == "15m"
+            and state.session == "london"
+            and state.direction.name == "SHORT"
+            and state.benchmark_family in {"vwap", "vwap-canonical-m1"}
+            and state.lookback in {20, 40}
+            and state.p0 > state.e0
+        )
+        states[selected] = replace(states[selected], z=2.1, qualifying=True)
+        return tuple(states)
+
+    def eligible_internal_states(signal_states, process_spec, required):
+        # The runner supplies its complete internal SignalState history, rather than
+        # a path or externally authenticated OU artifact.
+        calls.append((signal_states, process_spec.process_spec_id, required))
+        states = original_builder(signal_states, process_spec, required)
+        by_process = {
+            state.process_id: source
+            for source in signal_states
+            for state in states
+            if state.available_at == source.timestamp
+            and state.process_id == residual_observations((source,))[0].process_id
+        }
+        return tuple(
+            replace(
+                state,
+                status="valid",
+                invalid_reason=None,
+                half_life_minutes=120.0,
+                ornstein_uhlenbeck_score=2.0,
+            )
+            if (
+                (source := by_process.get(state.process_id)) is not None
+                and str(source.signal_timeframe) == "15m"
+                and source.session == "london"
+                and source.direction.name == "SHORT"
+                and source.benchmark_family in {"vwap", "vwap-canonical-m1"}
+                and source.lookback in {20, 40}
+            )
+            else state
+            for state in states
+        )
+
+    monkeypatch.setattr(
+        stage4b_runner, "build_candidate_ou_states", eligible_internal_states
+    )
+    monkeypatch.setattr(
+        stage4b_runner, "assemble_signal_states", with_frozen_scope_candidate
+    )
+    unsharded = tmp_path / "filtered-unsharded"
+    shards = [tmp_path / f"filtered-shard-{index}" for index in range(2)]
+    reduced = tmp_path / "filtered-reduced"
+    selected = "frozen-ou-crossasset-v1"
+    run(corpus, unsharded, "EURUSD", registry, eligibility_filter=selected)
+    for index, directory in enumerate(shards):
+        run(
+            corpus,
+            directory,
+            "EURUSD",
+            registry,
+            eligibility_filter=selected,
+            shard_index=index,
+            shard_count=2,
+        )
+    reduce_shards(shards, reduced, 2)
+
+    assert len(calls) == 3 and all(call[0] and call[2] for call in calls)
+    candidates = _jsonl(unsharded / "candidate-events.jsonl")
+    assert candidates and all(
+        {"eligibility", "filter_family", "filter_spec_id", "filter_metadata"}
+        <= row.keys()
+        for row in candidates
+    )
+    eligible_ids = {
+        row["candidate_event_id"] for row in candidates if row["eligibility"]
+    }
+    assert eligible_ids
+    assert all(
+        not row["eligibility"]
+        for row in candidates
+        if row["signal"]["session"] != "london"
+    )
+    trades = _jsonl(unsharded / "trades.jsonl")
+    assert {row["candidate_event_id"] for row in trades} == eligible_ids
+    assert {row["entry_mode"] for row in trades} == {"immediate"}
+    assert {row["tp_target_fraction"] for row in trades} == {0.75, 1.0}
+    assert {row["sl_extension_fraction"] for row in trades} == {0.25, 0.5}
+    assert {row["time_stop_minutes"] for row in trades} == {60, 120}
+    assert len(trades) == 8 * len(eligible_ids)
+
+    audit = json.loads((unsharded / "execution-audit.json").read_text())
+    assert audit["filter_spec_id"] and audit["process_spec_id"]
+    assert all(row["filter_family"] == audit["filter_family"] for row in trades)
+    assert all(row["filter_spec_id"] == audit["filter_spec_id"] for row in trades)
+    manifests = [
+        json.loads((directory / "shard-manifest.json").read_text())
+        for directory in shards
+    ]
+    assert {item["filter_family"] for item in manifests} == {audit["filter_family"]}
+    assert {item["filter_spec_id"] for item in manifests} == {audit["filter_spec_id"]}
+    for name in COMPACT_CSVS:
+        assert _canonical_rows(_csv_rows(reduced / name)) == _canonical_rows(
+            _csv_rows(unsharded / name)
+        )

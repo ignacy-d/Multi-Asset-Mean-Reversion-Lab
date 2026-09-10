@@ -157,8 +157,15 @@ class FrozenOuEligibilitySpec:
             raise OrnsteinUhlenbeckError("frozen OU parameters cannot be changed")
 
     @property
+    def identity_payload(self):
+        """Canonical filter inputs, explicitly bound to OU process semantics."""
+        return asdict(self) | {"process_spec_id": self.process_spec.process_spec_id}
+
+    @property
     def filter_spec_id(self):
-        encoded = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        encoded = json.dumps(
+            self.identity_payload, sort_keys=True, separators=(",", ":")
+        )
         return "sha256:" + sha256(encoded.encode()).hexdigest()
 
     @property

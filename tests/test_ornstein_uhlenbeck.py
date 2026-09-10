@@ -1,6 +1,8 @@
+import json
 import math
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from itertools import pairwise
 
 import pytest
@@ -312,6 +314,22 @@ def test_frozen_ou_gate_strict_score_inclusive_half_life_and_control():
         .evaluate(event)
         .eligible
     )
+
+
+def test_frozen_filter_identity_is_deterministic_and_bound_to_process_spec():
+    gate = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    duplicate = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    control = frozen_ou_eligibility_spec("frozen-ou-score-only-control-v1")
+    payload = gate.identity_payload
+    assert payload["process_spec_id"] == gate.process_spec.process_spec_id
+    expected = (
+        "sha256:"
+        + sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    assert gate.filter_spec_id == duplicate.filter_spec_id == expected
+    assert control.filter_spec_id != gate.filter_spec_id
 
 
 def test_frozen_ou_direction_scope_exact_time_and_fail_closed():
