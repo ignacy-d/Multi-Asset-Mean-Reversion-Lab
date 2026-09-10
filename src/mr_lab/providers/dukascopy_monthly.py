@@ -11,13 +11,21 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from mr_lab.providers.dukascopy_bi5 import INSTRUMENT
+from mr_lab.providers.dukascopy_bi5 import (
+    CANONICAL_SCHEMA_VERSION,
+    INSTRUMENT,
+    PARSER_SCHEMA_VERSION,
+    SOURCE_TIMEZONE,
+)
 from mr_lab.providers.dukascopy_multiday import DailyPayload
 from mr_lab.providers.dukascopy_range import (
+    CORPUS_SCHEMA_VERSION,
+    GENERIC_CORPUS_SCHEMA_VERSION,
     RangeAcquisitionError,
     RangeAcquisitionResult,
     acquire_range,
     build_corpus_manifest,
+    load_offline_corpus,
 )
 from mr_lab.providers.instruments import get_instrument_spec
 
@@ -61,6 +69,86 @@ class YearAssemblyResult:
     manifest_path: Path
     corpus_id: str
     dataset_id: str
+
+
+def verify_full_year_corpus(
+    corpus_dir: Path,
+    *,
+    year: int = DISCOVERY_YEAR,
+    instrument: str = INSTRUMENT,
+) -> YearAssemblyResult:
+    """Fail closed unless a published corpus has the exact immutable contract."""
+    spec = get_instrument_spec(instrument)
+    if year != DISCOVERY_YEAR:
+        raise RangeAcquisitionError("full-year verification accepts only 2024")
+    manifest_path = corpus_dir / "corpus-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RangeAcquisitionError("invalid or missing full-year manifest") from error
+
+    expected = {
+        "corpus_schema_version": (
+            CORPUS_SCHEMA_VERSION
+            if spec.instrument == INSTRUMENT
+            else GENERIC_CORPUS_SCHEMA_VERSION
+        ),
+        "provider": spec.provider,
+        "instrument": spec.instrument,
+        "requested_start_date": f"{year}-01-01",
+        "requested_end_date": f"{year}-12-31",
+        "requested_calendar_day_count": 366,
+        "native_timeframe": spec.native_timeframe.value,
+        "price_basis": spec.price_basis.value,
+        "volume_semantics": spec.volume_semantics.value,
+        "source_timezone": SOURCE_TIMEZONE,
+        "canonical_schema_version": CANONICAL_SCHEMA_VERSION,
+        "parser_schema_version": PARSER_SCHEMA_VERSION,
+    }
+    if spec.instrument != INSTRUMENT:
+        expected["instrument_spec"] = spec.as_dict()
+    if any(manifest.get(field) != value for field, value in expected.items()):
+        raise RangeAcquisitionError("full-year manifest contract mismatch")
+
+    requested = {
+        date.fromordinal(value)
+        for value in range(
+            date(year, 1, 1).toordinal(),
+            date(year, 12, 31).toordinal() + 1,
+        )
+    }
+    try:
+        successful = [
+            date.fromisoformat(value)
+            for value in manifest["successful_component_dates"]
+        ]
+        absent = [
+            date.fromisoformat(value)
+            for value in manifest["confirmed_absent_dates"]
+        ]
+    except (KeyError, TypeError, ValueError) as error:
+        raise RangeAcquisitionError("invalid full-year date declarations") from error
+    if (
+        len(successful) != len(set(successful))
+        or len(absent) != len(set(absent))
+        or set(successful) & set(absent)
+        or set(successful) | set(absent) != requested
+    ):
+        raise RangeAcquisitionError("full-year dates do not exactly partition 2024")
+
+    claimed_corpus_id = manifest.get("corpus_id")
+    identity = {key: value for key, value in manifest.items() if key != "corpus_id"}
+    actual_corpus_id = "sha256:" + hashlib.sha256(
+        json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+    ).hexdigest()
+    if claimed_corpus_id != actual_corpus_id:
+        raise RangeAcquisitionError("full-year corpus identity mismatch")
+    dataset = load_offline_corpus(corpus_dir)
+    return YearAssemblyResult(
+        manifest_path, actual_corpus_id, dataset.metadata.dataset_id
+    )
 
 
 def _read_month(
@@ -194,18 +282,29 @@ def main() -> None:
     assembly_parser.add_argument("--instrument", default=INSTRUMENT)
     assembly_parser.add_argument("--chunks-root", type=Path, required=True)
     assembly_parser.add_argument("--output-dir", type=Path, required=True)
+    verify_parser = subparsers.add_parser("verify-year")
+    verify_parser.add_argument("--year", type=int, default=DISCOVERY_YEAR)
+    verify_parser.add_argument("--instrument", required=True)
+    verify_parser.add_argument("--corpus-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "acquire-month":
         result = acquire_month(
             args.output_dir, args.year, args.month, instrument=args.instrument
         )
         print(f"month_manifest={result.manifest_path}")
-    else:
+    elif args.command == "assemble-year":
         result = assemble_year(
             args.chunks_root,
             args.output_dir,
             year=args.year,
             instrument=args.instrument,
+        )
+        print(f"corpus_manifest={result.manifest_path}")
+        print(f"corpus_id={result.corpus_id}")
+        print(f"assembled_dataset_id={result.dataset_id}")
+    else:
+        result = verify_full_year_corpus(
+            args.corpus_dir, year=args.year, instrument=args.instrument
         )
         print(f"corpus_manifest={result.manifest_path}")
         print(f"corpus_id={result.corpus_id}")

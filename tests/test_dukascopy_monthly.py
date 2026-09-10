@@ -13,6 +13,7 @@ from mr_lab.providers.dukascopy_monthly import (
     acquire_month,
     assemble_year,
     month_bounds,
+    verify_full_year_corpus,
 )
 from mr_lab.providers.dukascopy_multiday import DailyPayload
 from mr_lab.providers.dukascopy_range import (
@@ -52,9 +53,9 @@ def write_month(root: Path, month: int, *, instrument: str = "EURUSD") -> None:
     (directory / "corpus-manifest.json").write_text(manifest.to_json())
 
 
-def complete_chunks(root: Path) -> None:
+def complete_chunks(root: Path, *, instrument: str = "EURUSD") -> None:
     for month in range(1, 13):
-        write_month(root, month)
+        write_month(root, month, instrument=instrument)
 
 
 def test_monthly_assembly_matches_direct_full_year_identity(tmp_path: Path) -> None:
@@ -80,6 +81,22 @@ def test_monthly_assembly_matches_direct_full_year_identity(tmp_path: Path) -> N
     assert result.dataset_id == direct.dataset.metadata.dataset_id
     assert result.corpus_id == direct.corpus_id
     assert json.loads(result.manifest_path.read_text()) == direct.as_dict()
+
+
+def test_legacy_eurusd_full_year_publication_verifies_without_instrument_spec(
+    tmp_path: Path,
+) -> None:
+    chunks = tmp_path / "chunks"
+    complete_chunks(chunks, instrument="EURUSD")
+    corpus = tmp_path / "assembled"
+    assembled = assemble_year(chunks, corpus, instrument="EURUSD")
+
+    manifest = json.loads(assembled.manifest_path.read_text())
+    assert "instrument_spec" not in manifest
+
+    verified = verify_full_year_corpus(corpus, instrument="EURUSD")
+    assert verified.corpus_id == assembled.corpus_id
+    assert verified.dataset_id == assembled.dataset_id
 
 
 def test_missing_month_and_missing_day_are_rejected(tmp_path: Path) -> None:
@@ -163,3 +180,84 @@ def test_raw_hash_mismatch_is_rejected(tmp_path: Path) -> None:
     (chunks / "checkpoint-04" / "EURUSD-2024-04-01-M1-BID.bi5").write_bytes(b"changed")
     with pytest.raises(RangeAcquisitionError, match="provenance mismatch"):
         assemble_year(chunks, tmp_path / "out")
+
+
+def test_gbpusd_full_year_publication_is_exact_and_identity_bound(
+    tmp_path: Path,
+) -> None:
+    chunks = tmp_path / "chunks"
+    complete_chunks(chunks, instrument="GBPUSD")
+    corpus = tmp_path / "assembled"
+    assembled = assemble_year(chunks, corpus, instrument="GBPUSD")
+
+    verified = verify_full_year_corpus(corpus, instrument="GBPUSD")
+
+    manifest = json.loads(verified.manifest_path.read_text())
+    assert (manifest["requested_start_date"], manifest["requested_end_date"]) == (
+        "2024-01-01",
+        "2024-12-31",
+    )
+    assert manifest["instrument"] == "GBPUSD"
+    assert manifest["provider"] == "Dukascopy"
+    assert manifest["price_basis"] == "bid"
+    assert manifest["native_timeframe"] == "1m"
+    assert manifest["instrument_spec"]["instrument"] == "GBPUSD"
+    assert verified.corpus_id == assembled.corpus_id
+    assert verified.dataset_id == assembled.dataset_id
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("instrument", "EURUSD"),
+        ("requested_start_date", "2024-01-02"),
+        ("requested_end_date", "2024-12-30"),
+        ("provider", "Other"),
+        ("price_basis", "ask"),
+        ("native_timeframe", "5m"),
+        ("instrument_spec", {"instrument": "GBPUSD"}),
+        ("corpus_id", "sha256:not-the-identity"),
+    ],
+)
+def test_gbpusd_publication_refuses_malformed_or_mismatched_metadata(
+    tmp_path: Path, field: str, bad: object
+) -> None:
+    chunks = tmp_path / "chunks"
+    complete_chunks(chunks, instrument="GBPUSD")
+    corpus = tmp_path / "assembled"
+    assemble_year(chunks, corpus, instrument="GBPUSD")
+    manifest_path = corpus / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[field] = bad
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RangeAcquisitionError):
+        verify_full_year_corpus(corpus, instrument="GBPUSD")
+
+
+def test_gbpusd_publication_refuses_non_2024_component_date(tmp_path: Path) -> None:
+    chunks = tmp_path / "chunks"
+    complete_chunks(chunks, instrument="GBPUSD")
+    corpus = tmp_path / "assembled"
+    assemble_year(chunks, corpus, instrument="GBPUSD")
+    manifest_path = corpus / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["confirmed_absent_dates"][-1] = "2026-01-01"
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RangeAcquisitionError, match="partition 2024"):
+        verify_full_year_corpus(corpus, instrument="GBPUSD")
+
+
+def test_gbpusd_publication_refuses_missing_instrument_spec(tmp_path: Path) -> None:
+    chunks = tmp_path / "chunks"
+    complete_chunks(chunks, instrument="GBPUSD")
+    corpus = tmp_path / "assembled"
+    assemble_year(chunks, corpus, instrument="GBPUSD")
+    manifest_path = corpus / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("instrument_spec")
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RangeAcquisitionError, match="manifest contract mismatch"):
+        verify_full_year_corpus(corpus, instrument="GBPUSD")
