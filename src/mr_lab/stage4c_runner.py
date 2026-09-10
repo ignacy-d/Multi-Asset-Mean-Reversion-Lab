@@ -16,6 +16,10 @@ import tempfile
 from collections import defaultdict
 from pathlib import Path
 
+from mr_lab.ornstein_uhlenbeck import (
+    FROZEN_OU_FILTER_CHOICES,
+    frozen_ou_eligibility_spec,
+)
 from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
 from mr_lab.stage4c import (
     CONFIG_FIELDS,
@@ -52,6 +56,9 @@ ALLOWED_SOURCE_AUDIT_FIELDS = (
     "source_trade_sha256",
     "source_shard_identities",
     "expected_shard_count",
+    "filter_family",
+    "filter_spec_id",
+    "process_spec_id",
 )
 
 
@@ -94,7 +101,42 @@ def _group_owner(key, shard_count):
     return int.from_bytes(digest[:8], "big") % shard_count
 
 
-def _source_input_identity(source_mode, source_audit):
+def _expected_filter_provenance(eligibility_filter):
+    if eligibility_filter == "none":
+        return {"filter_family": "none", "filter_spec_id": "none-v1"}
+    spec = frozen_ou_eligibility_spec(eligibility_filter)
+    return {
+        "filter_family": "ornstein-uhlenbeck",
+        "filter_spec_id": spec.filter_spec_id,
+        "process_spec_id": spec.process_spec.process_spec_id,
+    }
+
+
+def _authenticate_filter_provenance(source_audit, eligibility_filter):
+    expected = _expected_filter_provenance(eligibility_filter)
+    actual = {
+        key: source_audit.get(key)
+        for key in ("filter_family", "filter_spec_id", "process_spec_id")
+        if key in expected or key in source_audit
+    }
+    if actual != expected:
+        raise Stage4CError(
+            "Stage 4B eligibility-filter provenance mismatch: "
+            f"expected {_json(expected)}, got {_json(actual)}"
+        )
+    return expected
+
+
+def _eligibility_filter_from_provenance(provenance):
+    if provenance == _expected_filter_provenance("none"):
+        return "none"
+    for choice in FROZEN_OU_FILTER_CHOICES:
+        if provenance == _expected_filter_provenance(choice):
+            return choice
+    raise Stage4CError("unknown Stage 4B eligibility-filter provenance")
+
+
+def _source_input_identity(source_mode, source_audit, filter_provenance):
     components = {
         "source_mode": source_mode,
         "instrument": source_audit.get("instrument"),
@@ -102,6 +144,7 @@ def _source_input_identity(source_mode, source_audit):
         "assembled_dataset_id": source_audit["assembled_dataset_id"],
         "source_trade_sha256": source_audit.get("source_trade_sha256"),
         "registry_identity": source_audit.get("registry_identity"),
+        **filter_provenance,
     }
     if not components["source_trade_sha256"]:
         raise Stage4CError("source trade SHA-256 commitment is required")
@@ -270,6 +313,7 @@ def run_rows(
     shard_index=None,
     shard_count=None,
     spool_dir: Path | None = None,
+    eligibility_filter="none",
 ):
     """Externally group rows, retaining only the currently processed group in RAM."""
     if source_mode not in ("regenerated_stage4b", "existing_stage4b_raw"):
@@ -279,9 +323,12 @@ def run_rows(
     for required in ("corpus_id", "assembled_dataset_id"):
         if not source_audit.get(required):
             raise Stage4CError(f"missing expected input identity: {required}")
+    filter_provenance = _authenticate_filter_provenance(
+        source_audit, eligibility_filter
+    )
     profile = CostProfile.load(profile_path)
     source_components, source_commitment = _source_input_identity(
-        source_mode, source_audit
+        source_mode, source_audit, filter_provenance
     )
     expected_matrix = {
         "spread_statistics": list(SPREAD_STATISTICS),
@@ -476,6 +523,7 @@ def run_regenerated(
     shard_index=None,
     shard_count=None,
     spool_dir: Path | None = None,
+    eligibility_filter="none",
 ):
     """Run frozen Stage 4B and feed its immutable callback rows into Stage 4C."""
     from mr_lab.stage4b_runner import run as run_stage4b
@@ -484,12 +532,16 @@ def run_regenerated(
         temporary = Path(temporary)
         callback_rows = temporary / "callback-rows.jsonl"
         with callback_rows.open("w") as stream:
+            stage4b_options = {}
+            if eligibility_filter != "none":
+                stage4b_options["eligibility_filter"] = eligibility_filter
             run_stage4b(
                 corpus_dir,
                 temporary / "stage4b",
                 instrument,
                 registry_path,
                 trade_row_consumer=lambda row: stream.write(_json(row) + "\n"),
+                **stage4b_options,
             )
         stage4b_audit = json.loads(
             (temporary / "stage4b" / "execution-audit.json").read_text()
@@ -501,7 +553,11 @@ def run_regenerated(
             "assembled_dataset_id": stage4b_audit["assembled_dataset_id"],
             "registry_identity": sha256_file(Path(registry_path)),
             "source_trade_sha256": {"callback_stream": sha256_file(callback_rows)},
+            "filter_family": stage4b_audit["filter_family"],
+            "filter_spec_id": stage4b_audit["filter_spec_id"],
         }
+        if "process_spec_id" in stage4b_audit:
+            source_audit["process_spec_id"] = stage4b_audit["process_spec_id"]
         return run_rows(
             iter_jsonl((callback_rows,)),
             Path(output_dir),
@@ -512,6 +568,7 @@ def run_regenerated(
             shard_index=shard_index,
             shard_count=shard_count,
             spool_dir=spool_dir,
+            eligibility_filter=eligibility_filter,
         )
 
 
@@ -524,6 +581,12 @@ def main(argv=None):
     )
     parser.add_argument("--stage4b-trades", type=Path, action="append")
     parser.add_argument("--stage4b-audit", type=Path)
+    parser.add_argument(
+        "--eligibility-filter",
+        choices=("none", *FROZEN_OU_FILTER_CHOICES),
+        default="none",
+        help="exact Stage 4B eligibility filter whose trade stream is priced",
+    )
     parser.add_argument("--corpus-dir", type=Path)
     parser.add_argument("--instrument")
     parser.add_argument(
@@ -555,6 +618,7 @@ def main(argv=None):
             shard_index=args.shard_index,
             shard_count=args.shard_count,
             spool_dir=args.spool_dir,
+            eligibility_filter=args.eligibility_filter,
         )
         return 0
     if not args.stage4b_trades or not args.stage4b_audit:
@@ -573,6 +637,7 @@ def main(argv=None):
         shard_index=args.shard_index,
         shard_count=args.shard_count,
         spool_dir=args.spool_dir,
+        eligibility_filter=args.eligibility_filter,
     )
     return 0
 

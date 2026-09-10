@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from mr_lab.ornstein_uhlenbeck import frozen_ou_eligibility_spec
 from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
 from mr_lab.stage4c import (
     CONFIG_FIELDS,
@@ -149,6 +150,8 @@ def test_streaming_matches_reference_and_sharded_equals_unsharded(
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -189,6 +192,8 @@ def test_default_and_external_spool_are_byte_identical(tmp_path, monkeypatch):
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -221,6 +226,8 @@ def test_default_and_external_spool_are_byte_identical(tmp_path, monkeypatch):
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -240,6 +247,8 @@ def test_external_spool_directory_is_empty_after_success(tmp_path, monkeypatch):
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -286,6 +295,8 @@ def test_duplicate_and_wrong_methodology_fail_closed(tmp_path, monkeypatch):
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -313,6 +324,8 @@ def test_external_spool_is_cleaned_after_spooling_failure(tmp_path, monkeypatch)
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -338,6 +351,8 @@ def test_cleanup_failure_does_not_mask_original_spooling_exception(
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -366,6 +381,8 @@ def test_reports_required_metrics_and_no_2025_path(tmp_path, monkeypatch):
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -407,6 +424,8 @@ def test_bounded_processing_releases_independent_groups(tmp_path, monkeypatch):
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -441,6 +460,8 @@ def test_real_independent_shards_reduce_exactly(tmp_path, monkeypatch):
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -512,6 +533,8 @@ def test_regenerated_shards_preserve_original_source_mode(tmp_path, monkeypatch)
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"callback_stream": "c" * 64},
         "registry_identity": "registry",
     }
@@ -545,6 +568,8 @@ def test_reducer_rejects_missing_duplicate_overlap_and_inconsistency(
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -592,6 +617,8 @@ def test_reducer_rejects_source_commitment_count_and_state_ownership(
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -661,6 +688,8 @@ def test_reducer_rejects_missing_complete_group_and_wrong_instrument(
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -747,6 +776,8 @@ def test_reducer_recomputes_source_provenance_commitment(tmp_path, monkeypatch):
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -778,6 +809,8 @@ def test_audit_authority_and_currency_rule(tmp_path, monkeypatch):
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
         "schema_version": "hostile",
@@ -809,6 +842,8 @@ def test_existing_stage4b_raw_provenance_is_unchanged_with_external_spool(
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -827,6 +862,8 @@ def test_existing_stage4b_raw_provenance_is_unchanged_with_external_spool(
         "instrument": "EURUSD",
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -845,6 +882,8 @@ def test_default_spool_path_remains_backward_compatible(tmp_path, monkeypatch):
         "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
         "corpus_id": "corpus",
         "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
         "source_trade_sha256": {"fixture": "f" * 64},
         "registry_identity": "registry",
     }
@@ -870,9 +909,25 @@ def test_regenerated_route_uses_stage4b_callback(tmp_path, monkeypatch):
     registry = tmp_path / "registry.json"
     registry.write_text("{}")
 
-    def fake_run(_corpus, output, instrument, _registry, trade_row_consumer=None):
+    def fake_run(
+        _corpus,
+        output,
+        instrument,
+        _registry,
+        eligibility_filter=None,
+        trade_row_consumer=None,
+    ):
         output.mkdir()
-        trade_row_consumer(trade(instrument=instrument))
+        if eligibility_filter is None:
+            provenance = {"filter_family": "none", "filter_spec_id": "none-v1"}
+        else:
+            spec = frozen_ou_eligibility_spec(eligibility_filter)
+            provenance = {
+                "filter_family": "ornstein-uhlenbeck",
+                "filter_spec_id": spec.filter_spec_id,
+                "process_spec_id": spec.process_spec.process_spec_id,
+            }
+        trade_row_consumer(trade(instrument=instrument) | provenance)
         (output / "execution-audit.json").write_text(
             json.dumps(
                 {
@@ -882,6 +937,7 @@ def test_regenerated_route_uses_stage4b_callback(tmp_path, monkeypatch):
                     "assembled_dataset_id": "dataset",
                     "source_trade_sha256": {"fixture": "f" * 64},
                     "registry_identity": "registry",
+                    **provenance,
                 }
             )
         )
@@ -892,3 +948,130 @@ def test_regenerated_route_uses_stage4b_callback(tmp_path, monkeypatch):
     audit = json.loads((output / "execution-audit.json").read_text())
     assert audit["source_mode"] == "regenerated_stage4b"
     assert audit["corpus_id"] == "corpus"
+
+
+@pytest.mark.parametrize(
+    "eligibility_filter",
+    ("frozen-ou-crossasset-v1", "frozen-ou-score-only-control-v1"),
+)
+def test_regenerated_route_forwards_and_commits_frozen_filter(
+    tmp_path, monkeypatch, eligibility_filter
+):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    registry = tmp_path / "registry.json"
+    registry.write_text("{}")
+    forwarded = []
+
+    def fake_run(
+        _corpus,
+        output,
+        instrument,
+        _registry,
+        eligibility_filter=None,
+        trade_row_consumer=None,
+    ):
+        forwarded.append(eligibility_filter)
+        spec = frozen_ou_eligibility_spec(eligibility_filter)
+        provenance = {
+            "filter_family": "ornstein-uhlenbeck",
+            "filter_spec_id": spec.filter_spec_id,
+            "process_spec_id": spec.process_spec.process_spec_id,
+        }
+        output.mkdir()
+        trade_row_consumer(trade(instrument=instrument) | provenance)
+        (output / "execution-audit.json").write_text(
+            json.dumps(
+                {
+                    "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+                    "instrument": instrument,
+                    "corpus_id": "corpus",
+                    "assembled_dataset_id": "dataset",
+                    **provenance,
+                }
+            )
+        )
+
+    monkeypatch.setattr("mr_lab.stage4b_runner.run", fake_run)
+    output = tmp_path / eligibility_filter
+    run_regenerated(
+        tmp_path / "corpus",
+        output,
+        "EURUSD",
+        registry,
+        PROFILE,
+        eligibility_filter=eligibility_filter,
+    )
+    audit = json.loads((output / "execution-audit.json").read_text())
+    assert forwarded == [eligibility_filter]
+    assert audit["source_input_components"]["process_spec_id"].startswith("sha256:")
+    assert audit["filter_family"] == "ornstein-uhlenbeck"
+
+
+def test_filter_source_identity_differs_and_mismatch_fails_closed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("STAGE4C_SOURCE_COMMIT", "a" * 40)
+    base = {
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+        "instrument": "EURUSD",
+        "corpus_id": "corpus",
+        "assembled_dataset_id": "dataset",
+        "filter_family": "none",
+        "filter_spec_id": "none-v1",
+        "source_trade_sha256": {"fixture": "f" * 64},
+        "registry_identity": "registry",
+    }
+    baseline = tmp_path / "baseline"
+    run_rows(
+        [trade()],
+        baseline,
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=base | {"filter_family": "none", "filter_spec_id": "none-v1"},
+        eligibility_filter="none",
+    )
+    spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    filtered_audit = base | {
+        "filter_family": "ornstein-uhlenbeck",
+        "filter_spec_id": spec.filter_spec_id,
+        "process_spec_id": spec.process_spec.process_spec_id,
+    }
+    filtered = tmp_path / "filtered"
+    run_rows(
+        [trade() | filtered_audit],
+        filtered,
+        PROFILE,
+        source_mode="existing_stage4b_raw",
+        source_audit=filtered_audit,
+        eligibility_filter="frozen-ou-crossasset-v1",
+    )
+    baseline_identity = json.loads(
+        (baseline / "execution-audit.json").read_text()
+    )["source_input_commitment"]
+    filtered_identity = json.loads(
+        (filtered / "execution-audit.json").read_text()
+    )["source_input_commitment"]
+    assert filtered_identity != baseline_identity
+    with pytest.raises(Stage4CError, match="provenance mismatch"):
+        missing_provenance = {
+            key: value
+            for key, value in base.items()
+            if key not in ("filter_family", "filter_spec_id")
+        }
+        run_rows(
+            [trade()],
+            tmp_path / "mismatch",
+            PROFILE,
+            source_mode="existing_stage4b_raw",
+            source_audit=filtered_audit,
+            eligibility_filter="none",
+        )
+    with pytest.raises(Stage4CError, match="provenance mismatch"):
+        run_rows(
+            [trade()],
+            tmp_path / "missing",
+            PROFILE,
+            source_mode="existing_stage4b_raw",
+            source_audit=missing_provenance,
+            eligibility_filter="none",
+        )

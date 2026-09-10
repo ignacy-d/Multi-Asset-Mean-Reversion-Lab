@@ -21,6 +21,7 @@ from mr_lab.stage4c import (
 from mr_lab.stage4c_runner import (
     SHARD_MANIFEST,
     SHARD_STATE,
+    _eligibility_filter_from_provenance,
     _group_owner,
     _source_input_identity,
     iter_jsonl,
@@ -86,8 +87,13 @@ def reduce_shards(shard_dirs, output_dir, profile_path, expected_shard_count):
             if components.get(component) != manifest.get(manifest_field):
                 raise Stage4CReductionError(f"source component mismatch: {component}")
         try:
+            filter_provenance = {
+                key: components[key]
+                for key in ("filter_family", "filter_spec_id", "process_spec_id")
+                if key in components
+            }
             canonical_components, commitment = _source_input_identity(
-                manifest["source_mode"], components
+                manifest["source_mode"], components, filter_provenance
             )
         except (KeyError, Stage4CError) as error:
             raise Stage4CReductionError("malformed source input components") from error
@@ -192,13 +198,26 @@ def reduce_shards(shard_dirs, output_dir, profile_path, expected_shard_count):
         "registry_identity": components.get("registry_identity"),
         "source_shard_identities": shard_commitments,
         "expected_shard_count": expected_shard_count,
+        **{
+            key: components[key]
+            for key in ("filter_family", "filter_spec_id", "process_spec_id")
+            if key in components
+        },
     }
+    eligibility_filter = _eligibility_filter_from_provenance(
+        {
+            key: components[key]
+            for key in ("filter_family", "filter_spec_id", "process_spec_id")
+            if key in components
+        }
+    )
     summary = run_rows(
         states(),
         Path(output_dir),
         Path(profile_path),
         source_mode=reference["source_mode"],
         source_audit=source_audit,
+        eligibility_filter=eligibility_filter,
     )
     summary.update(
         stage4b_rows_read=reference["source_rows_read"],
