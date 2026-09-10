@@ -16,7 +16,7 @@ from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
 
 SCHEMA_VERSION = "stage-4c-report-v1"
 STAGE4B_SOURCE_COMMIT = "3090682b61090de1b4a30efc18a7547e92fa262e"
-INSTRUMENTS = ("EURUSD", "USDJPY", "AUDUSD", "AUDJPY")
+INSTRUMENTS = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "AUDJPY")
 SPREAD_STATISTICS = ("mean", "p75", "p90", "p95")
 SLIPPAGES = (0.0, 0.1, 0.25, 0.5)
 CONFIG_FIELDS = (
@@ -79,15 +79,13 @@ class CostProfile:
             ]
         except KeyError as error:
             raise Stage4CError(f"missing cost profile: {instrument}/{key}") from error
-        commission = (
-            self.raw["commission"]["usd_quote_pairs"][instrument][
+        usd_quote_pairs = self.raw["commission"]["usd_quote_pairs"]
+        if instrument in usd_quote_pairs:
+            commission = usd_quote_pairs[instrument]["commission_round_turn_pips"]
+        else:
+            commission = self.raw["commission"]["jpy_quote_pairs"]["profiles"][key][
                 "commission_round_turn_pips"
             ]
-            if instrument in ("EURUSD", "AUDUSD")
-            else self.raw["commission"]["jpy_quote_pairs"]["profiles"][key][
-                "commission_round_turn_pips"
-            ]
-        )
         if not all(
             math.isfinite(float(x)) and float(x) >= 0 for x in (spread, commission)
         ):
