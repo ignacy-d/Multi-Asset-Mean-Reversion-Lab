@@ -66,6 +66,11 @@ jobs:
           --year 2024 --instrument "${{ inputs.instrument }}"
           --chunks-root data/raw/months
           --output-dir data/raw/stage-3a-corpus
+      - name: Fail closed on the assembled publication contract
+        run: >-
+          uv run python -m mr_lab.providers.dukascopy_monthly verify-year
+          --year 2024 --instrument "${{ inputs.instrument }}"
+          --corpus-dir data/raw/stage-3a-corpus
       - uses: actions/upload-artifact@v4
         with:
           name: dukascopy-${{ inputs.instrument }}-m1-bid-2024-full-year
