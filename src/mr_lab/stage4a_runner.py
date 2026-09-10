@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
@@ -58,6 +59,9 @@ RESEARCH_FILES = ("events.jsonl", "matrix.csv", "summary.json", "report.md")
 REGISTRY_STATUSES = frozenset(
     ("verified", "pending-reviewer-verification", "pending-acquisition")
 )
+SOURCE_MODES = frozenset(("github-artifact", "local-checkpointed"))
+SHA256_IDENTITY = re.compile(r"sha256:[0-9a-f]{64}\Z")
+GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
 class Stage4ARunnerError(ValueError):
@@ -140,13 +144,44 @@ def validate_registry_entry(
     if require_verified and status != "verified":
         raise Stage4ARunnerError(f"{instrument} registry entry is not verified")
     if status == "verified":
-        for field in ("source_workflow_run_id", "source_artifact_id"):
-            value = entry.get(field)
-            if type(value) is not int or value <= 0:
-                raise Stage4ARunnerError(f"verified registry {field} must be positive")
+        source_mode = entry.get("source_mode", "github-artifact")
+        if source_mode not in SOURCE_MODES:
+            raise Stage4ARunnerError("verified registry source_mode is unsupported")
+        if source_mode == "github-artifact":
+            for field in ("source_workflow_run_id", "source_artifact_id"):
+                value = entry.get(field)
+                if type(value) is not int or value <= 0:
+                    raise Stage4ARunnerError(
+                        f"verified registry {field} must be positive"
+                    )
+            if entry.get("source_acquisition_commit_sha") is not None:
+                raise Stage4ARunnerError(
+                    "github-artifact acquisition commit SHA must be null"
+                )
+        else:
+            if any(
+                entry.get(field) is not None
+                for field in ("source_workflow_run_id", "source_artifact_id")
+            ):
+                raise Stage4ARunnerError(
+                    "local-checkpointed GitHub source IDs must be null"
+                )
+            acquisition_sha = entry.get("source_acquisition_commit_sha")
+            if not isinstance(acquisition_sha, str) or not GIT_SHA.fullmatch(
+                acquisition_sha
+            ):
+                raise Stage4ARunnerError(
+                    "local-checkpointed acquisition commit SHA must be valid"
+                )
         for field in ("corpus_id", "assembled_dataset_id"):
             if not isinstance(entry.get(field), str) or not entry[field]:
                 raise Stage4ARunnerError(f"verified registry {field} must be non-empty")
+            if source_mode == "local-checkpointed" and not SHA256_IDENTITY.fullmatch(
+                entry[field]
+            ):
+                raise Stage4ARunnerError(
+                    f"local-checkpointed registry {field} must be a sha256 identity"
+                )
     elif any(
         entry.get(field) is not None
         for field in (
@@ -154,6 +189,7 @@ def validate_registry_entry(
             "source_artifact_id",
             "corpus_id",
             "assembled_dataset_id",
+            "source_acquisition_commit_sha",
         )
     ):
         raise Stage4ARunnerError(
@@ -373,6 +409,8 @@ def write_execution_audit(
         "research_output_sha256": hashes,
         "source_artifact_id": entry["source_artifact_id"],
         "source_artifact_name": entry["source_artifact_name"],
+        "source_mode": entry.get("source_mode", "github-artifact"),
+        "source_acquisition_commit_sha": entry.get("source_acquisition_commit_sha"),
         "source_commit_sha": source_commit_sha,
         "source_workflow_run_id": entry["source_workflow_run_id"],
         "stage4a_methodology_ids": summary["stage4a_methodology_ids"],

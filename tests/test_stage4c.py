@@ -236,9 +236,10 @@ def test_default_and_external_spool_are_byte_identical(tmp_path, monkeypatch):
     assert default_audit["source_input_commitment"] == _source_input_commitment(
         expected_components
     )
-    assert external_audit["source_input_commitment"] == default_audit[
-        "source_input_commitment"
-    ]
+    assert (
+        external_audit["source_input_commitment"]
+        == default_audit["source_input_commitment"]
+    )
 
 
 def test_external_spool_directory_is_empty_after_success(tmp_path, monkeypatch):
@@ -1045,12 +1046,12 @@ def test_filter_source_identity_differs_and_mismatch_fails_closed(
         source_audit=filtered_audit,
         eligibility_filter="frozen-ou-crossasset-v1",
     )
-    baseline_identity = json.loads(
-        (baseline / "execution-audit.json").read_text()
-    )["source_input_commitment"]
-    filtered_identity = json.loads(
-        (filtered / "execution-audit.json").read_text()
-    )["source_input_commitment"]
+    baseline_identity = json.loads((baseline / "execution-audit.json").read_text())[
+        "source_input_commitment"
+    ]
+    filtered_identity = json.loads((filtered / "execution-audit.json").read_text())[
+        "source_input_commitment"
+    ]
     assert filtered_identity != baseline_identity
     with pytest.raises(Stage4CError, match="provenance mismatch"):
         missing_provenance = {

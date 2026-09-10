@@ -352,6 +352,31 @@ def test_registry_identity_mismatch_fails(tmp_path, field, message):
         build_atlas([source], tmp_path / "out", PROFILE, registry)
 
 
+def test_local_checkpointed_registry_provenance_authenticates(tmp_path):
+    registry = _registry(tmp_path, instruments=("EURUSD",))
+    value = json.loads(registry.read_text())
+    entry = value["instruments"]["EURUSD"]
+    entry.update(
+        source_mode="local-checkpointed",
+        source_acquisition_commit_sha="a" * 40,
+        source_workflow_run_id=None,
+        source_artifact_id=None,
+    )
+    registry.write_text(json.dumps(value))
+    source = _shard(tmp_path, registry, [_trade("local")])
+    manifest_path = source / "shard-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update(
+        source_mode="local-checkpointed",
+        source_acquisition_commit_sha="a" * 40,
+        source_workflow_run_id=None,
+        source_artifact_id=None,
+    )
+    manifest_path.write_text(json.dumps(manifest))
+
+    build_atlas([source], tmp_path / "out", PROFILE, registry)
+
+
 @pytest.mark.parametrize("target", ["trades.jsonl", "shard-manifest.json"])
 def test_tampered_manifest_or_raw_fails(tmp_path, target):
     registry = _registry(tmp_path)

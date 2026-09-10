@@ -92,7 +92,23 @@ def test_registry_exact_pins_and_status_model():
     registry = load_corpus_registry(Path("configs/stage4a-2024-corpus-registry.json"))
     entries = registry["instruments"]
     assert entries["EURUSD"]["verification_status"] == "verified"
-    assert entries["GBPUSD"]["verification_status"] == "pending-acquisition"
+    assert entries["GBPUSD"] == {
+        "assembled_dataset_id": (
+            "sha256:1333e8d1b378b2b08f88a857a07f017a61a744b1787c8db68f629e6c3c0fe70a"
+        ),
+        "corpus_id": (
+            "sha256:16d58bfa2de1a5a771f7a0f9034f4e05a0c1b900002276e4c6e28d85ac4628cf"
+        ),
+        "instrument": "GBPUSD",
+        "requested_end_date": "2024-12-31",
+        "requested_start_date": "2024-01-01",
+        "source_acquisition_commit_sha": "94a43c36e1a5fa1b3b9e98890dc2d62a156592c4",
+        "source_artifact_id": None,
+        "source_artifact_name": "dukascopy-GBPUSD-m1-bid-2024-full-year",
+        "source_mode": "local-checkpointed",
+        "source_workflow_run_id": None,
+        "verification_status": "verified",
+    }
     expected = {
         "EURUSD": (
             32523318565,
@@ -162,6 +178,42 @@ def test_verified_entry_is_strict_and_manifest_bound():
         )
 
 
+def test_local_checkpointed_entry_requires_exact_local_provenance():
+    entry = {
+        **verified_entry("GBPUSD"),
+        "source_mode": "local-checkpointed",
+        "source_acquisition_commit_sha": "a" * 40,
+        "source_workflow_run_id": None,
+        "source_artifact_id": None,
+        "corpus_id": "sha256:" + "b" * 64,
+        "assembled_dataset_id": "sha256:" + "c" * 64,
+    }
+    assert validate_registry_entry("GBPUSD", entry) == entry
+    for field, bad in (
+        ("source_acquisition_commit_sha", "short"),
+        ("source_workflow_run_id", 1),
+        ("source_artifact_id", 2),
+        ("corpus_id", None),
+        ("assembled_dataset_id", ""),
+    ):
+        with pytest.raises(Stage4ARunnerError):
+            validate_registry_entry("GBPUSD", {**entry, field: bad})
+
+
+def test_pending_entry_rejects_partial_local_pin():
+    entry = {
+        **verified_entry("GBPUSD"),
+        "verification_status": "pending-acquisition",
+        "source_workflow_run_id": None,
+        "source_artifact_id": None,
+        "corpus_id": None,
+        "assembled_dataset_id": None,
+        "source_acquisition_commit_sha": "a" * 40,
+    }
+    with pytest.raises(Stage4ARunnerError, match="partial pins"):
+        validate_registry_entry("GBPUSD", entry)
+
+
 def test_partial_registry_fails_closed_for_all_but_verified_single_proceeds():
     registry = load_corpus_registry(Path("configs/stage4a-2024-corpus-registry.json"))
     assert (
@@ -172,10 +224,11 @@ def test_partial_registry_fails_closed_for_all_but_verified_single_proceeds():
         select_verified_registry_entries(registry, "EURUSD")[0]["instrument"]
         == "EURUSD"
     )
-    with pytest.raises(Stage4ARunnerError):
-        select_verified_registry_entries(registry, "ALL")
-    with pytest.raises(Stage4ARunnerError):
-        select_verified_registry_entries(registry, "GBPUSD")
+    assert len(select_verified_registry_entries(registry, "ALL")) == 5
+    assert (
+        select_verified_registry_entries(registry, "GBPUSD")[0]["instrument"]
+        == "GBPUSD"
+    )
 
 
 def test_signal_grid_uses_family_constants_identities_contexts_and_progress(

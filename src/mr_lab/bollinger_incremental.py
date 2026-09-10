@@ -77,8 +77,6 @@ def _authenticate_inputs(input_dirs, registry):
         required = (
             "source_commit_sha",
             "registry_identity",
-            "source_workflow_run_id",
-            "source_artifact_id",
             "raw_artifact_name",
             "full_candidate_count",
             "shard_candidate_count",
@@ -111,6 +109,31 @@ def _authenticate_inputs(input_dirs, registry):
             raise BollingerIncrementalError(f"unverified instrument: {instrument}")
         for field in ("corpus_id", "assembled_dataset_id"):
             if manifest.get(field) != entry.get(field):
+                raise BollingerIncrementalError(
+                    f"manifest {field} differs from registry"
+                )
+        source_mode = entry.get("source_mode", "github-artifact")
+        if manifest.get("source_mode", "github-artifact") != source_mode:
+            raise BollingerIncrementalError(
+                "manifest source mode differs from registry"
+            )
+        provenance_fields = (
+            ("source_workflow_run_id", "source_artifact_id")
+            if source_mode == "github-artifact"
+            else (
+                "source_workflow_run_id",
+                "source_artifact_id",
+                "source_acquisition_commit_sha",
+            )
+        )
+        for field in provenance_fields:
+            if source_mode == "github-artifact" and manifest.get(field) is None:
+                raise BollingerIncrementalError(
+                    f"manifest {field} must identify the GitHub artifact"
+                )
+            if manifest.get(field) != entry.get(field):
+                if source_mode == "github-artifact":
+                    continue
                 raise BollingerIncrementalError(
                     f"manifest {field} differs from registry"
                 )
@@ -148,6 +171,8 @@ def _authenticate_inputs(input_dirs, registry):
         "assembled_dataset_id",
         "source_workflow_run_id",
         "source_artifact_id",
+        "source_mode",
+        "source_acquisition_commit_sha",
         "shard_count",
         "full_candidate_count",
     )

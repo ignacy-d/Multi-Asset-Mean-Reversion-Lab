@@ -4,7 +4,6 @@ from types import SimpleNamespace
 import pytest
 
 from mr_lab.stage4a_runner import (
-    Stage4ARunnerError,
     load_corpus_registry,
     select_verified_registry_entries,
 )
@@ -25,10 +24,12 @@ from mr_lab.stage4b_runner import (
 )
 
 
-def test_gbpusd_pending_fails_closed():
+def test_gbpusd_promoted_entry_is_accepted():
     registry = load_corpus_registry(Path("configs/stage4a-2024-corpus-registry.json"))
-    with pytest.raises(Stage4ARunnerError, match="not verified"):
-        select_verified_registry_entries(registry, "GBPUSD")
+    entry = select_verified_registry_entries(registry, "GBPUSD")[0]
+    assert entry["source_mode"] == "local-checkpointed"
+    assert entry["source_workflow_run_id"] is None
+    assert entry["source_artifact_id"] is None
 
 
 def test_workflow_artifact_upload_contract():

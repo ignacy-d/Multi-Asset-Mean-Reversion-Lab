@@ -6,8 +6,10 @@
       "instrument": "AUDJPY",
       "requested_end_date": "2024-12-31",
       "requested_start_date": "2024-01-01",
+      "source_acquisition_commit_sha": null,
       "source_artifact_id": 9360642306,
       "source_artifact_name": "dukascopy-AUDJPY-m1-bid-2024-full-year",
+      "source_mode": "github-artifact",
       "source_workflow_run_id": 32150801479,
       "verification_status": "verified"
     },
@@ -17,8 +19,10 @@
       "instrument": "AUDUSD",
       "requested_end_date": "2024-12-31",
       "requested_start_date": "2024-01-01",
+      "source_acquisition_commit_sha": null,
       "source_artifact_id": 9354746762,
       "source_artifact_name": "dukascopy-AUDUSD-m1-bid-2024-full-year",
+      "source_mode": "github-artifact",
       "source_workflow_run_id": 32150777156,
       "verification_status": "verified"
     },
@@ -28,21 +32,25 @@
       "instrument": "EURUSD",
       "requested_end_date": "2024-12-31",
       "requested_start_date": "2024-01-01",
+      "source_acquisition_commit_sha": null,
       "source_artifact_id": 9461322006,
       "source_artifact_name": "dukascopy-EURUSD-m1-bid-2024-full-year",
+      "source_mode": "github-artifact",
       "source_workflow_run_id": 32523318565,
       "verification_status": "verified"
     },
     "GBPUSD": {
-      "assembled_dataset_id": null,
-      "corpus_id": null,
+      "assembled_dataset_id": "sha256:1333e8d1b378b2b08f88a857a07f017a61a744b1787c8db68f629e6c3c0fe70a",
+      "corpus_id": "sha256:16d58bfa2de1a5a771f7a0f9034f4e05a0c1b900002276e4c6e28d85ac4628cf",
       "instrument": "GBPUSD",
       "requested_end_date": "2024-12-31",
       "requested_start_date": "2024-01-01",
+      "source_acquisition_commit_sha": "94a43c36e1a5fa1b3b9e98890dc2d62a156592c4",
       "source_artifact_id": null,
       "source_artifact_name": "dukascopy-GBPUSD-m1-bid-2024-full-year",
+      "source_mode": "local-checkpointed",
       "source_workflow_run_id": null,
-      "verification_status": "pending-acquisition"
+      "verification_status": "verified"
     },
     "USDJPY": {
       "assembled_dataset_id": "sha256:d6b11d469eff71d81af5c31d7d29638287d864fd9221451ffb713204b9109571",
@@ -50,8 +58,10 @@
       "instrument": "USDJPY",
       "requested_end_date": "2024-12-31",
       "requested_start_date": "2024-01-01",
+      "source_acquisition_commit_sha": null,
       "source_artifact_id": 9326494647,
       "source_artifact_name": "dukascopy-USDJPY-m1-bid-2024-full-year",
+      "source_mode": "github-artifact",
       "source_workflow_run_id": 32122032975,
       "verification_status": "verified"
     }
