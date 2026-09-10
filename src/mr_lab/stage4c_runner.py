@@ -53,6 +53,7 @@ ALLOWED_SOURCE_AUDIT_FIELDS = (
     "source_shard_identities",
     "expected_shard_count",
 )
+SPOOL_BATCH_SIZE = 10_000
 
 
 def _json(value):
@@ -117,12 +118,22 @@ def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
     connection.execute("PRAGMA journal_mode=OFF")
     connection.execute("PRAGMA synchronous=OFF")
     connection.execute(
-        "CREATE TABLE trades (group_key TEXT NOT NULL, identity TEXT PRIMARY KEY, "
-        "row_json TEXT NOT NULL) WITHOUT ROWID"
+        "CREATE TABLE trades (group_key TEXT NOT NULL, identity TEXT NOT NULL, "
+        "row_json TEXT NOT NULL, PRIMARY KEY (group_key, identity)) WITHOUT ROWID"
     )
     before = complete = owned = 0
     groups = set()
+    batch = []
+
+    def insert_batch():
+        try:
+            connection.executemany("INSERT INTO trades VALUES (?, ?, ?)", batch)
+        except sqlite3.IntegrityError as error:
+            raise Stage4CError("duplicate original trade identity") from error
+        batch.clear()
+
     try:
+        connection.execute("BEGIN")
         for row in rows:
             before += 1
             if not validate_trade(row):
@@ -137,13 +148,11 @@ def _spool_rows(rows, database, *, shard_index=None, shard_count=None):
             owned += 1
             group_json = _json(group)
             groups.add(group_json)
-            try:
-                connection.execute(
-                    "INSERT INTO trades VALUES (?, ?, ?)",
-                    (group_json, _json(trade_identity(row)), _json(row)),
-                )
-            except sqlite3.IntegrityError as error:
-                raise Stage4CError("duplicate original trade identity") from error
+            batch.append((group_json, _json(trade_identity(row)), _json(row)))
+            if len(batch) == SPOOL_BATCH_SIZE:
+                insert_batch()
+        if batch:
+            insert_batch()
         connection.commit()
     except Exception:
         connection.close()
@@ -270,6 +279,7 @@ def run_rows(
     shard_index=None,
     shard_count=None,
     spool_dir: Path | None = None,
+    streamed_source_hashes: dict | None = None,
 ):
     """Externally group rows, retaining only the currently processed group in RAM."""
     if source_mode not in ("regenerated_stage4b", "existing_stage4b_raw"):
@@ -280,9 +290,10 @@ def run_rows(
         if not source_audit.get(required):
             raise Stage4CError(f"missing expected input identity: {required}")
     profile = CostProfile.load(profile_path)
-    source_components, source_commitment = _source_input_identity(
-        source_mode, source_audit
-    )
+    if streamed_source_hashes is None:
+        source_components, source_commitment = _source_input_identity(
+            source_mode, source_audit
+        )
     expected_matrix = {
         "spread_statistics": list(SPREAD_STATISTICS),
         "slippage_round_turn_pips": list(SLIPPAGES),
@@ -300,6 +311,13 @@ def run_rows(
         connection, before, complete, owned_complete, owned_groups = _spool_rows(
             rows, database, shard_index=shard_index, shard_count=shard_count
         )
+        if streamed_source_hashes is not None:
+            source_audit = source_audit | {
+                "source_trade_sha256": dict(streamed_source_hashes)
+            }
+            source_components, source_commitment = _source_input_identity(
+                source_mode, source_audit
+            )
         expanded = 0
         matrix = []
         raw = (
@@ -465,6 +483,20 @@ def iter_jsonl(paths):
                     raise Stage4CError(f"malformed JSONL {path}:{number}") from error
 
 
+def iter_jsonl_with_sha256(paths, hashes):
+    """Parse JSONL while committing the exact bytes read in the same source pass."""
+    for path in paths:
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for number, line in enumerate(stream, 1):
+                digest.update(line)
+                try:
+                    yield json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    raise Stage4CError(f"malformed JSONL {path}:{number}") from error
+        hashes[str(path)] = digest.hexdigest()
+
+
 def run_regenerated(
     corpus_dir,
     output_dir,
@@ -560,11 +592,9 @@ def main(argv=None):
     if not args.stage4b_trades or not args.stage4b_audit:
         parser.error("existing raw route requires --stage4b-trades and --stage4b-audit")
     source = json.loads(args.stage4b_audit.read_text())
-    source["source_trade_sha256"] = {
-        str(p): sha256_file(p) for p in args.stage4b_trades
-    }
+    source_hashes = {}
     run_rows(
-        iter_jsonl(args.stage4b_trades),
+        iter_jsonl_with_sha256(args.stage4b_trades, source_hashes),
         args.output_dir,
         args.cost_profile,
         source_mode="existing_stage4b_raw",
@@ -573,6 +603,7 @@ def main(argv=None):
         shard_index=args.shard_index,
         shard_count=args.shard_count,
         spool_dir=args.spool_dir,
+        streamed_source_hashes=source_hashes,
     )
     return 0
 
