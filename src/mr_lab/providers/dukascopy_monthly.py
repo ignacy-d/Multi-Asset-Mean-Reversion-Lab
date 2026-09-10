@@ -104,8 +104,9 @@ def verify_full_year_corpus(
         "source_timezone": SOURCE_TIMEZONE,
         "canonical_schema_version": CANONICAL_SCHEMA_VERSION,
         "parser_schema_version": PARSER_SCHEMA_VERSION,
-        "instrument_spec": spec.as_dict(),
     }
+    if spec.instrument != INSTRUMENT:
+        expected["instrument_spec"] = spec.as_dict()
     if any(manifest.get(field) != value for field, value in expected.items()):
         raise RangeAcquisitionError("full-year manifest contract mismatch")
 

@@ -83,6 +83,22 @@ def test_monthly_assembly_matches_direct_full_year_identity(tmp_path: Path) -> N
     assert json.loads(result.manifest_path.read_text()) == direct.as_dict()
 
 
+def test_legacy_eurusd_full_year_publication_verifies_without_instrument_spec(
+    tmp_path: Path,
+) -> None:
+    chunks = tmp_path / "chunks"
+    complete_chunks(chunks, instrument="EURUSD")
+    corpus = tmp_path / "assembled"
+    assembled = assemble_year(chunks, corpus, instrument="EURUSD")
+
+    manifest = json.loads(assembled.manifest_path.read_text())
+    assert "instrument_spec" not in manifest
+
+    verified = verify_full_year_corpus(corpus, instrument="EURUSD")
+    assert verified.corpus_id == assembled.corpus_id
+    assert verified.dataset_id == assembled.dataset_id
+
+
 def test_missing_month_and_missing_day_are_rejected(tmp_path: Path) -> None:
     chunks = tmp_path / "chunks"
     complete_chunks(chunks)
@@ -185,6 +201,7 @@ def test_gbpusd_full_year_publication_is_exact_and_identity_bound(
     assert manifest["provider"] == "Dukascopy"
     assert manifest["price_basis"] == "bid"
     assert manifest["native_timeframe"] == "1m"
+    assert manifest["instrument_spec"]["instrument"] == "GBPUSD"
     assert verified.corpus_id == assembled.corpus_id
     assert verified.dataset_id == assembled.dataset_id
 
@@ -229,4 +246,18 @@ def test_gbpusd_publication_refuses_non_2024_component_date(tmp_path: Path) -> N
     manifest_path.write_text(json.dumps(manifest))
 
     with pytest.raises(RangeAcquisitionError, match="partition 2024"):
+        verify_full_year_corpus(corpus, instrument="GBPUSD")
+
+
+def test_gbpusd_publication_refuses_missing_instrument_spec(tmp_path: Path) -> None:
+    chunks = tmp_path / "chunks"
+    complete_chunks(chunks, instrument="GBPUSD")
+    corpus = tmp_path / "assembled"
+    assemble_year(chunks, corpus, instrument="GBPUSD")
+    manifest_path = corpus / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("instrument_spec")
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RangeAcquisitionError, match="manifest contract mismatch"):
         verify_full_year_corpus(corpus, instrument="GBPUSD")

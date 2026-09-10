@@ -8,11 +8,11 @@ an additional fail-closed verification immediately before upload.
 
 ## Acquire and verify the real artifact
 
-Dispatch the workflow from the commit intended to identify the corpus:
+Dispatch the workflow from the branch or tag intended to identify the corpus:
 
 ```bash
 gh workflow run acquire-historical-sample.yml \
-  --ref <committed-branch-or-sha> -f instrument=GBPUSD
+  --ref <branch-or-tag> -f instrument=GBPUSD
 gh run list --workflow acquire-historical-sample.yml \
   --branch <committed-branch> --event workflow_dispatch
 gh run watch <source_workflow_run_id> --exit-status
