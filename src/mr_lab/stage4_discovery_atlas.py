@@ -125,6 +125,8 @@ def _manifest_identity(manifest):
         "source_workflow_run_id",
         "source_artifact_id",
         "source_artifact_name",
+        "source_mode",
+        "source_acquisition_commit_sha",
         "filter_family",
         "filter_spec_id",
         "process_spec_id",
@@ -157,12 +159,16 @@ def _authenticate_run(records, registry, registry_sha, role):
     expected = registry.get("instruments", {}).get(instrument)
     if not expected or expected.get("verification_status") != "verified":
         raise DiscoveryAtlasError("instrument lacks verified frozen registry evidence")
+    source_mode = expected.get("source_mode", "github-artifact")
+    if reference.get("source_mode", "github-artifact") != source_mode:
+        raise DiscoveryAtlasError("registry source_mode mismatch")
     for field in (
         "corpus_id",
         "assembled_dataset_id",
         "source_workflow_run_id",
         "source_artifact_id",
         "source_artifact_name",
+        "source_acquisition_commit_sha",
     ):
         if reference.get(field) != expected.get(field):
             raise DiscoveryAtlasError(f"registry {field} mismatch")

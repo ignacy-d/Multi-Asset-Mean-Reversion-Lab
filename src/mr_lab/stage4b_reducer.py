@@ -30,6 +30,8 @@ IDENTICAL_FIELDS = (
     "registry_identity",
     "corpus_id",
     "assembled_dataset_id",
+    "source_mode",
+    "source_acquisition_commit_sha",
     "filter_family",
     "filter_spec_id",
     "shard_count",
@@ -170,7 +172,7 @@ def reduce_shards(shard_dirs, output_dir, expected_shard_count):
             }
             for _, manifest in records
         ],
-        **{field: reference[field] for field in IDENTICAL_FIELDS},
+        **{field: reference.get(field) for field in IDENTICAL_FIELDS},
         "shards": [manifest for _, manifest in records],
         "combined_output_sha256": {
             path.name: _sha256_file(path)

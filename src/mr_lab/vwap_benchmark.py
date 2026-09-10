@@ -114,9 +114,7 @@ def build_vwap_features(
             and previous.bar.close_time == observation.bar.open_time
         )
         if not adjacent or not (
-            previous
-            and previous.is_research_active
-            and observation.is_research_active
+            previous and previous.is_research_active and observation.is_research_active
         ):
             # A bounded deque containing stale pre-gap returns would compress
             # elapsed time. Clear it at the boundary and retain an unavailable

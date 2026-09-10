@@ -77,8 +77,6 @@ def _authenticate_inputs(input_dirs, registry):
         required = (
             "source_commit_sha",
             "registry_identity",
-            "source_workflow_run_id",
-            "source_artifact_id",
             "raw_artifact_name",
             "full_candidate_count",
             "shard_candidate_count",
@@ -110,6 +108,39 @@ def _authenticate_inputs(input_dirs, registry):
         if entry.get("verification_status") != "verified":
             raise BollingerIncrementalError(f"unverified instrument: {instrument}")
         for field in ("corpus_id", "assembled_dataset_id"):
+            if manifest.get(field) != entry.get(field):
+                raise BollingerIncrementalError(
+                    f"manifest {field} differs from registry"
+                )
+        source_mode = entry.get("source_mode", "github-artifact")
+        if manifest.get("source_mode", "github-artifact") != source_mode:
+            raise BollingerIncrementalError(
+                "manifest source mode differs from registry"
+            )
+        if source_mode == "github-artifact":
+            for field in ("source_workflow_run_id", "source_artifact_id"):
+                value = manifest.get(field)
+                if type(value) is not int or value <= 0:
+                    raise BollingerIncrementalError(
+                        f"manifest {field} must be a positive integer"
+                    )
+            if manifest.get("source_acquisition_commit_sha") is not None:
+                raise BollingerIncrementalError(
+                    "GitHub artifact acquisition commit SHA must be null"
+                )
+        elif any(
+            manifest.get(field) is not None
+            for field in ("source_workflow_run_id", "source_artifact_id")
+        ):
+            raise BollingerIncrementalError(
+                "local-checkpointed GitHub source IDs must be null"
+            )
+        for field in (
+            "source_workflow_run_id",
+            "source_artifact_id",
+            "source_artifact_name",
+            "source_acquisition_commit_sha",
+        ):
             if manifest.get(field) != entry.get(field):
                 raise BollingerIncrementalError(
                     f"manifest {field} differs from registry"
@@ -148,6 +179,8 @@ def _authenticate_inputs(input_dirs, registry):
         "assembled_dataset_id",
         "source_workflow_run_id",
         "source_artifact_id",
+        "source_mode",
+        "source_acquisition_commit_sha",
         "shard_count",
         "full_candidate_count",
     )

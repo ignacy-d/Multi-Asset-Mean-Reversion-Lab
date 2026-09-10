@@ -172,9 +172,7 @@ def test_canonical_m1_uses_native_gap_safe_denominator() -> None:
         item.rolling_volatility for item in native if item.anchor_session == "london"
     ]
     canonical_denominator = [
-        item.rolling_volatility
-        for item in canonical
-        if item.anchor_session == "london"
+        item.rolling_volatility for item in canonical if item.anchor_session == "london"
     ]
     assert canonical_denominator == native_denominator
     assert native_denominator[2:4] == [None, None]

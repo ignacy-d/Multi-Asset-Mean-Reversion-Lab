@@ -1,80 +1,37 @@
 # GBPUSD 2024 corpus onboarding
 
-This change is **Phase A** only. No corpus was acquired while preparing it and
-the GBPUSD registry entry remains `pending-acquisition`; its four provenance
-pins must remain null until the following workflow succeeds. The generic
-checkpointed acquisition workflow is the existing publication path, now with
-an additional fail-closed verification immediately before upload.
+## Promotion record
 
-## Acquire and verify the real artifact
+GBPUSD is promoted in the frozen registry as a verified
+`local-checkpointed` corpus. All twelve monthly checkpoints were acquired with
+the repository's authenticated, resumable Dukascopy pipeline at commit
+`94a43c36e1a5fa1b3b9e98890dc2d62a156592c4`. Full-year assembly and the
+independent `verify-year` pass agreed on both frozen identities recorded in the
+registry.
 
-Dispatch the workflow from the branch or tag intended to identify the corpus:
+This source mode deliberately has null `source_workflow_run_id` and
+`source_artifact_id` values: the corpus did not originate from a GitHub Actions
+artifact, and workflow provenance must not be fabricated. Its logical source
+name remains `dukascopy-GBPUSD-m1-bid-2024-full-year`.
 
-```bash
-gh workflow run acquire-historical-sample.yml \
-  --ref <branch-or-tag> -f instrument=GBPUSD
-gh run list --workflow acquire-historical-sample.yml \
-  --branch <committed-branch> --event workflow_dispatch
-gh run watch <source_workflow_run_id> --exit-status
-```
+## Reverification contract
 
-The successful run must contain exactly one non-expired artifact named
-`dukascopy-GBPUSD-m1-bid-2024-full-year`. Resolve and download it by its real
-ID rather than by guessing a pin:
-
-If a local monthly acquisition is interrupted, rerun that exact 2024 month in
-explicit resumable mode. This validates and reuses only complete immutable
-daily raw/provenance pairs; any orphaned, mismatched, or corrupt snapshot stops
-the run without overwriting it:
+The corpus can be independently checked with the provider-agnostic frozen-year
+verifier at its operator-managed location:
 
 ```bash
-uv run python -m mr_lab.providers.dukascopy_monthly acquire-month \
-  --year 2024 --month 1 --instrument GBPUSD \
-  --output-dir gbpusd-checkpoints/2024-01 --resume
-```
-
-Do not use a different month or instrument with an existing checkpoint
-directory. A completed valid monthly manifest is returned idempotently.
-
-```bash
-REPO=ignacy-d/Multi-Asset-Mean-Reversion-Lab
-RUN=<source_workflow_run_id>
-NAME=dukascopy-GBPUSD-m1-bid-2024-full-year
-gh api "repos/$REPO/actions/runs/$RUN/artifacts?per_page=100" > artifacts.json
-jq --arg name "$NAME" \
-  '[.artifacts[] | select(.name == $name and .expired == false)] | if length == 1 then .[0] else error("expected exactly one live artifact") end' \
-  artifacts.json > artifact.json
-ARTIFACT=$(jq -er '.id' artifact.json)
-test "$(jq -r '.workflow_run.id' artifact.json)" = "$RUN"
-gh api "repos/$REPO/actions/artifacts/$ARTIFACT/zip" > gbpusd-corpus.zip
-rm -rf gbpusd-corpus && mkdir gbpusd-corpus
-unzip -q gbpusd-corpus.zip -d gbpusd-corpus
 uv run python -m mr_lab.providers.dukascopy_monthly verify-year \
-  --year 2024 --instrument GBPUSD --corpus-dir gbpusd-corpus
+  --year 2024 --instrument GBPUSD --corpus-dir <gbpusd-corpus-dir>
 ```
 
 The verifier reconstructs the dataset from immutable raw components, checks
 all component hashes, checks that successful and confirmed-absent dates exactly
-partition the requested 2024 calendar, authenticates the corpus identity, and
+partition the requested calendar, authenticates the corpus identity, and
 requires the verified GBPUSD Dukascopy/M1/BID decoding contract. A provider 404
 is the only acquisition outcome represented as confirmed absence; transport,
-parsing, assembly, and verification failures stop the workflow.
+parsing, assembly, and verification failures stop the pipeline.
 
-## Stage the Phase B registry-only change
-
-Copy the printed `corpus_id` and `assembled_dataset_id`, and the real `RUN` and
-`ARTIFACT` values above, into the GBPUSD entry in
-`configs/stage4a-2024-corpus-registry.json`. Change `verification_status` to
-`verified`, without changing its instrument, dates, or artifact name. Then run:
-
-```bash
-uv run pytest tests/test_dukascopy_monthly.py tests/test_stage4a_runner.py \
-  tests/test_stage4b_runner.py tests/test_ornstein_uhlenbeck.py
-uv run pytest
-uv run ruff check .
-```
-
-That registry promotion must be a separate reviewable Phase B commit/PR. Never
-promote from a failed run, an expired artifact, a differently named artifact,
-or identity values that were not printed by the verifier for those downloaded
-bytes.
+The operator-managed corpus itself is not repository content and must not be
+committed. Downstream Stage 4 provenance carries the explicit source mode,
+acquisition commit, corpus identity, and assembled dataset identity while
+preserving the null GitHub identifiers.

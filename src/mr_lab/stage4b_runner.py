@@ -716,6 +716,8 @@ def _write_shard_manifest(
         "source_workflow_run_id": entry["source_workflow_run_id"],
         "source_artifact_id": entry["source_artifact_id"],
         "source_artifact_name": entry["source_artifact_name"],
+        "source_mode": entry.get("source_mode", "github-artifact"),
+        "source_acquisition_commit_sha": entry.get("source_acquisition_commit_sha"),
         "raw_artifact_name": os.environ.get(
             "STAGE4B_RAW_ARTIFACT_NAME", f"local-stage4b-raw-shard-{shard_index}"
         ),
@@ -1004,6 +1006,8 @@ def _write_outputs(
         "source_workflow_run_id": entry["source_workflow_run_id"],
         "source_artifact_id": entry["source_artifact_id"],
         "source_artifact_name": entry["source_artifact_name"],
+        "source_mode": entry.get("source_mode", "github-artifact"),
+        "source_acquisition_commit_sha": entry.get("source_acquisition_commit_sha"),
         "corpus_id": entry["corpus_id"],
         "assembled_dataset_id": entry["assembled_dataset_id"],
         "requested_start_date": entry["requested_start_date"],

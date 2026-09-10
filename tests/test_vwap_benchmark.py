@@ -160,9 +160,7 @@ def test_only_exactly_adjacent_bars_enter_volatility(timeframe: str) -> None:
     )
     output = build_vwap_features(observations(*bars), DEFAULT_SESSION_SPEC, 2)
     by_bar = {
-        item.observation.bar: item
-        for item in output
-        if item.anchor_session == "london"
+        item.observation.bar: item for item in output if item.anchor_session == "london"
     }
     expected = statistics.stdev(
         (bars[2].close / bars[1].close - 1, bars[3].close / bars[2].close - 1)
@@ -215,9 +213,12 @@ def test_v2_identity_does_not_reuse_historical_v1_identity() -> None:
         "strategy_schema_version": LEGACY_STRATEGY_SCHEMA_VERSION,
         "normalized_deviation_definition": LEGACY_NORMALIZATION_DEFINITION,
     }
-    historical_id = "sha256:" + hashlib.sha256(
-        json.dumps(historical, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    historical_id = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(historical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     assert historical_id == (
         "sha256:6aca0e037562736c266ebcf1e8a518383b1a32961dad47082c02d423ad3ce7eb"
     )

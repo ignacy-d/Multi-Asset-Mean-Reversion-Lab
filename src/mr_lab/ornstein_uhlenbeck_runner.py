@@ -93,6 +93,8 @@ def run(corpus_dir, output_dir, instrument, registry_path, windows):
         "requested_start_date": entry["requested_start_date"],
         "source_artifact_id": entry["source_artifact_id"],
         "source_artifact_name": entry["source_artifact_name"],
+        "source_mode": entry.get("source_mode", "github-artifact"),
+        "source_acquisition_commit_sha": entry.get("source_acquisition_commit_sha"),
         "source_commit_sha": _commit_sha(),
         "source_workflow_run_id": entry["source_workflow_run_id"],
         "output_sha256": {
