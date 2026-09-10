@@ -7,13 +7,16 @@ import pytest
 
 from mr_lab.data import Timeframe
 from mr_lab.ornstein_uhlenbeck import (
+    FrozenOuEligibilityFilter,
     OrnsteinUhlenbeckError,
     OrnsteinUhlenbeckProcessSpec,
+    OrnsteinUhlenbeckProcessState,
     align_candidate_states,
     build_candidate_ou_states,
     build_ou_states,
     candidate_process_keys,
     fit_ou_state,
+    frozen_ou_eligibility_spec,
     residual_observations,
 )
 from mr_lab.research import Direction
@@ -237,3 +240,107 @@ def test_candidate_alignment_fails_closed_on_duplicate_exact_state():
 def test_non_finite_residual_input_fails_closed():
     with pytest.raises(OrnsteinUhlenbeckError, match="finite"):
         residual_observations((replace(signal(0, 0), p0=math.inf),))
+
+
+def frozen_event(direction=Direction.SHORT, **changes):
+    state = replace(
+        signal(0, 0.02 if direction is Direction.SHORT else -0.02, direction),
+        signal_timeframe=Timeframe("15m"),
+        session="london",
+        benchmark_family="vwap",
+        lookback=20,
+    )
+    state = replace(state, **changes)
+    return deduplicate_states((state,))[0]
+
+
+def filter_state(event, *, score=1.5001, half_life=120.0, status="valid"):
+    observation = residual_observations(
+        (
+            SignalState(
+                event.signal.instrument,
+                event.signal.signal_timestamp,
+                event.signal.benchmark_family,
+                event.signal.signal_timeframe,
+                event.signal.session,
+                event.signal.direction,
+                event.signal.lookback,
+                event.signal.p0,
+                event.signal.e0,
+                event.signal.normalized_deviation,
+                event.signal.source_corpus_id,
+                event.signal.assembled_dataset_id,
+                event.signal.strategy_spec_id,
+                True,
+            ),
+        )
+    )[0]
+    spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    return OrnsteinUhlenbeckProcessState(
+        observation.process_id,
+        spec.process_spec.process_spec_id,
+        event.signal.signal_timestamp,
+        event.signal.d0,
+        128,
+        15.0,
+        half_life_minutes=half_life,
+        ornstein_uhlenbeck_score=score,
+        status=status,
+        invalid_reason=None if status == "valid" else "test_invalid",
+    )
+
+
+def test_frozen_ou_gate_strict_score_inclusive_half_life_and_control():
+    event = frozen_event()
+    gate = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    assert (
+        FrozenOuEligibilityFilter(gate, (filter_state(event),)).evaluate(event).eligible
+    )
+    assert (
+        not FrozenOuEligibilityFilter(gate, (filter_state(event, score=1.5),))
+        .evaluate(event)
+        .eligible
+    )
+    assert (
+        not FrozenOuEligibilityFilter(gate, (filter_state(event, half_life=120.0001),))
+        .evaluate(event)
+        .eligible
+    )
+    control = frozen_ou_eligibility_spec("frozen-ou-score-only-control-v1")
+    assert (
+        FrozenOuEligibilityFilter(control, (filter_state(event, half_life=10_000),))
+        .evaluate(event)
+        .eligible
+    )
+
+
+def test_frozen_ou_direction_scope_exact_time_and_fail_closed():
+    short = frozen_event()
+    long = frozen_event(Direction.LONG)
+    spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    assert (
+        FrozenOuEligibilityFilter(spec, (filter_state(short, score=2),))
+        .evaluate(short)
+        .eligible
+    )
+    long_decision = FrozenOuEligibilityFilter(
+        spec, (filter_state(long, score=-2),)
+    ).evaluate(long)
+    assert (
+        not long_decision.eligible
+    )  # Correct sign, but frozen v1 itself is SHORT-only.
+    assert dict(long_decision.metadata)["directional_ou_score"] == "2"
+    assert not FrozenOuEligibilityFilter(spec, ()).evaluate(short).eligible
+    invalid = filter_state(short, status="invalid")
+    assert not FrozenOuEligibilityFilter(spec, (invalid,)).evaluate(short).eligible
+    later = replace(
+        filter_state(short),
+        available_at=short.signal.signal_timestamp + timedelta(minutes=15),
+    )
+    assert not FrozenOuEligibilityFilter(spec, (later,)).evaluate(short).eligible
+    outside = frozen_event(session="new_york")
+    assert (
+        not FrozenOuEligibilityFilter(spec, (filter_state(outside),))
+        .evaluate(outside)
+        .eligible
+    )

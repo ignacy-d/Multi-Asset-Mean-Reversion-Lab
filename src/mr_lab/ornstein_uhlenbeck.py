@@ -10,12 +10,17 @@ from datetime import datetime
 from hashlib import sha256
 
 from mr_lab.data import Timeframe
-from mr_lab.stage4b import CandidateEvent, SignalState
+from mr_lab.research import Direction
+from mr_lab.stage4b import CandidateEvent, EligibilityDecision, SignalState
 
 RESIDUAL_DEFINITION = "completed-price-minus-causal-benchmark-equilibrium-v1"
 ADJACENCY_SEMANTICS = "exactly-one-signal-timeframe-valid-transitions-v1"
 INCLUSION_SEMANTICS = "include-valid-transition-ending-at-current-observation-v1"
 ESTIMATOR_VERSION = "ols-ar1-with-intercept-v1"
+FROZEN_OU_FILTER_CHOICES = (
+    "frozen-ou-crossasset-v1",
+    "frozen-ou-score-only-control-v1",
+)
 
 
 class OrnsteinUhlenbeckError(ValueError):
@@ -109,6 +114,149 @@ class OrnsteinUhlenbeckProcessState:
     is_structurally_valid: bool = False
     status: str = "unavailable"
     invalid_reason: str | None = "insufficient_history"
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenOuEligibilitySpec:
+    """Pre-registered 2024 cross-asset OU candidate gate (not tunable at run time)."""
+
+    name: str
+    window_transitions: int = 128
+    score_threshold: float = 1.5
+    half_life_cap_minutes: float | None = 120.0
+    timeframe: str = "15m"
+    session: str = "london"
+    direction: str = "SHORT"
+    benchmark_families: tuple[str, ...] = ("vwap", "vwap-canonical-m1")
+    lookbacks: tuple[int, ...] = (20, 40)
+    specification_version: str = "frozen-ou-crossasset-eligibility-v1"
+
+    def __post_init__(self):
+        expected_cap = {
+            "frozen-ou-crossasset-v1": 120.0,
+            "frozen-ou-score-only-control-v1": None,
+        }
+        if (
+            self.name not in expected_cap
+            or self.half_life_cap_minutes != expected_cap[self.name]
+        ):
+            raise OrnsteinUhlenbeckError(
+                "unsupported frozen OU eligibility specification"
+            )
+        fixed = (
+            self.window_transitions == 128
+            and self.score_threshold == 1.5
+            and self.timeframe == "15m"
+            and self.session == "london"
+            and self.direction == "SHORT"
+            and self.benchmark_families == ("vwap", "vwap-canonical-m1")
+            and self.lookbacks == (20, 40)
+            and self.specification_version == "frozen-ou-crossasset-eligibility-v1"
+        )
+        if not fixed:
+            raise OrnsteinUhlenbeckError("frozen OU parameters cannot be changed")
+
+    @property
+    def filter_spec_id(self):
+        encoded = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        return "sha256:" + sha256(encoded.encode()).hexdigest()
+
+    @property
+    def process_spec(self):
+        return OrnsteinUhlenbeckProcessSpec(self.window_transitions)
+
+
+def frozen_ou_eligibility_spec(name):
+    if name == "frozen-ou-crossasset-v1":
+        return FrozenOuEligibilitySpec(name)
+    if name == "frozen-ou-score-only-control-v1":
+        return FrozenOuEligibilitySpec(name, half_life_cap_minutes=None)
+    raise OrnsteinUhlenbeckError("unknown frozen OU eligibility filter")
+
+
+class FrozenOuEligibilityFilter:
+    """Exact-time, fail-closed view of internally assembled causal OU states."""
+
+    filter_family = "ornstein-uhlenbeck"
+
+    def __init__(self, spec, states):
+        self.spec = spec
+        self.filter_spec_id = spec.filter_spec_id
+        self._states = {}
+        for state in states:
+            key = (state.process_id, state.available_at)
+            existing = self._states.get(key)
+            if existing is not None and existing != state:
+                raise OrnsteinUhlenbeckError(
+                    "conflicting duplicate exact-time OU state"
+                )
+            self._states[key] = state
+
+    def evaluate(self, event):
+        signal = event.signal
+        in_scope = (
+            str(signal.signal_timeframe) == self.spec.timeframe
+            and signal.session == self.spec.session
+            and signal.direction.name == self.spec.direction
+            and signal.benchmark_family in self.spec.benchmark_families
+            and signal.lookback in self.spec.lookbacks
+        )
+        observation = ResidualObservation(
+            signal.instrument,
+            signal.benchmark_family,
+            signal.signal_timeframe,
+            signal.session,
+            signal.lookback,
+            signal.strategy_spec_id,
+            signal.signal_timestamp,
+            signal.p0,
+            signal.e0,
+        )
+        state = self._states.get((observation.process_id, signal.signal_timestamp))
+        raw = None if state is None else state.ornstein_uhlenbeck_score
+        directional = (
+            None
+            if raw is None
+            else (raw if signal.direction is Direction.SHORT else -raw)
+        )
+        half_life = None if state is None else state.half_life_minutes
+        reason = "eligible"
+        if not in_scope:
+            reason = "outside_frozen_signal_scope"
+        elif state is None:
+            reason = "missing_exact_state"
+        elif state.process_spec_id != self.spec.process_spec.process_spec_id:
+            reason = "process_spec_mismatch"
+        elif state.status != "valid":
+            reason = f"ou_status_{state.status}"
+        elif directional is None or not math.isfinite(directional):
+            reason = "non_finite_directional_score"
+        elif directional <= self.spec.score_threshold:
+            reason = "directional_score_not_strictly_above_threshold"
+        elif half_life is None or not math.isfinite(half_life):
+            reason = "non_finite_half_life"
+        elif (
+            self.spec.half_life_cap_minutes is not None
+            and half_life > self.spec.half_life_cap_minutes
+        ):
+            reason = "half_life_above_cap"
+        metadata = {
+            "process_spec_id": self.spec.process_spec.process_spec_id,
+            "ou_status": "missing" if state is None else state.status,
+            "raw_ou_score": raw,
+            "directional_ou_score": directional,
+            "half_life_minutes": half_life,
+            "eligibility_reason": reason,
+        }
+        return EligibilityDecision(
+            reason == "eligible",
+            self.filter_family,
+            self.filter_spec_id,
+            tuple(
+                (key, "" if value is None else str(value))
+                for key, value in metadata.items()
+            ),
+        )
 
 
 def residual_observations(states) -> tuple[ResidualObservation, ...]:

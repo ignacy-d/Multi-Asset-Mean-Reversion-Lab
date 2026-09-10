@@ -24,6 +24,13 @@ from mr_lab.bollinger_benchmark import (
     signal_direction as bollinger_direction,
 )
 from mr_lab.data import resample_bars
+from mr_lab.ornstein_uhlenbeck import (
+    FROZEN_OU_FILTER_CHOICES,
+    FrozenOuEligibilityFilter,
+    build_candidate_ou_states,
+    candidate_process_keys,
+    frozen_ou_eligibility_spec,
+)
 from mr_lab.providers.dukascopy_range import load_offline_corpus
 from mr_lab.research import Direction, build_research_observations
 from mr_lab.sessions import DEFAULT_SESSION_SPEC
@@ -35,6 +42,7 @@ from mr_lab.stage4a_runner import (
     validate_registry_entry,
 )
 from mr_lab.stage4b import (
+    ENTRY_MODES,
     SIGNAL_THRESHOLD,
     SL_FRACTIONS,
     STAGE4B_METHODOLOGY_ID,
@@ -44,7 +52,7 @@ from mr_lab.stage4b import (
     M1Index,
     NoEntryEligibilityFilter,
     SignalState,
-    construct_eligible_entries,
+    construct_entry,
     deduplicate_states,
     path_diagnostic,
     simulate_exit,
@@ -459,7 +467,8 @@ def run(
     print("STAGE4B_PROGRESS corpus_loaded m1_index_complete", flush=True)
     # This ordering is methodology-critical: partition only the complete output
     # of the existing global state assembly and global re-arm/deduplication.
-    full_events = deduplicate_states(assemble_signal_states(dataset, manifest))
+    signal_states = assemble_signal_states(dataset, manifest)
+    full_events = deduplicate_states(signal_states)
     print(
         "STAGE4B_PROGRESS signal_generation_complete "
         f"candidate_dedup_complete candidate_count={len(full_events)}",
@@ -485,13 +494,31 @@ def run(
             flush=True,
         )
     output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "candidate-events.jsonl").open("w") as candidates:
-        for event in events:
-            candidates.write(_json(event.as_dict()) + "\n")
     groups = defaultdict(Aggregate)
     diagnostics = []
     entry_observations = []
-    filter_ = eligibility_filter or NoEntryEligibilityFilter()
+    if isinstance(eligibility_filter, str):
+        filter_spec = frozen_ou_eligibility_spec(eligibility_filter)
+        required = candidate_process_keys(full_events)
+        ou_states = build_candidate_ou_states(
+            signal_states, filter_spec.process_spec, required
+        )
+        filter_ = FrozenOuEligibilityFilter(filter_spec, ou_states)
+    else:
+        filter_ = eligibility_filter or NoEntryEligibilityFilter()
+    decisions = {event.candidate_event_id: filter_.evaluate(event) for event in events}
+    with (output_dir / "candidate-events.jsonl").open("w") as candidates:
+        for event in events:
+            row = event.as_dict()
+            decision = decisions[event.candidate_event_id]
+            if not isinstance(filter_, NoEntryEligibilityFilter):
+                row.update(
+                    eligibility=decision.eligible,
+                    filter_family=decision.filter_family,
+                    filter_spec_id=decision.filter_spec_id,
+                    filter_metadata=dict(decision.metadata),
+                )
+            candidates.write(_json(row) + "\n")
     filter_identities = set()
     totals = defaultdict(int)
     started = time.monotonic()
@@ -515,7 +542,12 @@ def run(
                 }
                 for d in path_diagnostic(event, index)
             )
-            decision, entries = construct_eligible_entries(event, index, filter_)
+            decision = decisions[event.candidate_event_id]
+            entries = (
+                {mode: construct_entry(event, index, mode) for mode in ENTRY_MODES}
+                if decision.eligible
+                else {}
+            )
             filter_identities.add((decision.filter_family, decision.filter_spec_id))
             if not decision.eligible:
                 totals["filter_ineligible"] += 1
@@ -539,7 +571,11 @@ def run(
                 for constructed in entries.values()
                 if constructed.mode != "immediate"
             )
-            for mode, constructed in entries.items():
+            frozen_ou_run = isinstance(filter_, FrozenOuEligibilityFilter)
+            selected_entries = (
+                {"immediate": entries["immediate"]} if frozen_ou_run else entries
+            )
+            for mode, constructed in selected_entries.items():
                 base = (
                     instrument,
                     event.signal.benchmark_family,
@@ -552,9 +588,9 @@ def run(
                     decision.filter_spec_id,
                     mode,
                 )
-                for tp in TP_FRACTIONS:
-                    for sl in SL_FRACTIONS:
-                        for stop in TIME_STOPS_MINUTES:
+                for tp in (0.75, 1.0) if frozen_ou_run else TP_FRACTIONS:
+                    for sl in (0.25, 0.5) if frozen_ou_run else SL_FRACTIONS:
+                        for stop in (60, 120) if frozen_ou_run else TIME_STOPS_MINUTES:
                             key = (*base, tp, sl, stop)
                             agg = groups[key]
                             agg.candidate_ids.add(event.candidate_event_id)
@@ -624,6 +660,7 @@ def run(
         registry_entry,
         filter_identities,
         entry_observations,
+        filter_,
     )
     if shard_count is not None:
         _write_shard_manifest(
@@ -929,6 +966,7 @@ def _write_outputs(
     entry,
     filter_identities,
     entry_observations,
+    eligibility_filter,
 ):
     drows = _aggregate_diagnostics(diagnostics)
     _csv(out / "entry-diagnostics.csv", drows)
@@ -973,6 +1011,9 @@ def _write_outputs(
         **_filter_provenance(filter_identities),
         "output_sha256": hashes,
     }
+    if isinstance(eligibility_filter, FrozenOuEligibilityFilter):
+        audit["eligibility_filter_spec"] = asdict(eligibility_filter.spec)
+        audit["process_spec_id"] = eligibility_filter.spec.process_spec.process_spec_id
     (out / "execution-audit.json").write_text(_json(audit) + "\n")
     print("STAGE4B_PROGRESS reporting audit_complete", flush=True)
 
@@ -1031,12 +1072,20 @@ def main(argv=None):
     p.add_argument("--registry", type=Path, required=True)
     p.add_argument("--shard-index", type=int)
     p.add_argument("--shard-count", type=int)
+    p.add_argument(
+        "--eligibility-filter",
+        choices=("none", *FROZEN_OU_FILTER_CHOICES),
+        default="none",
+    )
     a = p.parse_args(argv)
     run(
         a.corpus_dir,
         a.output_dir,
         a.instrument,
         a.registry,
+        eligibility_filter=(
+            None if a.eligibility_filter == "none" else a.eligibility_filter
+        ),
         shard_index=a.shard_index,
         shard_count=a.shard_count,
     )
