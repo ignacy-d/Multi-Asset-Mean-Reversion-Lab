@@ -1,5 +1,36 @@
 # Multi-Asset Mean Reversion Lab
 
+## Frozen Stage 4 discovery atlas
+
+`mr-lab-stage4-discovery-atlas` creates a descriptive family-level atlas from
+existing, authenticated Stage 4B raw outputs. It never runs signal or trading
+logic, rejects inputs outside the frozen 2024 research period, verifies the
+Stage 4B audit commitments, and keeps baseline and filtered evidence separate.
+
+```bash
+uv run mr-lab-stage4-discovery-atlas \
+  --stage4b-dir results/stage4b/EURUSD/shard-0 \
+  --stage4b-dir results/stage4b/EURUSD/shard-1 \
+  --module-a-dir results/stage4b-module-a/EURUSD/shard-0 \
+  --output-dir results/stage4-discovery-atlas
+```
+
+The generated matrices retain setup families, deduplicate correlated variants
+at execution time, aggregate equivalent cross-asset hypotheses, preserve the
+four frozen cost scenarios, and report descriptive overlap with Module A. The
+shortlist uses evidence categories rather than a score or historical-best-cell
+ranking. Raw Stage 4B input is required because monthly stability, execution
+overlap, and duplicate-adjusted frequency cannot be authenticated from the
+compact Stage 4C matrices alone.
+
+Every input directory must be an authenticated Stage 4B shard, and every shard
+of each logical run must be supplied. Performance remains attached to the full
+signal/filter/exit cell. Setup-family rows summarize the distribution of exact
+cell expectancies as an exit plateau, while execution-family rows contain only
+duplicate-adjusted opportunity counts and memberships—never arbitrarily chosen
+P/L. Optional frozen-OU Module A shards have an explicit overlap-only role and
+are not pooled with baseline performance evidence.
+
 Multi-Asset Mean Reversion Lab is a Python research-engineering framework for
 systematically evaluating **families** of mean-reversion hypotheses across
 instruments, timeframes, sessions, models, rules, and cost assumptions. It does
