@@ -221,3 +221,55 @@ A regime is not advanced merely because one cell is net-positive.
 Advance only if Stage 4C-A shows a coherent net-positive region across multiple predeclared exit configurations and reasonable benchmark/lookback robustness, with positive cost headroom under more than the optimistic cost floor.
 
 If a regime fails even `mean spread + commission + 0 slippage`, it is rejected from the current FTMO mean-reversion candidate set unless a future separately preregistered hypothesis tests a genuinely different signal/filter family.
+
+## 14. Authenticated Stage 4B source bundles (September 2026 hardening)
+
+Production ingestion of recovered Stage 4B raw outputs uses
+`authenticated_stage4b_bundle`. Its trust anchor is the independently selected,
+version-controlled `configs/stage4b-approved-source-registry.json`; a hash supplied
+by the caller beside arbitrary bytes is not approval. Each registry entry pins a
+bundle ID, instrument, and canonical `stage4b-source-bundle.json` SHA-256.
+
+The candidate builder reads the reducer audit, original shard manifests, and raw
+trade files independently. It hashes and counts each raw JSONL in one bounded-memory
+sequential pass. All manifest-controlled paths must be non-empty bundle-relative
+paths; absolute paths, traversal, malformed components, and symlink escapes are
+rejected before file access.
+
+The bundle manifest binds the instrument, current corrected Stage 4B methodology and historical
+source commit, corpus and assembled-dataset identities, corpus-registry identity,
+source workflow run, combined/reducer audit, exact ordered shard universe, source
+artifact names and IDs, raw filenames/hashes/row counts, and shard-manifest
+filenames/hashes. Verification rehashes and recounts every local raw file, rehashes
+every shard manifest and the combined audit, and cross-checks their provenance and
+raw commitments. Stage 4C then binds the verified manifest, approval registry,
+combined audit, and shard identities into its source-input commitment.
+
+`development_existing_stage4b_raw` remains available for local fixtures and
+experiments. It records hashes of supplied files but is explicitly unauthenticated
+and cannot emit the authenticated source-mode or authentication marker. The old
+`existing_stage4b_raw` name remains only as a deprecated Python API alias; it is no
+longer a CLI choice.
+
+To migrate frozen inputs, artifact recovery must place each raw `trades.jsonl` and
+its original `shard-manifest.json` under stable, unique bundle-relative filenames,
+include the frozen reduction `execution-audit.json`, generate the canonical bundle
+manifest, and submit that manifest hash plus instrument under a reviewed registry
+entry. First run
+`uv run python tools/build_stage4b_source_bundle.py BUNDLE_DIR --source-provenance PROVENANCE.json`.
+This emits only an **unapproved candidate** and its deterministic SHA-256; it cannot
+read or modify the approval registry. The production trust sequence is: Stage 4B
+output → candidate bundle build → independent review → approval-registry commit →
+authentication → Stage 4C. Run
+`uv run python tools/verify_stage4b_source_bundle.py BUNDLE_DIR` before
+Stage 4C. The registry intentionally starts empty: no pre-audit or recomputed VWAP
+artifact is silently grandfathered. After the September methodology repair and
+Stage 4B recomputation, approve each instrument's recovered bundle in a reviewable
+commit, then invoke Stage 4C with `--source-mode authenticated_stage4b_bundle`,
+`--source-bundle-dir`, and `--approved-source-registry`.
+
+Historical v1 artifacts remain readable and checkable with their original Stage 4B
+audit/reducer tooling, but cannot be built or authenticated as current production
+bundles: both candidate construction and Stage 4C authentication require the
+imported current `STAGE4B_METHODOLOGY_ID`. An approved manifest carrying an older
+identity therefore still fails closed.
