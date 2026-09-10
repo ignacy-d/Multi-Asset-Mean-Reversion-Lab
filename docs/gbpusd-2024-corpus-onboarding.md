@@ -22,6 +22,20 @@ The successful run must contain exactly one non-expired artifact named
 `dukascopy-GBPUSD-m1-bid-2024-full-year`. Resolve and download it by its real
 ID rather than by guessing a pin:
 
+If a local monthly acquisition is interrupted, rerun that exact 2024 month in
+explicit resumable mode. This validates and reuses only complete immutable
+daily raw/provenance pairs; any orphaned, mismatched, or corrupt snapshot stops
+the run without overwriting it:
+
+```bash
+uv run python -m mr_lab.providers.dukascopy_monthly acquire-month \
+  --year 2024 --month 1 --instrument GBPUSD \
+  --output-dir gbpusd-checkpoints/2024-01 --resume
+```
+
+Do not use a different month or instrument with an existing checkpoint
+directory. A completed valid monthly manifest is returned idempotently.
+
 ```bash
 REPO=ignacy-d/Multi-Asset-Mean-Reversion-Lab
 RUN=<source_workflow_run_id>
