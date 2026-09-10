@@ -16,10 +16,12 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
 from mr_lab.stage4c import SLIPPAGES, SPREAD_STATISTICS, CostProfile, net_pips
 
 SCHEMA_VERSION = "bollinger-incremental-2024-v1"
-FAMILIES = ("bollinger", "vwap")
+VWAP_FAMILIES = ("vwap", "vwap-canonical-m1")
+FAMILIES = ("bollinger", *VWAP_FAMILIES)
 LOOKBACKS = (20, 40)
 TP_VALUES = (0.75, 1.0)
 SL_VALUES = (0.25, 0.5)
@@ -59,10 +61,145 @@ def _timestamp(value):
     return parsed
 
 
-def _candidate_index(input_dirs, registry):
+def _authenticate_inputs(input_dirs, registry):
+    """Authenticate a complete set of native Stage 4B raw shard directories."""
+    records = []
+    for directory in sorted(map(Path, input_dirs)):
+        manifest_path = directory / "shard-manifest.json"
+        if not manifest_path.is_file():
+            raise BollingerIncrementalError(
+                f"missing authenticated Stage 4B shard manifest: {directory}"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError as error:
+            raise BollingerIncrementalError("malformed shard manifest") from error
+        required = (
+            "source_commit_sha",
+            "registry_identity",
+            "source_workflow_run_id",
+            "source_artifact_id",
+            "raw_artifact_name",
+            "full_candidate_count",
+            "shard_candidate_count",
+            "full_group_keys",
+            "group_keys",
+        )
+        if any(manifest.get(field) is None for field in required):
+            raise BollingerIncrementalError("incomplete shard provenance manifest")
+        if not (
+            isinstance(manifest["source_commit_sha"], str)
+            and len(manifest["source_commit_sha"]) == 40
+            and isinstance(manifest["full_candidate_count"], int)
+            and manifest["full_candidate_count"] >= 0
+            and isinstance(manifest["shard_candidate_count"], int)
+            and manifest["shard_candidate_count"] >= 0
+            and isinstance(manifest["full_group_keys"], list)
+            and isinstance(manifest["group_keys"], list)
+        ):
+            raise BollingerIncrementalError("malformed shard provenance fields")
+        if manifest.get("stage4b_methodology_id") != STAGE4B_METHODOLOGY_ID:
+            raise BollingerIncrementalError("unexpected Stage 4B methodology")
+        if (
+            manifest.get("filter_family") != "none"
+            or manifest.get("filter_spec_id") != "none-v1"
+        ):
+            raise BollingerIncrementalError("only baseline Stage 4B shards are valid")
+        instrument = manifest.get("instrument")
+        entry = registry.get("instruments", {}).get(instrument, {})
+        if entry.get("verification_status") != "verified":
+            raise BollingerIncrementalError(f"unverified instrument: {instrument}")
+        for field in ("corpus_id", "assembled_dataset_id"):
+            if manifest.get(field) != entry.get(field):
+                raise BollingerIncrementalError(
+                    f"manifest {field} differs from registry"
+                )
+        for name in ("candidate-events.jsonl", "trades.jsonl"):
+            path = directory / name
+            expected_hash = manifest.get("file_sha256", {}).get(name)
+            expected_rows = manifest.get("row_counts", {}).get(name)
+            if (
+                not path.is_file()
+                or not expected_hash
+                or _sha256(path) != expected_hash
+            ):
+                raise BollingerIncrementalError(f"authenticated hash mismatch: {name}")
+            if not isinstance(expected_rows, int) or expected_rows != sum(
+                1 for _ in path.open("rb")
+            ):
+                raise BollingerIncrementalError(
+                    f"authenticated row count mismatch: {name}"
+                )
+        if (
+            type(manifest.get("shard_index")) is not int
+            or type(manifest.get("shard_count")) is not int
+            or not 0 <= manifest["shard_index"] < manifest["shard_count"]
+        ):
+            raise BollingerIncrementalError("malformed shard identity/count")
+        records.append((directory, manifest))
+
+    # A logical run is instrument + immutable source identity. Every logical run
+    # must be complete; mixing partial runs cannot manufacture an event universe.
+    run_fields = (
+        "instrument",
+        "source_commit_sha",
+        "registry_identity",
+        "corpus_id",
+        "assembled_dataset_id",
+        "source_workflow_run_id",
+        "source_artifact_id",
+        "shard_count",
+        "full_candidate_count",
+    )
+    runs = defaultdict(list)
+    for record in records:
+        manifest = record[1]
+        runs[tuple(manifest.get(field) for field in run_fields)].append(record)
+    seen_instruments = set()
+    for run_key, run_records in runs.items():
+        instrument = run_key[0]
+        if instrument in seen_instruments:
+            raise BollingerIncrementalError(
+                "mixed logical Stage 4B runs for instrument"
+            )
+        seen_instruments.add(instrument)
+        expected_count = run_key[-2]
+        indexes = [manifest["shard_index"] for _, manifest in run_records]
+        if len(indexes) != len(set(indexes)):
+            raise BollingerIncrementalError("duplicate or overlapping shard identity")
+        if set(indexes) != set(range(expected_count)):
+            raise BollingerIncrementalError("incomplete or mixed Stage 4B shard set")
+        reference = run_records[0][1]
+        identical = (*run_fields, "full_group_keys", "filter_family", "filter_spec_id")
+        if any(
+            any(manifest.get(field) != reference.get(field) for field in identical)
+            for _, manifest in run_records
+        ):
+            raise BollingerIncrementalError("mismatched shard manifest")
+        groups = [
+            group
+            for _, manifest in sorted(
+                run_records, key=lambda item: item[1]["shard_index"]
+            )
+            for group in manifest.get("group_keys", [])
+        ]
+        if groups != reference.get("full_group_keys") or len(
+            {json.dumps(group, sort_keys=True) for group in groups}
+        ) != len(groups):
+            raise BollingerIncrementalError("incomplete or overlapping shard groups")
+        if sum(
+            m.get("shard_candidate_count", -1) for _, m in run_records
+        ) != reference.get("full_candidate_count"):
+            raise BollingerIncrementalError("incomplete candidate coverage")
+    return sorted(
+        records, key=lambda item: (item[1]["instrument"], item[1]["shard_index"])
+    )
+
+
+def _candidate_index(records, registry):
     candidates = {}
     commitments = []
-    for directory in sorted(map(Path, input_dirs)):
+    for directory, manifest in records:
         path = directory / "candidate-events.jsonl"
         trades = directory / "trades.jsonl"
         if not path.is_file() or not trades.is_file():
@@ -72,6 +209,10 @@ def _candidate_index(input_dirs, registry):
         commitments.append(
             {
                 "directory": str(directory),
+                "manifest_sha256": _sha256(directory / "shard-manifest.json"),
+                "instrument": manifest["instrument"],
+                "shard_index": manifest["shard_index"],
+                "shard_count": manifest["shard_count"],
                 "candidate_sha256": _sha256(path),
                 "trade_sha256": _sha256(trades),
             }
@@ -80,6 +221,10 @@ def _candidate_index(input_dirs, registry):
             signal = row.get("signal", {})
             event_id = row.get("candidate_event_id")
             instrument = signal.get("instrument")
+            if instrument != manifest["instrument"]:
+                raise BollingerIncrementalError(
+                    "candidate instrument differs from shard manifest"
+                )
             entry = registry.get("instruments", {}).get(instrument, {})
             if entry.get("verification_status") != "verified":
                 raise BollingerIncrementalError(f"unverified instrument: {instrument}")
@@ -127,10 +272,10 @@ def _eligible_trade(row, candidate):
     )
 
 
-def _load_trades(input_dirs, candidates):
+def _load_trades(records, candidates):
     rows = []
     identities = set()
-    for directory in sorted(map(Path, input_dirs)):
+    for directory, _manifest in records:
         for row in _read_jsonl(directory / "trades.jsonl"):
             event_id = row.get("candidate_event_id")
             candidate = candidates.get(event_id)
@@ -164,7 +309,8 @@ def _load_trades(input_dirs, candidates):
 
 
 def _event_membership(candidates):
-    by_key = defaultdict(set)
+    strict = defaultdict(set)
+    execution = defaultdict(set)
     for _event_id, row in candidates.items():
         signal = row["signal"]
         if (
@@ -175,7 +321,10 @@ def _event_membership(candidates):
             and signal.get("benchmark_family") in FAMILIES
         ):
             key = (signal["instrument"], row["parsed_timestamp"], signal["lookback"])
-            by_key[key].add(signal["benchmark_family"])
+            strict[key].add(signal["benchmark_family"])
+            execution[(signal["instrument"], row["parsed_timestamp"])].add(
+                signal["benchmark_family"]
+            )
     membership = {}
     for event_id, row in candidates.items():
         signal = row["signal"]
@@ -184,18 +333,22 @@ def _event_membership(candidates):
             row["parsed_timestamp"],
             signal.get("lookback"),
         )
-        families = by_key.get(key, set())
+        families = execution.get(
+            (signal.get("instrument"), row["parsed_timestamp"]), set()
+        )
         family = signal.get("benchmark_family")
         if family == "bollinger":
             membership[event_id] = (
                 "bollinger-standalone",
-                "intersection" if "vwap" in families else "bollinger-only",
+                "intersection"
+                if any(item in families for item in VWAP_FAMILIES)
+                else "bollinger-only",
             )
-        elif family == "vwap":
+        elif family in VWAP_FAMILIES:
             membership[event_id] = (
                 "intersection" if "bollinger" in families else "vwap-only",
             )
-    return membership, by_key
+    return membership, {"strict": strict, "execution": execution}
 
 
 def _profit_factor(values):
@@ -266,8 +419,9 @@ def _correlation(left, right):
 def run(input_dirs, output_dir, registry_path, cost_profile_path):
     registry_path, cost_profile_path = Path(registry_path), Path(cost_profile_path)
     registry = json.loads(registry_path.read_text())
-    candidates, commitments = _candidate_index(input_dirs, registry)
-    trades = _load_trades(input_dirs, candidates)
+    authenticated = _authenticate_inputs(input_dirs, registry)
+    candidates, commitments = _candidate_index(authenticated, registry)
+    trades = _load_trades(authenticated, candidates)
     membership, event_sets = _event_membership(candidates)
     profile = CostProfile.load(cost_profile_path)
     output_dir = Path(output_dir)
@@ -349,33 +503,48 @@ def run(input_dirs, output_dir, registry_path, cost_profile_path):
             writer.writeheader()
             writer.writerows(results)
     overlap = []
-    instruments = sorted({key[0] for key in event_sets})
+    instruments = sorted({key[0] for key in event_sets["execution"]})
     for instrument in instruments:
-        for lookback in (*LOOKBACKS, "all"):
-            keys = {
-                key: families
-                for key, families in event_sets.items()
-                if key[0] == instrument and (lookback == "all" or key[2] == lookback)
-            }
-            bb = {key[1] for key, families in keys.items() if "bollinger" in families}
-            vwap = {key[1] for key, families in keys.items() if "vwap" in families}
-            both = bb & vwap
-            overlap.append(
-                {
-                    "instrument": instrument,
-                    "lookback": lookback,
-                    "bollinger_candidates": len(bb),
-                    "vwap_candidates": len(vwap),
-                    "intersection_count": len(both),
-                    "bollinger_only_incremental_count": len(bb - vwap),
-                    "bollinger_only_incremental_rate": len(bb - vwap) / len(bb)
-                    if bb
-                    else None,
-                    "bollinger_overlap_rate": len(both) / len(bb) if bb else None,
-                    "vwap_overlap_rate": len(both) / len(vwap) if vwap else None,
-                    "union_duplicate_adjusted_unique_trade_count": len(bb | vwap),
+        for definition, lookbacks in (
+            ("strict-specification", LOOKBACKS),
+            ("execution-level", ("all",)),
+        ):
+            for lookback in lookbacks:
+                source = event_sets[
+                    "strict" if definition == "strict-specification" else "execution"
+                ]
+                keys = {
+                    key: families
+                    for key, families in source.items()
+                    if key[0] == instrument
+                    and (definition == "execution-level" or key[2] == lookback)
                 }
-            )
+                bb = {
+                    key[1] for key, families in keys.items() if "bollinger" in families
+                }
+                vwap = {
+                    key[1]
+                    for key, families in keys.items()
+                    if any(item in families for item in VWAP_FAMILIES)
+                }
+                both = bb & vwap
+                overlap.append(
+                    {
+                        "instrument": instrument,
+                        "overlap_definition": definition,
+                        "lookback": lookback,
+                        "bollinger_candidates": len(bb),
+                        "vwap_module_a_candidates": len(vwap),
+                        "intersection_count": len(both),
+                        "bollinger_only_incremental_count": len(bb - vwap),
+                        "bollinger_only_incremental_rate": len(bb - vwap) / len(bb)
+                        if bb
+                        else None,
+                        "bollinger_overlap_rate": len(both) / len(bb) if bb else None,
+                        "vwap_overlap_rate": len(both) / len(vwap) if vwap else None,
+                        "union_duplicate_adjusted_unique_trade_count": len(bb | vwap),
+                    }
+                )
     with (output_dir / "event-overlap.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(overlap[0]) if overlap else [])
         if overlap:
@@ -400,13 +569,23 @@ def run(input_dirs, output_dir, registry_path, cost_profile_path):
         paired[key][row["benchmark_family"]] = row["gross_return_pips_adverse_first"]
     correlation_groups = defaultdict(list)
     for key, values in paired.items():
-        if set(values) == set(FAMILIES):
-            correlation_groups[key[:-1]].append((values["bollinger"], values["vwap"]))
+        for vwap_family in VWAP_FAMILIES:
+            if "bollinger" in values and vwap_family in values:
+                correlation_groups[(*key[:-1], vwap_family)].append(
+                    (values["bollinger"], values[vwap_family])
+                )
     for key, pairs in sorted(correlation_groups.items()):
         correlations.append(
             dict(
                 zip(
-                    ("instrument", "lookback", "tp", "sl", "time_stop_minutes"),
+                    (
+                        "instrument",
+                        "lookback",
+                        "tp",
+                        "sl",
+                        "time_stop_minutes",
+                        "vwap_outcome_family",
+                    ),
                     key,
                     strict=True,
                 )

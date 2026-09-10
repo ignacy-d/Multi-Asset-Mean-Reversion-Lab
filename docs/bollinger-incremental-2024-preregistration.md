@@ -9,12 +9,16 @@ used.
 
 The fixed scope is M15, London, SHORT, threshold 2.0, lookbacks 20 and 40,
 immediate entry, TP `{0.75, 1.0}`, SL `{0.25, 0.5}`, and time stop `{60, 120}`.
-No OU filter is permitted. The comparison benchmark is native VWAP Module A
-(`benchmark_family=vwap`), not canonical-M1 VWAP.
+No OU filter is permitted. VWAP Module A is the union of native VWAP and
+canonical-M1 VWAP (`benchmark_family` values `vwap` and `vwap-canonical-m1`).
 
-An intersection is equality of instrument, causal UTC signal timestamp, direction,
-session, timeframe, and lookback. Event classes are reported without changing the
+Strict-specification overlap requires equality of instrument, causal UTC signal
+timestamp, direction, session, timeframe, and lookback. Execution-level overlap
+ignores VWAP family and lookback. Event classes are reported without changing the
 trade engine: Bollinger standalone, Bollinger-only, VWAP-only, and intersection.
+Incremental `bollinger-only` means no event from either VWAP family or either
+lookback exists at the execution-level timestamp. Native/canonical and L20/L40
+duplicates are one Module A opportunity in execution-level counts.
 Intersection outcomes remain labelled by their originating family because the two
 signals can have different centers and displacement-scaled exits. Counts are also
 deduplicated by causal timestamp across lookbacks; this is a reporting count, not a
@@ -36,6 +40,13 @@ mr-lab-bollinger-incremental \
   --input-dir /path/to/stage4b/shard-1 \
   --output-dir results/bollinger-incremental-2024
 ```
+
+Every supplied directory must contain its original `shard-manifest.json`. The
+runner verifies raw hashes and row counts, frozen methodology and baseline-filter
+identity, registry corpus/dataset identities, logical-run consistency, nonoverlap,
+and complete shard/group/candidate coverage. The ordinary unsharded Stage 4B audit
+does not commit raw row counts or the complete group universe and is therefore not
+sufficient authentication for this study.
 
 GBPUSD is automatically rejected while its registry entry remains unverified.
 The current checkout contains no authenticated Stage 4B raw artifacts, so this PR
