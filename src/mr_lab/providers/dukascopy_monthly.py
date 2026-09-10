@@ -7,17 +7,28 @@ import calendar
 import hashlib
 import json
 import shutil
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+from mr_lab.providers.dukascopy import (
+    HOST,
+    PROVIDER,
+    AcquisitionError,
+    ProviderNoData,
+    acquire,
+    build_url,
+    validate_payload,
+)
 from mr_lab.providers.dukascopy_bi5 import (
     CANONICAL_SCHEMA_VERSION,
     INSTRUMENT,
     PARSER_SCHEMA_VERSION,
     SOURCE_TIMEZONE,
 )
-from mr_lab.providers.dukascopy_multiday import DailyPayload
+from mr_lab.providers.dukascopy_multiday import DailyPayload, assemble_daily_payloads
 from mr_lab.providers.dukascopy_range import (
     CORPUS_SCHEMA_VERSION,
     GENERIC_CORPUS_SCHEMA_VERSION,
@@ -25,6 +36,7 @@ from mr_lab.providers.dukascopy_range import (
     RangeAcquisitionResult,
     acquire_range,
     build_corpus_manifest,
+    enumerate_dates,
     load_offline_corpus,
 )
 from mr_lab.providers.instruments import get_instrument_spec
@@ -48,10 +60,20 @@ def acquire_month(
     *,
     instrument: str = INSTRUMENT,
     delay_seconds: float = 2.0,
+    resume: bool = False,
     **kwargs: object,
 ) -> RangeAcquisitionResult:
     """Acquire one independently checkpointable month, sequentially."""
     start, end = month_bounds(year, month)
+    if resume:
+        return _resume_month(
+            output_dir,
+            start,
+            end,
+            instrument=instrument,
+            delay_seconds=delay_seconds,
+            **kwargs,
+        )
     return acquire_range(
         output_dir,
         start,
@@ -59,6 +81,183 @@ def acquire_month(
         instrument=instrument,
         delay_seconds=delay_seconds,
         **kwargs,
+    )
+
+
+def _validate_existing_day(
+    output_dir: Path, day: date, instrument: str
+) -> tuple[DailyPayload, Path, Path] | None:
+    """Load one exact immutable daily pair, or fail closed on partial/corrupt state."""
+    spec = get_instrument_spec(instrument)
+    stem = f"{spec.instrument}-{day.isoformat()}-M1-BID"
+    raw_path = output_dir / f"{stem}.bi5"
+    provenance_path = output_dir / f"{stem}.json"
+    raw_exists, provenance_exists = raw_path.exists(), provenance_path.exists()
+    if not raw_exists and not provenance_exists:
+        return None
+    if raw_exists != provenance_exists:
+        raise RangeAcquisitionError(f"orphaned raw/provenance snapshot for {day}")
+    try:
+        raw = raw_path.read_bytes()
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        decoded_length = validate_payload(raw)
+    except (OSError, json.JSONDecodeError, ValueError, AcquisitionError) as error:
+        raise RangeAcquisitionError(f"invalid existing snapshot for {day}") from error
+    digest = hashlib.sha256(raw).hexdigest()
+    expected = {
+        "provider": PROVIDER,
+        "host": HOST,
+        "requested_url": build_url(spec.instrument, day),
+        "canonical_instrument": spec.instrument,
+        "provider_symbol": spec.provider_symbol,
+        "price_scale": spec.price_scale,
+        "price_precision": spec.price_precision,
+        "source_timeframe": "M1",
+        "price_side": "BID",
+        "requested_date": day.isoformat(),
+        "http_status": 200,
+        "compressed_byte_length": len(raw),
+        "decoded_byte_length": decoded_length,
+        "sha256": digest,
+    }
+    if not isinstance(provenance, dict) or any(
+        provenance.get(key) != value for key, value in expected.items()
+    ):
+        raise RangeAcquisitionError(f"existing snapshot provenance mismatch for {day}")
+    try:
+        retrieved_at = datetime.fromisoformat(provenance["retrieved_at"])
+        item = DailyPayload(day, raw, spec.instrument)
+        assemble_daily_payloads([item])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RangeAcquisitionError(f"invalid existing snapshot for {day}") from error
+    if retrieved_at.tzinfo is None or retrieved_at.utcoffset() != UTC.utcoffset(None):
+        raise RangeAcquisitionError(f"existing snapshot provenance mismatch for {day}")
+    return item, raw_path, provenance_path
+
+
+def _validate_checkpoint_inventory(
+    output_dir: Path, days: tuple[date, ...], instrument: str
+) -> None:
+    """Reject unexpected snapshot-shaped files in this exact monthly checkpoint."""
+    if not output_dir.exists():
+        return
+    expected = {
+        f"{instrument}-{day.isoformat()}-M1-BID{suffix}"
+        for day in days
+        for suffix in (".bi5", ".json")
+    }
+    expected.add("corpus-manifest.json")
+    unexpected = sorted(
+        path.name
+        for path in output_dir.iterdir()
+        if path.is_file()
+        and (path.suffix in {".bi5", ".json"})
+        and path.name not in expected
+    )
+    if unexpected:
+        raise RangeAcquisitionError(
+            "mismatched, ambiguous, or duplicate snapshot files: "
+            + ", ".join(unexpected)
+        )
+
+
+def _completed_month(
+    output_dir: Path, start: date, end: date, instrument: str
+) -> RangeAcquisitionResult:
+    """Authenticate an existing completed month and reproduce its logical result."""
+    payloads, absent, paths = _read_month(output_dir, instrument, start, end)
+    validated = [
+        _validate_existing_day(output_dir, item.requested_day, instrument)
+        for item in payloads
+    ]
+    if any(
+        item is None for item in validated
+    ):  # pragma: no cover - _read_month read it
+        raise RangeAcquisitionError("completed monthly snapshot disappeared")
+    rebuilt = build_corpus_manifest(start, end, payloads, absent, instrument)
+    manifest_path = output_dir / "corpus-manifest.json"
+    try:
+        stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RangeAcquisitionError("invalid completed monthly manifest") from error
+    if stored != rebuilt.as_dict():
+        raise RangeAcquisitionError("completed monthly manifest identity mismatch")
+    return RangeAcquisitionResult(
+        rebuilt,
+        tuple(raw for raw, _ in paths),
+        tuple(provenance for _, provenance in paths),
+        manifest_path,
+    )
+
+
+def _resume_month(
+    output_dir: Path,
+    start: date,
+    end: date,
+    *,
+    instrument: str,
+    timeout: float = 30.0,
+    retries: int = 6,
+    delay_seconds: float = 2.0,
+    acquire_day: Callable[..., tuple[Path, Path]] = acquire,
+    sleeper: Callable[[float], None] = time.sleep,
+    logger: Callable[[str], None] = print,
+) -> RangeAcquisitionResult:
+    """Resume an interrupted month without weakening immutable daily writes."""
+    spec = get_instrument_spec(instrument)
+    manifest_path = output_dir / "corpus-manifest.json"
+    days = enumerate_dates(start, end)
+    _validate_checkpoint_inventory(output_dir, days, spec.instrument)
+    if manifest_path.exists():
+        return _completed_month(output_dir, start, end, spec.instrument)
+    if delay_seconds < 0:
+        raise RangeAcquisitionError("delay_seconds must be non-negative")
+
+    payloads: list[DailyPayload] = []
+    absent: list[date] = []
+    raw_paths: list[Path] = []
+    provenance_paths: list[Path] = []
+    for index, day in enumerate(days):
+        progress = f"[{index + 1}/{len(days)}]"
+        existing = _validate_existing_day(output_dir, day, spec.instrument)
+        if existing is not None:
+            item, raw_path, provenance_path = existing
+            logger(f"{progress} reusing {day.isoformat()}")
+        else:
+            logger(f"{progress} acquiring {day.isoformat()}")
+            try:
+                call_kwargs: dict[str, object] = {
+                    "timeout": timeout,
+                    "retries": retries,
+                }
+                if spec.instrument != INSTRUMENT:
+                    call_kwargs["instrument"] = spec.instrument
+                raw_path, provenance_path = acquire_day(output_dir, day, **call_kwargs)
+            except ProviderNoData:
+                absent.append(day)
+                logger(f"{progress} absent {day.isoformat()}")
+                if delay_seconds and index != len(days) - 1:
+                    sleeper(delay_seconds)
+                continue
+            validated = _validate_existing_day(output_dir, day, spec.instrument)
+            if validated is None:  # pragma: no cover - defensive provider contract
+                raise RangeAcquisitionError(
+                    f"acquisition did not write snapshot for {day}"
+                )
+            item, raw_path, provenance_path = validated
+        payloads.append(item)
+        raw_paths.append(raw_path)
+        provenance_paths.append(provenance_path)
+        if delay_seconds and index != len(days) - 1:
+            sleeper(delay_seconds)
+
+    manifest = build_corpus_manifest(start, end, payloads, absent, spec.instrument)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if manifest_path.exists():
+        raise RangeAcquisitionError("refusing to overwrite an existing corpus manifest")
+    manifest_path.write_text(manifest.to_json() + "\n", encoding="utf-8")
+    return RangeAcquisitionResult(
+        manifest, tuple(raw_paths), tuple(provenance_paths), manifest_path
     )
 
 
@@ -123,8 +322,7 @@ def verify_full_year_corpus(
             for value in manifest["successful_component_dates"]
         ]
         absent = [
-            date.fromisoformat(value)
-            for value in manifest["confirmed_absent_dates"]
+            date.fromisoformat(value) for value in manifest["confirmed_absent_dates"]
         ]
     except (KeyError, TypeError, ValueError) as error:
         raise RangeAcquisitionError("invalid full-year date declarations") from error
@@ -138,11 +336,14 @@ def verify_full_year_corpus(
 
     claimed_corpus_id = manifest.get("corpus_id")
     identity = {key: value for key, value in manifest.items() if key != "corpus_id"}
-    actual_corpus_id = "sha256:" + hashlib.sha256(
-        json.dumps(
-            identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode()
-    ).hexdigest()
+    actual_corpus_id = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode()
+        ).hexdigest()
+    )
     if claimed_corpus_id != actual_corpus_id:
         raise RangeAcquisitionError("full-year corpus identity mismatch")
     dataset = load_offline_corpus(corpus_dir)
@@ -277,6 +478,7 @@ def main() -> None:
     acquire_parser.add_argument("--month", type=int, required=True)
     acquire_parser.add_argument("--instrument", default=INSTRUMENT)
     acquire_parser.add_argument("--output-dir", type=Path, required=True)
+    acquire_parser.add_argument("--resume", action="store_true")
     assembly_parser = subparsers.add_parser("assemble-year")
     assembly_parser.add_argument("--year", type=int, default=DISCOVERY_YEAR)
     assembly_parser.add_argument("--instrument", default=INSTRUMENT)
@@ -289,7 +491,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "acquire-month":
         result = acquire_month(
-            args.output_dir, args.year, args.month, instrument=args.instrument
+            args.output_dir,
+            args.year,
+            args.month,
+            instrument=args.instrument,
+            resume=args.resume,
         )
         print(f"month_manifest={result.manifest_path}")
     elif args.command == "assemble-year":
