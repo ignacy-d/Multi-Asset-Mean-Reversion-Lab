@@ -540,7 +540,17 @@ def _new_cell_metric_states():
     }
 
 
-def _finalize_cell_metrics(scenarios, states, count, candidate_count):
+def _finalize_cell_metrics(scenarios, states, count, candidate_count, numeric_rows):
+    for values in sorted(numeric_rows, key=lambda item: item[0]):
+        for name, value in zip(scenarios, values[1:], strict=True):
+            state = states[name]
+            state["exact_sum"].add(value)
+            state["total"] += value
+            if value > 0:
+                state["gains"] += value
+                state["wins"] += 1
+            elif value < 0:
+                state["losses"] -= value
     results = {}
     for name in scenarios:
         state = states[name]
@@ -573,41 +583,39 @@ def _stream_spooled_cell_metrics(database, *, started=None, progress_rows=1_000_
     """Yield every evidence cell from one chronological, bounded-memory cursor."""
     scan_started = started if started is not None else time.monotonic()
     query = (
-        "SELECT cell_key, candidate_id, timestamp, gross_pips, net_mean, net_p75, "
+        "SELECT cell_key, candidate_id, timestamp, seq, gross_pips, net_mean, net_p75, "
         "net_p90, net_p95 FROM trades WHERE role='evidence' "
         "ORDER BY cell_key, timestamp, candidate_id"
     )
     current_key = None
     scenarios = states = None
     candidates = set()
+    numeric_rows = []
     count = rows_processed = cells_finalized = 0
     for row in database.execute(query):
-        cell_key, candidate_id, timestamp, *values = row
+        cell_key, candidate_id, timestamp, seq, *values = row
         if current_key is not None and cell_key != current_key:
             cells_finalized += 1
             yield (
                 current_key,
-                _finalize_cell_metrics(scenarios, states, count, len(candidates)),
+                _finalize_cell_metrics(
+                    scenarios, states, count, len(candidates), numeric_rows
+                ),
             )
             scenarios, states = _new_cell_metric_states()
             candidates = set()
+            numeric_rows = []
             count = 0
         elif current_key is None:
             scenarios, states = _new_cell_metric_states()
         current_key = cell_key
         candidates.add(candidate_id)
+        numeric_rows.append((seq, *values))
         count += 1
         rows_processed += 1
         month = datetime.fromisoformat(timestamp).month
         for name, value in zip(scenarios, values, strict=True):
             state = states[name]
-            state["exact_sum"].add(value)
-            state["total"] += value
-            if value > 0:
-                state["gains"] += value
-                state["wins"] += 1
-            elif value < 0:
-                state["losses"] -= value
             state["monthly"][month] += value
             state["observed"].add(month)
             state["streak"] = state["streak"] + 1 if value < 0 else 0
@@ -623,7 +631,9 @@ def _stream_spooled_cell_metrics(database, *, started=None, progress_rows=1_000_
         cells_finalized += 1
         yield (
             current_key,
-            _finalize_cell_metrics(scenarios, states, count, len(candidates)),
+            _finalize_cell_metrics(
+                scenarios, states, count, len(candidates), numeric_rows
+            ),
         )
     LOGGER.info(
         "cell_rows_processed=%d cells_finalized=%d elapsed_seconds=%.3f",
@@ -650,6 +660,59 @@ def _stream_setup_counts(database):
         executions.add(execution_key)
     if current is not None:
         yield current, len(candidates), len(executions)
+
+
+def _stream_execution_family_rows(database):
+    """Yield execution-family summaries from one bounded grouped cursor."""
+    query = (
+        "SELECT execution_family, execution_key, setup_key, benchmark_family, lookback "
+        "FROM trades WHERE role='evidence' ORDER BY execution_family"
+    )
+    current = None
+    executions, setups, benchmarks, lookbacks = set(), set(), set(), set()
+    for family, execution, setup, benchmark, lookback in database.execute(query):
+        if current is not None and family != current:
+            yield current, executions, setups, benchmarks, lookbacks
+            executions, setups, benchmarks, lookbacks = set(), set(), set(), set()
+        current = family
+        executions.add(execution)
+        setups.add(setup)
+        benchmarks.add(benchmark)
+        lookbacks.add(lookback)
+    if current is not None:
+        yield current, executions, setups, benchmarks, lookbacks
+
+
+def _stream_overlap_counts(database):
+    """Yield all setup overlap counts using a fixed number of grouped queries."""
+    module_total = database.execute(
+        "SELECT COUNT(DISTINCT execution_key) FROM trades "
+        "WHERE role='module_a' AND module_candidate=1"
+    ).fetchone()[0]
+    query = (
+        "SELECT family.setup_key, COUNT(DISTINCT family.execution_key), "
+        "COUNT(DISTINCT CASE WHEN EXISTS (SELECT 1 FROM trades raw "
+        "WHERE raw.role='evidence' AND raw.module_candidate=1 "
+        "AND raw.execution_key=family.execution_key) THEN family.execution_key END), "
+        "COUNT(DISTINCT CASE WHEN EXISTS (SELECT 1 FROM trades module "
+        "WHERE module.role='module_a' AND module.module_candidate=1 "
+        "AND module.execution_key=family.execution_key) THEN family.execution_key END) "
+        "FROM trades family WHERE family.role='evidence' GROUP BY family.setup_key "
+        "ORDER BY family.setup_key"
+    )
+    for setup, opportunities, raw_intersection, module_intersection in database.execute(
+        query
+    ):
+        yield (
+            setup,
+            {
+                "opportunities": opportunities,
+                "raw_intersection": raw_intersection,
+                "module_intersection": module_intersection,
+                "unique_setup": opportunities - module_intersection,
+                "module_only": module_total - module_intersection,
+            },
+        )
 
 
 def build_atlas(
@@ -738,12 +801,13 @@ def build_atlas(
                     "SELECT DISTINCT cell_key FROM trades WHERE role='evidence' ORDER BY cell_key"
                 )
             ]
-            cost_rows, cell_results = [], {}
+            cost_rows, cell_results, cell_trade_counts = [], {}, {}
             for position, (encoded_key, metric_bundle) in enumerate(
                 _stream_spooled_cell_metrics(database, started=started), 1
             ):
                 key = tuple(json.loads(encoded_key))
                 gross_metrics = metric_bundle["gross"]
+                cell_trade_counts[encoded_key] = gross_metrics["trade_count"]
                 for statistic, slippage in HEADLINE_COSTS:
                     scenario = f"{statistic}+{slippage:g}"
                     metrics = metric_bundle[statistic]
@@ -811,36 +875,22 @@ def build_atlas(
             _write(output_dir / OUTPUTS[0], setup_rows)
 
             execution_rows = []
-            for (encoded,) in database.execute(
-                "SELECT DISTINCT execution_family FROM trades WHERE role='evidence' ORDER BY execution_family"
-            ):
+            for (
+                encoded,
+                execution_keys,
+                setup_keys,
+                benchmarks,
+                lookbacks,
+            ) in _stream_execution_family_rows(database):
                 key = tuple(json.loads(encoded))
-                where = "role='evidence' AND execution_family=?"
-                parameters = (encoded,)
                 execution_rows.append(
                     dict(zip(EXECUTION_FIELDS, key, strict=True))
                     | {
-                        "unique_execution_opportunities": database.execute(
-                            f"SELECT COUNT(DISTINCT execution_key) FROM trades WHERE {where}",
-                            parameters,
-                        ).fetchone()[0],
-                        "family_membership_count": database.execute(
-                            f"SELECT COUNT(DISTINCT setup_key) FROM trades WHERE {where}",
-                            parameters,
-                        ).fetchone()[0],
-                        "benchmark_variants_firing": "|".join(
-                            row[0]
-                            for row in database.execute(
-                                f"SELECT DISTINCT benchmark_family FROM trades WHERE {where} ORDER BY 1",
-                                parameters,
-                            )
-                        ),
+                        "unique_execution_opportunities": len(execution_keys),
+                        "family_membership_count": len(setup_keys),
+                        "benchmark_variants_firing": "|".join(sorted(benchmarks)),
                         "lookbacks_firing": "|".join(
-                            str(row[0])
-                            for row in database.execute(
-                                f"SELECT DISTINCT lookback FROM trades WHERE {where} ORDER BY 1",
-                                parameters,
-                            )
+                            str(value) for value in sorted(lookbacks)
                         ),
                     }
                 )
@@ -870,10 +920,8 @@ def build_atlas(
                 tested = len(instruments)
                 base = dict(zip(HYPOTHESIS_FIELDS, hypothesis, strict=True))
                 for instrument, evidence_by_cost in per_instrument.items():
-                    count = database.execute(
-                        "SELECT COUNT(*) FROM trades WHERE role='evidence' AND cell_key=?",
-                        (instruments[instrument],),
-                    ).fetchone()[0]
+                    cell = instruments[instrument]
+                    count = cell_trade_counts[cell]
                     row = base | {
                         "instrument": instrument,
                         "instrument_observation_count": count,
@@ -909,35 +957,13 @@ def build_atlas(
 
             overlap_rows = []
             actual_available = bool(module_trades)
+            overlap_counts = dict(_stream_overlap_counts(database))
             for encoded_family in sorted(family_cells):
                 family = tuple(json.loads(encoded_family))
-
-                def overlap_count(role, negate=False, family_key=encoded_family):
-                    operator = "NOT EXISTS" if negate else "EXISTS"
-                    return database.execute(
-                        "SELECT COUNT(DISTINCT family.execution_key) FROM trades family "
-                        "WHERE family.role='evidence' AND family.setup_key=? AND "
-                        f"{operator} (SELECT 1 FROM trades compared WHERE "
-                        "compared.role=? AND compared.module_candidate=1 AND "
-                        "compared.execution_key=family.execution_key)",
-                        (family_key, role),
-                    ).fetchone()[0]
-
-                opportunities = database.execute(
-                    "SELECT COUNT(DISTINCT execution_key) FROM trades "
-                    "WHERE role='evidence' AND setup_key=?",
-                    (encoded_family,),
-                ).fetchone()[0]
-                raw_intersection = overlap_count("evidence")
-                module_intersection = overlap_count("module_a")
-                unique_setup = overlap_count("module_a", negate=True)
-                module_only = database.execute(
-                    "SELECT COUNT(DISTINCT module.execution_key) FROM trades module "
-                    "WHERE module.role='module_a' AND module.module_candidate=1 AND "
-                    "NOT EXISTS (SELECT 1 FROM trades family WHERE family.role='evidence' "
-                    "AND family.setup_key=? AND family.execution_key=module.execution_key)",
-                    (encoded_family,),
-                ).fetchone()[0]
+                counts = overlap_counts[encoded_family]
+                opportunities = counts["opportunities"]
+                raw_intersection = counts["raw_intersection"]
+                module_intersection = counts["module_intersection"]
                 overlap_rows.append(
                     dict(zip(SETUP_FIELDS, family, strict=True))
                     | {
@@ -948,8 +974,8 @@ def build_atlas(
                         "actual_frozen_module_a_intersection_count": module_intersection,
                         "actual_frozen_module_a_overlap_rate": module_intersection
                         / opportunities,
-                        "unique_to_setup_vs_module_a": unique_setup,
-                        "module_a_only_count": module_only,
+                        "unique_to_setup_vs_module_a": counts["unique_setup"],
+                        "module_a_only_count": counts["module_only"],
                     }
                 )
             _write(output_dir / OUTPUTS[4], overlap_rows)
