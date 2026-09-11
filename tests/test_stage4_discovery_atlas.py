@@ -12,6 +12,7 @@ from mr_lab.stage4_discovery_atlas import (
     DiscoveryAtlasError,
     _cell_metrics,
     _create_spool,
+    _manifest_identity_key,
     _scenario_values,
     build_atlas,
 )
@@ -450,6 +451,48 @@ def test_duplicate_trade_identity_is_rejected(tmp_path):
     source = _shard(tmp_path, registry, [_trade("same"), _trade("same")])
     with pytest.raises(DiscoveryAtlasError, match="duplicate trade identity"):
         build_atlas([source], tmp_path / "out", PROFILE, registry)
+
+
+def test_manifest_identity_keys_are_compact_deterministic_and_distinct():
+    common = {"full_group_keys": [[f"group-{index}"] for index in range(10_000)]}
+    first = common | {"source_commit_sha": "a" * 40}
+    second = common | {"source_commit_sha": "b" * 40}
+
+    assert _manifest_identity_key(first) == _manifest_identity_key(first)
+    assert _manifest_identity_key(first) != _manifest_identity_key(second)
+    assert len(_manifest_identity_key(first)) == 64
+
+
+def test_spooled_trade_stores_digest_not_full_manifest_identity(tmp_path):
+    registry = _registry(tmp_path)
+    full_groups = [[f"large-logical-group-{index}"] for index in range(10_000)]
+    source = _shard(
+        tmp_path,
+        registry,
+        [_trade("event")],
+        full_groups=full_groups,
+        group_keys=full_groups,
+    )
+    database = _create_spool(tmp_path / "spool.sqlite3")
+    profile = CostProfile.load(PROFILE)
+    try:
+        atlas_module._collect(
+            [source],
+            json.loads(registry.read_text()),
+            hashlib.sha256(registry.read_bytes()).hexdigest(),
+            "evidence",
+            database,
+            profile,
+        )
+        run_key = database.execute("SELECT run_key FROM trades").fetchone()[0]
+    finally:
+        database.close()
+
+    assert len(run_key) == 64
+    assert run_key == _manifest_identity_key(
+        json.loads((source / "shard-manifest.json").read_text())
+    )
+    assert "large-logical-group" not in run_key
 
 
 def test_missing_candidate_reference_is_rejected(tmp_path):
