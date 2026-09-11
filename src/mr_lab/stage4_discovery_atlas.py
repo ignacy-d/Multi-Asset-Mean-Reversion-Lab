@@ -145,6 +145,12 @@ def _manifest_identity(manifest):
     return tuple(_json(manifest.get(field)) for field in fields)
 
 
+def _manifest_identity_key(manifest):
+    """Return a compact key for the exact canonical logical-run identity."""
+    canonical_identity = _json(_manifest_identity(manifest)).encode()
+    return hashlib.sha256(canonical_identity).hexdigest()
+
+
 def _authenticate_run(
     records, registry, registry_sha, role, database, run_number, profile
 ):
@@ -262,7 +268,7 @@ def _authenticate_run(
         reference.get(field)
         for field in ("filter_family", "filter_spec_id", "process_spec_id")
     )
-    run_key = _json(_manifest_identity(reference))
+    run_key = _manifest_identity_key(reference)
     insert_sql = (
         "INSERT INTO trades(role, run_key, candidate_id, cell_key, setup_key, "
         "execution_family, execution_key, timestamp, gross_pips, "
