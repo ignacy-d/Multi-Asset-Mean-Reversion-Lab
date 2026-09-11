@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+import tracemalloc
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from mr_lab.stage4_discovery_atlas import (
     _create_spool,
     _manifest_identity_key,
     _scenario_values,
+    _stream_execution_family_rows,
+    _stream_overlap_counts,
+    _stream_spooled_cell_metrics,
     build_atlas,
 )
 from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
@@ -403,7 +407,7 @@ def test_explicit_module_a_role_is_overlap_only(tmp_path):
     baseline = _shard(tmp_path, registry, [_trade("base")], label="base")
     spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
     module_trade = _trade(
-        "module",
+        "base",
         filter_family="ornstein-uhlenbeck",
         filter_spec_id=spec.filter_spec_id,
     )
@@ -419,12 +423,14 @@ def test_explicit_module_a_role_is_overlap_only(tmp_path):
     output = tmp_path / "atlas"
     build_atlas([baseline], output, PROFILE, registry, module_a_dirs=[module])
     assert len(_rows(output / "cost-robustness.csv")) == 4
-    assert (
-        _rows(output / "overlap-with-module-a.csv")[0][
-            "actual_frozen_module_a_available"
-        ]
-        == "True"
-    )
+    overlap = _rows(output / "overlap-with-module-a.csv")[0]
+    assert overlap["actual_frozen_module_a_available"] == "True"
+    assert overlap["raw_vwap_signal_family_intersection_count"] == "1"
+    assert overlap["raw_vwap_signal_family_overlap_rate"] == "1.0"
+    assert overlap["actual_frozen_module_a_intersection_count"] == "1"
+    assert overlap["actual_frozen_module_a_overlap_rate"] == "1.0"
+    assert overlap["unique_to_setup_vs_module_a"] == "0"
+    assert overlap["module_a_only_count"] == "0"
 
 
 def test_no_automatic_promising_or_fail_thresholds(tmp_path):
@@ -520,7 +526,9 @@ def test_spool_is_cleaned_after_aggregation_exception(tmp_path, monkeypatch):
     def fail(*_args, **_kwargs):
         raise RuntimeError("synthetic aggregation failure")
 
-    monkeypatch.setattr("mr_lab.stage4_discovery_atlas._spooled_cell_metrics", fail)
+    monkeypatch.setattr(
+        "mr_lab.stage4_discovery_atlas._stream_spooled_cell_metrics", fail
+    )
     with pytest.raises(RuntimeError, match="synthetic aggregation failure"):
         build_atlas([source], tmp_path / "out", PROFILE, registry, spool_dir=spool)
     assert list(spool.iterdir()) == []
@@ -602,3 +610,163 @@ def test_fused_cell_metrics_match_previous_implementation(tmp_path):
             assert actual[scenario][field] == str(value)
         for field, value in gross.items():
             assert actual[scenario][f"gross_{field}"] == str(value)
+
+
+def _insert_stream_trade(database, seq, cell, candidate, timestamp, values):
+    database.execute(
+        "INSERT INTO trades VALUES (?, 'evidence', ?, ?, ?, ?, 'execution', "
+        "?, ?, ?, 'vwap', 20, ?, ?, ?, ?, 0)",
+        (
+            seq,
+            f"run-{seq}",
+            candidate,
+            cell,
+            cell,
+            candidate,
+            timestamp,
+            *values,
+        ),
+    )
+
+
+def test_streamed_cells_match_legacy_metrics_and_distinct_candidates(tmp_path):
+    database = _create_spool(tmp_path / "stream.sqlite3")
+    rows = [
+        {
+            "timestamp": datetime.fromisoformat("2024-02-03T10:00:00+00:00"),
+            "candidate_event_id": "repeat",
+        },
+        {
+            "timestamp": datetime.fromisoformat("2024-02-01T10:00:00+00:00"),
+            "candidate_event_id": "repeat",
+        },
+        {
+            "timestamp": datetime.fromisoformat("2024-02-02T10:00:00+00:00"),
+            "candidate_event_id": "other",
+        },
+    ]
+    gross = [-3.0, -2.0, 7.0]
+    for seq, (row, value) in enumerate(zip(rows, gross, strict=True), 1):
+        _insert_stream_trade(
+            database,
+            seq,
+            "cell",
+            row["candidate_event_id"],
+            row["timestamp"].isoformat(),
+            (value, value - 1, value - 2, value - 3, value - 4),
+        )
+    actual = dict(_stream_spooled_cell_metrics(database, progress_rows=0))["cell"]
+    assert actual["gross"] == _cell_metrics(rows, gross)
+    assert actual["gross"]["candidate_count"] == 2
+    assert actual["gross"]["max_losing_streak"] == 1
+    for offset, scenario in enumerate(("mean", "p75", "p90", "p95"), 1):
+        assert actual[scenario] == _cell_metrics(rows, [v - offset for v in gross])
+    database.close()
+
+
+def test_streamed_cells_preserve_seq_order_float_accumulation(tmp_path):
+    database = _create_spool(tmp_path / "float-order.sqlite3")
+    timestamps = (
+        "2024-01-03T00:00:00+00:00",
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-02T00:00:00+00:00",
+        "2024-01-04T00:00:00+00:00",
+    )
+    rows = [
+        {
+            "timestamp": datetime.fromisoformat(timestamp),
+            "candidate_event_id": f"candidate-{seq}",
+        }
+        for seq, timestamp in enumerate(timestamps, 1)
+    ]
+    values = [1e16, 1.0, 1.0, -1e16]
+    for seq, (row, value) in enumerate(zip(rows, values, strict=True), 1):
+        _insert_stream_trade(
+            database,
+            seq,
+            "cell",
+            row["candidate_event_id"],
+            row["timestamp"].isoformat(),
+            (value,) * 5,
+        )
+    actual = dict(_stream_spooled_cell_metrics(database, progress_rows=0))["cell"]
+    chronological = [value for _, value in sorted(zip(timestamps, values, strict=True))]
+    seq_total = chronological_total = 0.0
+    for value in values:
+        seq_total += value
+    for value in chronological:
+        chronological_total += value
+    expected = _cell_metrics(rows, values) | {
+        "total_pips": seq_total,
+        "profit_factor": 1.0,
+    }
+    assert seq_total == 0.0
+    assert chronological_total == 2.0
+    assert actual["gross"] == expected
+    assert all(
+        actual[scenario] == expected for scenario in ("mean", "p75", "p90", "p95")
+    )
+    database.close()
+
+
+def test_streamed_aggregation_uses_one_global_trade_cursor(tmp_path):
+    database = _create_spool(tmp_path / "queries.sqlite3")
+    for seq in range(20):
+        _insert_stream_trade(
+            database,
+            seq,
+            f"cell-{seq:03d}",
+            f"candidate-{seq}",
+            "2024-01-01T00:00:00+00:00",
+            (1.0,) * 5,
+        )
+    statements = []
+    database.set_trace_callback(statements.append)
+    assert len(list(_stream_spooled_cell_metrics(database, progress_rows=0))) == 20
+    trade_selects = [
+        sql for sql in statements if sql.startswith("SELECT") and "FROM trades" in sql
+    ]
+    assert len(trade_selects) == 1
+    assert "cell_key=?" not in trade_selects[0]
+    database.close()
+
+
+def test_streamed_aggregation_memory_does_not_scale_with_cell_count(tmp_path):
+    database = _create_spool(tmp_path / "memory.sqlite3")
+    for seq in range(5_000):
+        _insert_stream_trade(
+            database,
+            seq,
+            f"cell-{seq:05d}",
+            f"candidate-{seq}",
+            "2024-01-01T00:00:00+00:00",
+            (1.0,) * 5,
+        )
+    tracemalloc.start()
+    for _ in _stream_spooled_cell_metrics(database, progress_rows=0):
+        pass
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < 2_000_000
+    database.close()
+
+
+def test_downstream_grouped_query_count_does_not_scale_with_families(tmp_path):
+    database = _create_spool(tmp_path / "downstream-queries.sqlite3")
+    for seq in range(50):
+        _insert_stream_trade(
+            database,
+            seq,
+            f"cell-{seq:03d}",
+            f"candidate-{seq}",
+            "2024-01-01T00:00:00+00:00",
+            (1.0,) * 5,
+        )
+    statements = []
+    database.set_trace_callback(statements.append)
+    assert len(list(_stream_execution_family_rows(database))) == 1
+    assert len(list(_stream_overlap_counts(database))) == 50
+    selects = [statement for statement in statements if statement.startswith("SELECT")]
+    assert len(selects) == 3
+    assert not any("setup_key=?" in statement for statement in selects)
+    database.close()
