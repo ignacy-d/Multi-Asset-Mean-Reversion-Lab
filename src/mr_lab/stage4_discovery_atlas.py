@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Authenticated frozen-2024 triage of already-computed Stage 4B evidence.
 
 Performance is computed only for exact strategy/exit cells.  Family and
@@ -11,8 +12,12 @@ import argparse
 import csv
 import hashlib
 import json
+import logging
 import math
+import sqlite3
 import statistics
+import tempfile
+import time
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,6 +75,8 @@ OUTPUTS = (
     "report.md",
 )
 RAW_FILES = ("candidate-events.jsonl", "trades.jsonl", "execution-audit.json")
+
+LOGGER = logging.getLogger(__name__)
 
 
 class DiscoveryAtlasError(ValueError):
@@ -137,7 +144,7 @@ def _manifest_identity(manifest):
     return tuple(_json(manifest.get(field)) for field in fields)
 
 
-def _authenticate_run(records, registry, registry_sha, role):
+def _authenticate_run(records, registry, registry_sha, role, database, run_number):
     """Authenticate one complete logical run, never indexes across runs."""
     records.sort(key=lambda item: item[1].get("shard_index", -1))
     reference = records[0][1]
@@ -188,7 +195,9 @@ def _authenticate_run(records, registry, registry_sha, role):
     ) != reference.get("full_candidate_count"):
         raise DiscoveryAtlasError("incomplete candidate coverage")
 
-    events, trades, commitments, process_ids = {}, [], [], set()
+    database.execute("DELETE FROM events")
+    commitments, process_ids = [], set()
+    candidate_count = trade_count = 0
     for directory, manifest in records:
         hashes, counts = manifest.get("file_sha256", {}), manifest.get("row_counts", {})
         for name in RAW_FILES:
@@ -224,10 +233,16 @@ def _authenticate_run(records, registry, registry_sha, role):
             ):
                 raise DiscoveryAtlasError("candidate provenance mismatch")
             event_id = event["candidate_event_id"]
-            if event_id in events:
-                raise DiscoveryAtlasError("duplicate candidate across shards")
-            events[event_id] = _time(signal["signal_timestamp"])
-        trades.extend(_jsonl(directory / "trades.jsonl"))
+            try:
+                database.execute(
+                    "INSERT INTO events VALUES (?, ?)",
+                    (event_id, _time(signal["signal_timestamp"]).isoformat()),
+                )
+            except sqlite3.IntegrityError as error:
+                raise DiscoveryAtlasError(
+                    "duplicate candidate across shards"
+                ) from error
+            candidate_count += 1
         commitments.append(
             {
                 "role": role,
@@ -235,12 +250,74 @@ def _authenticate_run(records, registry, registry_sha, role):
                 "raw_sha256": {name: hashes[name] for name in RAW_FILES},
             }
         )
-    if len(events) != reference["full_candidate_count"]:
+    if candidate_count != reference["full_candidate_count"]:
         raise DiscoveryAtlasError("candidate rows do not cover declared universe")
     if len(process_ids) != 1:
         raise DiscoveryAtlasError("logical-run process provenance mismatch")
     reference = reference | {"process_spec_id": next(iter(process_ids))}
-    return reference, events, trades, commitments
+    provenance = tuple(
+        reference.get(field)
+        for field in ("filter_family", "filter_spec_id", "process_spec_id")
+    )
+    run_key = _json(_manifest_identity(reference))
+    for directory, _manifest in records:
+        for row in _jsonl(directory / "trades.jsonl"):
+            if not row.get("complete"):
+                continue
+            found = database.execute(
+                "SELECT timestamp FROM events WHERE candidate_event_id = ?",
+                (row.get("candidate_event_id"),),
+            ).fetchone()
+            if found is None or row.get("instrument") != reference["instrument"]:
+                raise DiscoveryAtlasError("trade provenance mismatch")
+            timestamp = found[0]
+            row.update(
+                timestamp=datetime.fromisoformat(timestamp),
+                role=role,
+                process_spec_id=provenance[2],
+                execution_key=(
+                    row["instrument"],
+                    timestamp,
+                    row["session"],
+                    row["direction"],
+                    row["entry_mode"],
+                ),
+            )
+            cell = tuple(row.get(field) for field in CELL_FIELDS)
+            setup = cell[: len(SETUP_FIELDS)]
+            execution = tuple(row[field] for field in EXECUTION_FIELDS)
+            hypothesis = tuple(row.get(field) for field in HYPOTHESIS_FIELDS)
+            try:
+                database.execute(
+                    "INSERT INTO trades(role, run_key, candidate_id, cell_key, "
+                    "setup_key, execution_family, execution_key, hypothesis_key, "
+                    "instrument, module_candidate, payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        role,
+                        run_key,
+                        row["candidate_event_id"],
+                        _json(cell),
+                        _json(setup),
+                        _json(execution),
+                        _json(row["execution_key"]),
+                        _json(hypothesis),
+                        row["instrument"],
+                        int(_module_candidate(row)),
+                        _json(row),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise DiscoveryAtlasError("duplicate trade identity") from error
+            trade_count += 1
+    database.commit()
+    LOGGER.info(
+        "authenticated run %d: shards=%d candidate_rows=%d trade_rows_spooled=%d",
+        run_number,
+        len(records),
+        candidate_count,
+        trade_count,
+    )
+    return reference, commitments, candidate_count, trade_count
 
 
 def _time(value):
@@ -253,7 +330,7 @@ def _time(value):
     return parsed
 
 
-def _collect(directories, registry, registry_sha, role):
+def _collect(directories, registry, registry_sha, role, database, run_offset=0):
     directories = tuple(map(Path, directories))
     for directory in directories:
         _reject_sealed(directory)
@@ -266,38 +343,22 @@ def _collect(directories, registry, registry_sha, role):
     logical = defaultdict(list)
     for directory, manifest in manifests:
         logical[_manifest_identity(manifest)].append((directory, manifest))
-    output, commitments = [], []
-    for records in logical.values():
-        manifest, events, trades, run_commitments = _authenticate_run(
-            records, registry, registry_sha, role
+    commitments, provenance = [], set()
+    candidates = trades = 0
+    for number, records in enumerate(logical.values(), run_offset + 1):
+        manifest, run_commitments, run_candidates, run_trades = _authenticate_run(
+            records, registry, registry_sha, role, database, number
         )
-        provenance = tuple(
-            manifest.get(field)
-            for field in ("filter_family", "filter_spec_id", "process_spec_id")
-        )
-        for row in trades:
-            if not row.get("complete"):
-                continue
-            timestamp = events.get(row.get("candidate_event_id"))
-            if timestamp is None or row.get("instrument") != manifest["instrument"]:
-                raise DiscoveryAtlasError("trade provenance mismatch")
-            output.append(
-                row
-                | {
-                    "timestamp": timestamp,
-                    "role": role,
-                    "process_spec_id": provenance[2],
-                    "execution_key": (
-                        row["instrument"],
-                        timestamp.isoformat(),
-                        row["session"],
-                        row["direction"],
-                        row["entry_mode"],
-                    ),
-                }
+        provenance.add(
+            tuple(
+                manifest.get(field)
+                for field in ("filter_family", "filter_spec_id", "process_spec_id")
             )
+        )
         commitments.extend(run_commitments)
-    return output, commitments
+        candidates += run_candidates
+        trades += run_trades
+    return commitments, provenance, candidates, trades, len(logical)
 
 
 def _write(path, rows):
@@ -374,6 +435,107 @@ def _module_candidate(row):
     )
 
 
+def _create_spool(path):
+    database = sqlite3.connect(path)
+    database.execute("PRAGMA journal_mode=OFF")
+    database.execute("PRAGMA synchronous=OFF")
+    database.execute(
+        "CREATE TABLE events(candidate_event_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL)"
+    )
+    database.execute(
+        "CREATE TABLE trades(seq INTEGER PRIMARY KEY, role TEXT NOT NULL, run_key TEXT NOT NULL, "
+        "candidate_id TEXT NOT NULL, cell_key TEXT NOT NULL, setup_key TEXT NOT NULL, "
+        "execution_family TEXT NOT NULL, execution_key TEXT NOT NULL, hypothesis_key TEXT NOT NULL, "
+        "instrument TEXT NOT NULL, module_candidate INTEGER NOT NULL, payload TEXT NOT NULL, "
+        "UNIQUE(role, run_key, candidate_id, cell_key))"
+    )
+    database.execute("CREATE INDEX trades_cell ON trades(role, cell_key)")
+    database.execute(
+        "CREATE INDEX trades_setup ON trades(role, setup_key, execution_key)"
+    )
+    database.execute(
+        "CREATE INDEX trades_execution ON trades(role, execution_family, execution_key)"
+    )
+    database.execute(
+        "CREATE INDEX trades_overlap ON trades(role, module_candidate, execution_key)"
+    )
+    return database
+
+
+def _spooled_rows(database, where, parameters=()):
+    for (payload,) in database.execute(
+        f"SELECT payload FROM trades WHERE {where} ORDER BY seq", parameters
+    ):
+        row = json.loads(payload)
+        row["timestamp"] = datetime.fromisoformat(row["timestamp"])
+        row["execution_key"] = tuple(row["execution_key"])
+        yield row
+
+
+def _spooled_metrics(database, cell_key, profile, statistic=None, slippage=0.0):
+    """Compute one exact cell using repeatable cursor passes, never a row list."""
+
+    def observations(order="seq"):
+        query = (
+            "SELECT payload FROM trades WHERE role='evidence' AND cell_key=? "
+            f"ORDER BY {order}"
+        )
+        for (payload,) in database.execute(query, (cell_key,)):
+            row = json.loads(payload)
+            gross = float(row["gross_return_pips_adverse_first"])
+            if statistic is None:
+                value = gross
+            else:
+                spread, commission = profile.costs(
+                    row["instrument"], row["session"], statistic
+                )
+                value = net_pips(gross, row["instrument"], spread, slippage, commission)
+            yield row, value
+
+    count = database.execute(
+        "SELECT COUNT(*) FROM trades WHERE role='evidence' AND cell_key=?",
+        (cell_key,),
+    ).fetchone()[0]
+    candidate_count = database.execute(
+        "SELECT COUNT(DISTINCT candidate_id) FROM trades "
+        "WHERE role='evidence' AND cell_key=?",
+        (cell_key,),
+    ).fetchone()[0]
+    expectancy = statistics.fmean(value for _, value in observations())
+    total = sum(value for _, value in observations())
+    gains = sum(value for _, value in observations() if value > 0)
+    losses = -sum(value for _, value in observations() if value < 0)
+    wins = sum(value > 0 for _, value in observations())
+    monthly, observed = defaultdict(float), set()
+    streak = longest = 0
+    for row, value in observations(
+        "json_extract(payload, '$.timestamp'), candidate_id"
+    ):
+        month = datetime.fromisoformat(row["timestamp"]).month
+        monthly[month] += value
+        observed.add(month)
+        streak = streak + 1 if value < 0 else 0
+        longest = max(longest, streak)
+    month_values = [monthly.get(month, 0.0) for month in range(1, 13)]
+    return {
+        "trade_count": count,
+        "trades_per_month": count / 12,
+        "candidate_count": candidate_count,
+        "expectancy": expectancy,
+        "total_pips": total,
+        "profit_factor": gains / losses if losses else (math.inf if gains else 0.0),
+        "win_rate": wins / count,
+        "positive_months": sum(monthly[m] > 0 for m in observed),
+        "negative_months": sum(monthly[m] < 0 for m in observed),
+        "no_trade_months": 12 - len(observed),
+        "worst_month": min(month_values),
+        "best_month": max(month_values),
+        "monthly_mean": statistics.fmean(month_values),
+        "monthly_standard_deviation": statistics.pstdev(month_values),
+        "max_losing_streak": longest,
+    }
+
+
 def build_atlas(
     stage4b_dirs,
     output_dir,
@@ -381,244 +543,324 @@ def build_atlas(
     registry_path=Path("configs/stage4a-2024-corpus-registry.json"),
     *,
     module_a_dirs=(),
+    spool_dir=None,
 ):
+    started = time.monotonic()
     stage4b_dirs, module_a_dirs = tuple(stage4b_dirs), tuple(module_a_dirs)
     for path in (*stage4b_dirs, *module_a_dirs):
         _reject_sealed(path)
     registry_path, profile_path = Path(registry_path), Path(profile_path)
     registry_sha, profile_sha = _sha(registry_path), _sha(profile_path)
     registry, profile = _load_registry(registry_path), CostProfile.load(profile_path)
-    evidence, commitments = _collect(stage4b_dirs, registry, registry_sha, "evidence")
-    module, module_commitments = (
-        _collect(module_a_dirs, registry, registry_sha, "module_a")
-        if module_a_dirs
-        else ([], [])
-    )
-    commitments.extend(module_commitments)
-    if not evidence:
-        raise DiscoveryAtlasError("no complete authenticated evidence trades")
-    if module:
-        spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
-        expected_module = (
-            "ornstein-uhlenbeck",
-            spec.filter_spec_id,
-            spec.process_spec.process_spec_id,
-        )
-        if any(
+    if spool_dir is not None:
+        spool_dir = Path(spool_dir)
+        _reject_sealed(spool_dir)
+        spool_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="discovery-atlas-", dir=spool_dir
+    ) as temporary:
+        database = _create_spool(Path(temporary) / "atlas.sqlite3")
+        try:
+            commitments, evidence_provenance, candidate_count, trade_count, runs = (
+                _collect(stage4b_dirs, registry, registry_sha, "evidence", database)
+            )
             (
-                row.get("filter_family"),
-                row.get("filter_spec_id"),
-                row.get("process_spec_id"),
+                module_commitments,
+                module_provenance,
+                module_candidates,
+                module_trades,
+                module_runs,
+            ) = (
+                _collect(
+                    module_a_dirs,
+                    registry,
+                    registry_sha,
+                    "module_a",
+                    database,
+                    runs,
+                )
+                if module_a_dirs
+                else ([], set(), 0, 0, 0)
             )
-            != expected_module
-            for row in module
-        ):
-            raise DiscoveryAtlasError(
-                "Module A role requires exact frozen-ou-crossasset-v1 provenance"
+            commitments.extend(module_commitments)
+            LOGGER.info(
+                "authenticated_shards=%d candidate_rows_processed=%d "
+                "trade_rows_spooled=%d elapsed_seconds=%.3f",
+                len(commitments),
+                candidate_count + module_candidates,
+                trade_count + module_trades,
+                time.monotonic() - started,
             )
+            if not trade_count:
+                raise DiscoveryAtlasError("no complete authenticated evidence trades")
+            if module_trades:
+                spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+                expected_module = (
+                    "ornstein-uhlenbeck",
+                    spec.filter_spec_id,
+                    spec.process_spec.process_spec_id,
+                )
+                if module_provenance != {expected_module}:
+                    raise DiscoveryAtlasError(
+                        "Module A role requires exact frozen-ou-crossasset-v1 provenance"
+                    )
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cells = defaultdict(list)
-    for row in evidence:
-        cells[tuple(row.get(field) for field in CELL_FIELDS)].append(row)
-    cost_rows, cell_results = [], {}
-    for key, rows in sorted(cells.items(), key=lambda item: _json(item[0])):
-        gross_metrics = _cell_metrics(
-            rows, [float(row["gross_return_pips_adverse_first"]) for row in rows]
-        )
-        for statistic, slippage in HEADLINE_COSTS:
-            values = _scenario_values(rows, profile, statistic, slippage)
-            metrics = _cell_metrics(rows, values)
-            scenario = f"{statistic}+{slippage:g}"
-            cell_results[(key, scenario)] = metrics
-            cost_rows.append(
-                dict(zip(CELL_FIELDS, key, strict=True))
-                | {
-                    "cost_scenario": scenario,
-                    "spread_statistic": statistic,
-                    "slippage_pips": slippage,
-                    **{f"gross_{name}": value for name, value in gross_metrics.items()},
-                    **{f"net_{name}": value for name, value in metrics.items()},
-                    **metrics,
-                }
-            )
-    _write(output_dir / OUTPUTS[3], cost_rows)
-
-    families = defaultdict(list)
-    for key in cells:
-        families[key[: len(SETUP_FIELDS)]].append(key)
-    setup_rows = []
-    for family, exit_cells in sorted(families.items(), key=lambda item: _json(item[0])):
-        opportunities = {
-            row["execution_key"] for key in exit_cells for row in cells[key]
-        }
-        candidate_ids = {
-            row["candidate_event_id"] for key in exit_cells for row in cells[key]
-        }
-        base = dict(zip(SETUP_FIELDS, family, strict=True)) | {
-            "exit_cell_count": len(exit_cells),
-            "candidate_count": len(candidate_ids),
-            "unique_execution_opportunities": len(opportunities),
-            "trades_per_month": len(opportunities) / 12,
-        }
-        for statistic, slippage in HEADLINE_COSTS:
-            scenario = f"{statistic}+{slippage:g}"
-            expectancies = [
-                cell_results[(key, scenario)]["expectancy"] for key in exit_cells
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            cell_keys = [
+                row[0]
+                for row in database.execute(
+                    "SELECT DISTINCT cell_key FROM trades WHERE role='evidence' ORDER BY cell_key"
+                )
             ]
-            positive = sum(value > 0 for value in expectancies)
-            prefix = scenario.replace("+", "_").replace(".", "p")
-            base.update(
-                {
-                    f"{prefix}_positive_exit_cells": positive,
-                    f"{prefix}_positive_fraction": positive / len(expectancies),
-                    f"{prefix}_min_expectancy": min(expectancies),
-                    f"{prefix}_median_expectancy": statistics.median(expectancies),
-                    f"{prefix}_max_expectancy": max(expectancies),
+            cost_rows, cell_results = [], {}
+            for position, encoded_key in enumerate(cell_keys, 1):
+                key = tuple(json.loads(encoded_key))
+                gross_metrics = _spooled_metrics(database, encoded_key, profile)
+                for statistic, slippage in HEADLINE_COSTS:
+                    metrics = _spooled_metrics(
+                        database, encoded_key, profile, statistic, slippage
+                    )
+                    scenario = f"{statistic}+{slippage:g}"
+                    cell_results[(encoded_key, scenario)] = metrics
+                    cost_rows.append(
+                        dict(zip(CELL_FIELDS, key, strict=True))
+                        | {
+                            "cost_scenario": scenario,
+                            "spread_statistic": statistic,
+                            "slippage_pips": slippage,
+                            **{
+                                f"gross_{name}": value
+                                for name, value in gross_metrics.items()
+                            },
+                            **{f"net_{name}": value for name, value in metrics.items()},
+                            **metrics,
+                        }
+                    )
+                if position == 1 or position % 100 == 0 or position == len(cell_keys):
+                    LOGGER.info(
+                        "cell_groups_processed=%d/%d elapsed_seconds=%.3f",
+                        position,
+                        len(cell_keys),
+                        time.monotonic() - started,
+                    )
+            _write(output_dir / OUTPUTS[3], cost_rows)
+
+            family_cells = defaultdict(list)
+            for encoded in cell_keys:
+                key = tuple(json.loads(encoded))
+                family_cells[_json(key[: len(SETUP_FIELDS)])].append(encoded)
+            setup_rows = []
+            for encoded_family, exits in sorted(family_cells.items()):
+                family = tuple(json.loads(encoded_family))
+                marks = ",".join("?" for _ in exits)
+                opportunities = database.execute(
+                    f"SELECT COUNT(DISTINCT execution_key) FROM trades WHERE role='evidence' AND cell_key IN ({marks})",
+                    exits,
+                ).fetchone()[0]
+                candidates = database.execute(
+                    f"SELECT COUNT(DISTINCT candidate_id) FROM trades WHERE role='evidence' AND cell_key IN ({marks})",
+                    exits,
+                ).fetchone()[0]
+                base = dict(zip(SETUP_FIELDS, family, strict=True)) | {
+                    "exit_cell_count": len(exits),
+                    "candidate_count": candidates,
+                    "unique_execution_opportunities": opportunities,
+                    "trades_per_month": opportunities / 12,
                 }
+                for statistic, slippage in HEADLINE_COSTS:
+                    scenario = f"{statistic}+{slippage:g}"
+                    expectancies = [
+                        cell_results[(key, scenario)]["expectancy"] for key in exits
+                    ]
+                    positive = sum(value > 0 for value in expectancies)
+                    prefix = scenario.replace("+", "_").replace(".", "p")
+                    base.update(
+                        {
+                            f"{prefix}_positive_exit_cells": positive,
+                            f"{prefix}_positive_fraction": positive / len(expectancies),
+                            f"{prefix}_min_expectancy": min(expectancies),
+                            f"{prefix}_median_expectancy": statistics.median(
+                                expectancies
+                            ),
+                            f"{prefix}_max_expectancy": max(expectancies),
+                        }
+                    )
+                setup_rows.append(base)
+            _write(output_dir / OUTPUTS[0], setup_rows)
+
+            execution_rows = []
+            for (encoded,) in database.execute(
+                "SELECT DISTINCT execution_family FROM trades WHERE role='evidence' ORDER BY execution_family"
+            ):
+                key = tuple(json.loads(encoded))
+                where = "role='evidence' AND execution_family=?"
+                parameters = (encoded,)
+                execution_rows.append(
+                    dict(zip(EXECUTION_FIELDS, key, strict=True))
+                    | {
+                        "unique_execution_opportunities": database.execute(
+                            f"SELECT COUNT(DISTINCT execution_key) FROM trades WHERE {where}",
+                            parameters,
+                        ).fetchone()[0],
+                        "family_membership_count": database.execute(
+                            f"SELECT COUNT(DISTINCT setup_key) FROM trades WHERE {where}",
+                            parameters,
+                        ).fetchone()[0],
+                        "benchmark_variants_firing": "|".join(
+                            row[0]
+                            for row in database.execute(
+                                f"SELECT DISTINCT json_extract(payload, '$.benchmark_family') FROM trades WHERE {where} ORDER BY 1",
+                                parameters,
+                            )
+                        ),
+                        "lookbacks_firing": "|".join(
+                            str(row[0])
+                            for row in database.execute(
+                                f"SELECT DISTINCT json_extract(payload, '$.lookback') FROM trades WHERE {where} ORDER BY 1",
+                                parameters,
+                            )
+                        ),
+                    }
+                )
+            _write(output_dir / OUTPUTS[1], execution_rows)
+
+            hypotheses = defaultdict(dict)
+            for encoded in cell_keys:
+                cell = tuple(json.loads(encoded))
+                hypothesis = tuple(
+                    cell[CELL_FIELDS.index(f)] for f in HYPOTHESIS_FIELDS
+                )
+                hypotheses[_json(hypothesis)][cell[0]] = encoded
+            cross_rows, shortlist = [], []
+            for index, encoded_hypothesis in enumerate(sorted(hypotheses), 1):
+                hypothesis = tuple(json.loads(encoded_hypothesis))
+                instruments = hypotheses[encoded_hypothesis]
+                scenario_positive, per_instrument = {}, {}
+                for instrument, cell in sorted(instruments.items()):
+                    per_instrument[instrument] = {}
+                    for statistic, slippage in HEADLINE_COSTS:
+                        scenario = f"{statistic}+{slippage:g}"
+                        expectancy = cell_results[(cell, scenario)]["expectancy"]
+                        per_instrument[instrument][scenario] = expectancy
+                        scenario_positive[scenario] = scenario_positive.get(
+                            scenario, 0
+                        ) + (expectancy > 0)
+                tested = len(instruments)
+                base = dict(zip(HYPOTHESIS_FIELDS, hypothesis, strict=True))
+                for instrument, evidence_by_cost in per_instrument.items():
+                    count = database.execute(
+                        "SELECT COUNT(*) FROM trades WHERE role='evidence' AND cell_key=?",
+                        (instruments[instrument],),
+                    ).fetchone()[0]
+                    row = base | {
+                        "instrument": instrument,
+                        "instrument_observation_count": count,
+                        "instruments_tested": tested,
+                        "instruments_with_sufficient_observations": "not_assessed_no_preregistered_threshold",
+                        "cross_asset_support": _json(per_instrument),
+                    }
+                    for scenario, positive in scenario_positive.items():
+                        prefix = scenario.replace("+", "_").replace(".", "p")
+                        row[f"{prefix}_instruments_positive"] = positive
+                        row[f"{prefix}_instruments_negative_or_zero"] = (
+                            tested - positive
+                        )
+                        row[f"{prefix}_instrument_expectancy"] = evidence_by_cost[
+                            scenario
+                        ]
+                    cross_rows.append(row)
+                shortlist.append(
+                    {
+                        "hypothesis_id": f"H{index:04d}",
+                        **base,
+                        "evidence_status": "descriptive_only_no_preregistered_triage_thresholds",
+                        "cross_asset_support": _json(per_instrument),
+                        "frequency": "see cross-asset-hypotheses.csv",
+                        "positive_months": "see cost-robustness.csv",
+                        "plateau_breadth": "see setup-family-matrix.csv",
+                        "cost_survival": _json(scenario_positive),
+                        "module_a_overlap": "see overlap-with-module-a.csv",
+                    }
+                )
+            _write(output_dir / OUTPUTS[2], cross_rows)
+            _write(output_dir / OUTPUTS[5], shortlist)
+
+            overlap_rows = []
+            actual_available = bool(module_trades)
+            for encoded_family in sorted(family_cells):
+                family = tuple(json.loads(encoded_family))
+
+                def overlap_count(role, negate=False, family_key=encoded_family):
+                    operator = "NOT EXISTS" if negate else "EXISTS"
+                    return database.execute(
+                        "SELECT COUNT(DISTINCT family.execution_key) FROM trades family "
+                        "WHERE family.role='evidence' AND family.setup_key=? AND "
+                        f"{operator} (SELECT 1 FROM trades compared WHERE "
+                        "compared.role=? AND compared.module_candidate=1 AND "
+                        "compared.execution_key=family.execution_key)",
+                        (family_key, role),
+                    ).fetchone()[0]
+
+                opportunities = database.execute(
+                    "SELECT COUNT(DISTINCT execution_key) FROM trades "
+                    "WHERE role='evidence' AND setup_key=?",
+                    (encoded_family,),
+                ).fetchone()[0]
+                raw_intersection = overlap_count("evidence")
+                module_intersection = overlap_count("module_a")
+                unique_setup = overlap_count("module_a", negate=True)
+                module_only = database.execute(
+                    "SELECT COUNT(DISTINCT module.execution_key) FROM trades module "
+                    "WHERE module.role='module_a' AND module.module_candidate=1 AND "
+                    "NOT EXISTS (SELECT 1 FROM trades family WHERE family.role='evidence' "
+                    "AND family.setup_key=? AND family.execution_key=module.execution_key)",
+                    (encoded_family,),
+                ).fetchone()[0]
+                overlap_rows.append(
+                    dict(zip(SETUP_FIELDS, family, strict=True))
+                    | {
+                        "raw_vwap_signal_family_intersection_count": raw_intersection,
+                        "raw_vwap_signal_family_overlap_rate": raw_intersection
+                        / opportunities,
+                        "actual_frozen_module_a_available": actual_available,
+                        "actual_frozen_module_a_intersection_count": module_intersection,
+                        "actual_frozen_module_a_overlap_rate": module_intersection
+                        / opportunities,
+                        "unique_to_setup_vs_module_a": unique_setup,
+                        "module_a_only_count": module_only,
+                    }
+                )
+            _write(output_dir / OUTPUTS[4], overlap_rows)
+            (output_dir / OUTPUTS[6]).write_text(
+                "# Frozen 2024 discovery atlas\n\nExact cells retain performance. Families report exit-plateau evidence; execution deduplication reports opportunities only. No automatic triage threshold or ranking is applied.\n"
             )
-        setup_rows.append(base)
-    _write(output_dir / OUTPUTS[0], setup_rows)
-
-    executions = defaultdict(list)
-    for row in evidence:
-        executions[tuple(row[field] for field in EXECUTION_FIELDS)].append(row)
-    execution_rows = []
-    for key, rows in sorted(executions.items(), key=lambda item: _json(item[0])):
-        by_opportunity = defaultdict(list)
-        for row in rows:
-            by_opportunity[row["execution_key"]].append(row)
-        execution_rows.append(
-            dict(zip(EXECUTION_FIELDS, key, strict=True))
-            | {
-                "unique_execution_opportunities": len(by_opportunity),
-                "family_membership_count": len(
-                    {tuple(row.get(f) for f in SETUP_FIELDS) for row in rows}
+            audit = {
+                "schema_version": SCHEMA,
+                "atlas_methodology_version": METHODOLOGY,
+                "research_period": {"start": FROZEN_START, "end": FROZEN_END},
+                "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+                "registry_sha256": registry_sha,
+                "cost_profile_sha256": profile_sha,
+                "input_shards": commitments,
+                "filter_process_provenance": sorted(
+                    (
+                        *[(a, b, c, "evidence") for a, b, c in evidence_provenance],
+                        *[(a, b, c, "module_a") for a, b, c in module_provenance],
+                    )
                 ),
-                "benchmark_variants_firing": "|".join(
-                    sorted({row["benchmark_family"] for row in rows})
-                ),
-                "lookbacks_firing": "|".join(
-                    map(str, sorted({row["lookback"] for row in rows}))
-                ),
+                "output_sha256": {name: _sha(output_dir / name) for name in OUTPUTS},
             }
-        )
-    _write(output_dir / OUTPUTS[1], execution_rows)
-
-    hypothesis_instruments = defaultdict(lambda: defaultdict(list))
-    for key, rows in cells.items():
-        hypothesis = tuple(key[CELL_FIELDS.index(field)] for field in HYPOTHESIS_FIELDS)
-        hypothesis_instruments[hypothesis][key[0]].extend(rows)
-    cross_rows, shortlist = [], []
-    for index, (hypothesis, instruments) in enumerate(
-        sorted(hypothesis_instruments.items(), key=lambda item: _json(item[0])), 1
-    ):
-        scenario_positive = {}
-        per_instrument = {}
-        for instrument, rows in sorted(instruments.items()):
-            per_instrument[instrument] = {}
-            for statistic, slippage in HEADLINE_COSTS:
-                scenario = f"{statistic}+{slippage:g}"
-                expectancy = statistics.fmean(
-                    _scenario_values(rows, profile, statistic, slippage)
-                )
-                per_instrument[instrument][scenario] = expectancy
-                scenario_positive.setdefault(scenario, 0)
-                scenario_positive[scenario] += expectancy > 0
-        tested = len(instruments)
-        base = dict(zip(HYPOTHESIS_FIELDS, hypothesis, strict=True))
-        for instrument, evidence_by_cost in per_instrument.items():
-            row = base | {
-                "instrument": instrument,
-                "instrument_observation_count": len(instruments[instrument]),
-                "instruments_tested": tested,
-                "instruments_with_sufficient_observations": (
-                    "not_assessed_no_preregistered_threshold"
-                ),
-                "cross_asset_support": _json(per_instrument),
-            }
-            for scenario, positive in scenario_positive.items():
-                prefix = scenario.replace("+", "_").replace(".", "p")
-                row[f"{prefix}_instruments_positive"] = positive
-                row[f"{prefix}_instruments_negative_or_zero"] = tested - positive
-                row[f"{prefix}_instrument_expectancy"] = evidence_by_cost[scenario]
-            cross_rows.append(row)
-        shortlist.append(
-            {
-                "hypothesis_id": f"H{index:04d}",
-                **base,
-                "evidence_status": (
-                    "descriptive_only_no_preregistered_triage_thresholds"
-                ),
-                "cross_asset_support": _json(per_instrument),
-                "frequency": "see cross-asset-hypotheses.csv",
-                "positive_months": "see cost-robustness.csv",
-                "plateau_breadth": "see setup-family-matrix.csv",
-                "cost_survival": _json(scenario_positive),
-                "module_a_overlap": "see overlap-with-module-a.csv",
-            }
-        )
-    _write(output_dir / OUTPUTS[2], cross_rows)
-    _write(output_dir / OUTPUTS[5], shortlist)
-
-    raw_vwap = {row["execution_key"] for row in evidence if _module_candidate(row)}
-    actual_module = {row["execution_key"] for row in module if _module_candidate(row)}
-    overlap_rows = []
-    for family, exit_cells in sorted(families.items(), key=lambda item: _json(item[0])):
-        opportunities = {
-            row["execution_key"] for key in exit_cells for row in cells[key]
-        }
-        raw_intersection, module_intersection = (
-            opportunities & raw_vwap,
-            opportunities & actual_module,
-        )
-        overlap_rows.append(
-            dict(zip(SETUP_FIELDS, family, strict=True))
-            | {
-                "raw_vwap_signal_family_intersection_count": len(raw_intersection),
-                "raw_vwap_signal_family_overlap_rate": len(raw_intersection)
-                / len(opportunities),
-                "actual_frozen_module_a_available": bool(module),
-                "actual_frozen_module_a_intersection_count": len(module_intersection),
-                "actual_frozen_module_a_overlap_rate": len(module_intersection)
-                / len(opportunities),
-                "unique_to_setup_vs_module_a": len(opportunities - actual_module),
-                "module_a_only_count": len(actual_module - opportunities),
-            }
-        )
-    _write(output_dir / OUTPUTS[4], overlap_rows)
-    (output_dir / OUTPUTS[6]).write_text(
-        "# Frozen 2024 discovery atlas\n\nExact cells retain performance. Families "
-        "report exit-plateau evidence; execution deduplication reports "
-        "opportunities only. No automatic triage threshold or ranking is applied.\n"
-    )
-    audit = {
-        "schema_version": SCHEMA,
-        "atlas_methodology_version": METHODOLOGY,
-        "research_period": {"start": FROZEN_START, "end": FROZEN_END},
-        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
-        "registry_sha256": registry_sha,
-        "cost_profile_sha256": profile_sha,
-        "input_shards": commitments,
-        "filter_process_provenance": sorted(
-            {
-                (
-                    row.get("filter_family"),
-                    row.get("filter_spec_id"),
-                    row.get("process_spec_id"),
-                    row["role"],
-                )
-                for row in (*evidence, *module)
-            }
-        ),
-        "output_sha256": {name: _sha(output_dir / name) for name in OUTPUTS},
-    }
-    (output_dir / "execution-audit.json").write_text(_json(audit) + "\n")
-    return audit
+            (output_dir / "execution-audit.json").write_text(_json(audit) + "\n")
+            return audit
+        finally:
+            database.close()
 
 
 def main(argv=None):
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     parser = argparse.ArgumentParser(
         description="Report authenticated frozen-2024 Stage 4 families"
     )
@@ -638,6 +880,11 @@ def main(argv=None):
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
+        "--spool-dir",
+        type=Path,
+        help="parent directory for the automatically cleaned temporary SQLite spool",
+    )
+    parser.add_argument(
         "--registry",
         type=Path,
         default=Path("configs/stage4a-2024-corpus-registry.json"),
@@ -654,6 +901,7 @@ def main(argv=None):
         args.cost_profile,
         args.registry,
         module_a_dirs=args.module_a_dir,
+        spool_dir=args.spool_dir,
     )
     return 0
 
