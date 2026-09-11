@@ -489,7 +489,9 @@ def _create_spool(path):
 
 def _index_spool(database):
     """Add read-path indexes after bulk ingestion has completed."""
-    database.execute("CREATE INDEX trades_cell ON trades(role, cell_key)")
+    database.execute(
+        "CREATE INDEX trades_cell ON trades(role, cell_key, timestamp, candidate_id)"
+    )
     database.execute(
         "CREATE INDEX trades_setup ON trades(role, setup_key, execution_key)"
     )
@@ -520,14 +522,9 @@ class _ExactFloatSum:
         return float(Fraction(self.numerator, 1 << self.exponent))
 
 
-def _spooled_cell_metrics(database, cell_key):
-    """Return gross and all headline metrics with one numeric row pass.
-
-    A second narrow, chronologically ordered cursor preserves the historical
-    monthly-total and losing-streak order using only normalized spool columns.
-    """
+def _new_cell_metric_states():
     scenarios = ("gross", *(statistic for statistic, _ in HEADLINE_COSTS))
-    states = {
+    return scenarios, {
         name: {
             "exact_sum": _ExactFloatSum(),
             "total": 0.0,
@@ -541,42 +538,9 @@ def _spooled_cell_metrics(database, cell_key):
         }
         for name in scenarios
     }
-    count = 0
-    query = (
-        "SELECT gross_pips, net_mean, net_p75, net_p90, net_p95 FROM trades "
-        "WHERE role='evidence' AND cell_key=? ORDER BY seq"
-    )
-    for row in database.execute(query, (cell_key,)):
-        count += 1
-        for name, value in zip(scenarios, row, strict=True):
-            state = states[name]
-            state["exact_sum"].add(value)
-            state["total"] += value
-            if value > 0:
-                state["gains"] += value
-                state["wins"] += 1
-            elif value < 0:
-                state["losses"] -= value
 
-    chronological = (
-        "SELECT gross_pips, net_mean, net_p75, net_p90, net_p95, timestamp "
-        "FROM trades "
-        "WHERE role='evidence' AND cell_key=? ORDER BY timestamp, candidate_id"
-    )
-    for row in database.execute(chronological, (cell_key,)):
-        month = datetime.fromisoformat(row[5]).month
-        for name, value in zip(scenarios, row[:5], strict=True):
-            state = states[name]
-            state["monthly"][month] += value
-            state["observed"].add(month)
-            state["streak"] = state["streak"] + 1 if value < 0 else 0
-            state["longest"] = max(state["longest"], state["streak"])
 
-    candidate_count = database.execute(
-        "SELECT COUNT(DISTINCT candidate_id) FROM trades "
-        "WHERE role='evidence' AND cell_key=?",
-        (cell_key,),
-    ).fetchone()[0]
+def _finalize_cell_metrics(scenarios, states, count, candidate_count):
     results = {}
     for name in scenarios:
         state = states[name]
@@ -603,6 +567,89 @@ def _spooled_cell_metrics(database, cell_key):
             "max_losing_streak": state["longest"],
         }
     return results
+
+
+def _stream_spooled_cell_metrics(database, *, started=None, progress_rows=1_000_000):
+    """Yield every evidence cell from one chronological, bounded-memory cursor."""
+    scan_started = started if started is not None else time.monotonic()
+    query = (
+        "SELECT cell_key, candidate_id, timestamp, gross_pips, net_mean, net_p75, "
+        "net_p90, net_p95 FROM trades WHERE role='evidence' "
+        "ORDER BY cell_key, timestamp, candidate_id"
+    )
+    current_key = None
+    scenarios = states = None
+    candidates = set()
+    count = rows_processed = cells_finalized = 0
+    for row in database.execute(query):
+        cell_key, candidate_id, timestamp, *values = row
+        if current_key is not None and cell_key != current_key:
+            cells_finalized += 1
+            yield (
+                current_key,
+                _finalize_cell_metrics(scenarios, states, count, len(candidates)),
+            )
+            scenarios, states = _new_cell_metric_states()
+            candidates = set()
+            count = 0
+        elif current_key is None:
+            scenarios, states = _new_cell_metric_states()
+        current_key = cell_key
+        candidates.add(candidate_id)
+        count += 1
+        rows_processed += 1
+        month = datetime.fromisoformat(timestamp).month
+        for name, value in zip(scenarios, values, strict=True):
+            state = states[name]
+            state["exact_sum"].add(value)
+            state["total"] += value
+            if value > 0:
+                state["gains"] += value
+                state["wins"] += 1
+            elif value < 0:
+                state["losses"] -= value
+            state["monthly"][month] += value
+            state["observed"].add(month)
+            state["streak"] = state["streak"] + 1 if value < 0 else 0
+            state["longest"] = max(state["longest"], state["streak"])
+        if progress_rows and rows_processed % progress_rows == 0:
+            LOGGER.info(
+                "cell_rows_processed=%d cells_finalized=%d elapsed_seconds=%.3f",
+                rows_processed,
+                cells_finalized,
+                time.monotonic() - scan_started,
+            )
+    if current_key is not None:
+        cells_finalized += 1
+        yield (
+            current_key,
+            _finalize_cell_metrics(scenarios, states, count, len(candidates)),
+        )
+    LOGGER.info(
+        "cell_rows_processed=%d cells_finalized=%d elapsed_seconds=%.3f",
+        rows_processed,
+        cells_finalized,
+        time.monotonic() - scan_started,
+    )
+
+
+def _stream_setup_counts(database):
+    """Yield setup-level distinct counts while retaining only one setup's keys."""
+    query = (
+        "SELECT setup_key, candidate_id, execution_key FROM trades "
+        "WHERE role='evidence' ORDER BY setup_key, execution_key, candidate_id"
+    )
+    current = None
+    candidates, executions = set(), set()
+    for setup_key, candidate_id, execution_key in database.execute(query):
+        if current is not None and setup_key != current:
+            yield current, len(candidates), len(executions)
+            candidates, executions = set(), set()
+        current = setup_key
+        candidates.add(candidate_id)
+        executions.add(execution_key)
+    if current is not None:
+        yield current, len(candidates), len(executions)
 
 
 def build_atlas(
@@ -692,9 +739,10 @@ def build_atlas(
                 )
             ]
             cost_rows, cell_results = [], {}
-            for position, encoded_key in enumerate(cell_keys, 1):
+            for position, (encoded_key, metric_bundle) in enumerate(
+                _stream_spooled_cell_metrics(database, started=started), 1
+            ):
                 key = tuple(json.loads(encoded_key))
-                metric_bundle = _spooled_cell_metrics(database, encoded_key)
                 gross_metrics = metric_bundle["gross"]
                 for statistic, slippage in HEADLINE_COSTS:
                     scenario = f"{statistic}+{slippage:g}"
@@ -727,18 +775,14 @@ def build_atlas(
             for encoded in cell_keys:
                 key = tuple(json.loads(encoded))
                 family_cells[_json(key[: len(SETUP_FIELDS)])].append(encoded)
+            setup_counts = {
+                key: (candidates, opportunities)
+                for key, candidates, opportunities in _stream_setup_counts(database)
+            }
             setup_rows = []
             for encoded_family, exits in sorted(family_cells.items()):
                 family = tuple(json.loads(encoded_family))
-                marks = ",".join("?" for _ in exits)
-                opportunities = database.execute(
-                    f"SELECT COUNT(DISTINCT execution_key) FROM trades WHERE role='evidence' AND cell_key IN ({marks})",
-                    exits,
-                ).fetchone()[0]
-                candidates = database.execute(
-                    f"SELECT COUNT(DISTINCT candidate_id) FROM trades WHERE role='evidence' AND cell_key IN ({marks})",
-                    exits,
-                ).fetchone()[0]
+                candidates, opportunities = setup_counts[encoded_family]
                 base = dict(zip(SETUP_FIELDS, family, strict=True)) | {
                     "exit_cell_count": len(exits),
                     "candidate_count": candidates,

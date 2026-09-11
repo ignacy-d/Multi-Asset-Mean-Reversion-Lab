@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+import tracemalloc
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from mr_lab.stage4_discovery_atlas import (
     _create_spool,
     _manifest_identity_key,
     _scenario_values,
+    _stream_spooled_cell_metrics,
     build_atlas,
 )
 from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
@@ -520,7 +522,9 @@ def test_spool_is_cleaned_after_aggregation_exception(tmp_path, monkeypatch):
     def fail(*_args, **_kwargs):
         raise RuntimeError("synthetic aggregation failure")
 
-    monkeypatch.setattr("mr_lab.stage4_discovery_atlas._spooled_cell_metrics", fail)
+    monkeypatch.setattr(
+        "mr_lab.stage4_discovery_atlas._stream_spooled_cell_metrics", fail
+    )
     with pytest.raises(RuntimeError, match="synthetic aggregation failure"):
         build_atlas([source], tmp_path / "out", PROFILE, registry, spool_dir=spool)
     assert list(spool.iterdir()) == []
@@ -602,3 +606,97 @@ def test_fused_cell_metrics_match_previous_implementation(tmp_path):
             assert actual[scenario][field] == str(value)
         for field, value in gross.items():
             assert actual[scenario][f"gross_{field}"] == str(value)
+
+
+def _insert_stream_trade(database, seq, cell, candidate, timestamp, values):
+    database.execute(
+        "INSERT INTO trades VALUES (?, 'evidence', ?, ?, ?, ?, 'execution', "
+        "?, ?, ?, 'vwap', 20, ?, ?, ?, ?, 0)",
+        (
+            seq,
+            f"run-{seq}",
+            candidate,
+            cell,
+            cell,
+            candidate,
+            timestamp,
+            *values,
+        ),
+    )
+
+
+def test_streamed_cells_match_legacy_metrics_and_distinct_candidates(tmp_path):
+    database = _create_spool(tmp_path / "stream.sqlite3")
+    rows = [
+        {
+            "timestamp": datetime.fromisoformat("2024-02-03T10:00:00+00:00"),
+            "candidate_event_id": "repeat",
+        },
+        {
+            "timestamp": datetime.fromisoformat("2024-02-01T10:00:00+00:00"),
+            "candidate_event_id": "repeat",
+        },
+        {
+            "timestamp": datetime.fromisoformat("2024-02-02T10:00:00+00:00"),
+            "candidate_event_id": "other",
+        },
+    ]
+    gross = [-3.0, -2.0, 7.0]
+    for seq, (row, value) in enumerate(zip(rows, gross, strict=True), 1):
+        _insert_stream_trade(
+            database,
+            seq,
+            "cell",
+            row["candidate_event_id"],
+            row["timestamp"].isoformat(),
+            (value, value - 1, value - 2, value - 3, value - 4),
+        )
+    actual = dict(_stream_spooled_cell_metrics(database, progress_rows=0))["cell"]
+    assert actual["gross"] == _cell_metrics(rows, gross)
+    assert actual["gross"]["candidate_count"] == 2
+    assert actual["gross"]["max_losing_streak"] == 1
+    for offset, scenario in enumerate(("mean", "p75", "p90", "p95"), 1):
+        assert actual[scenario] == _cell_metrics(rows, [v - offset for v in gross])
+    database.close()
+
+
+def test_streamed_aggregation_uses_one_global_trade_cursor(tmp_path):
+    database = _create_spool(tmp_path / "queries.sqlite3")
+    for seq in range(20):
+        _insert_stream_trade(
+            database,
+            seq,
+            f"cell-{seq:03d}",
+            f"candidate-{seq}",
+            "2024-01-01T00:00:00+00:00",
+            (1.0,) * 5,
+        )
+    statements = []
+    database.set_trace_callback(statements.append)
+    assert len(list(_stream_spooled_cell_metrics(database, progress_rows=0))) == 20
+    trade_selects = [
+        sql for sql in statements if sql.startswith("SELECT") and "FROM trades" in sql
+    ]
+    assert len(trade_selects) == 1
+    assert "cell_key=?" not in trade_selects[0]
+    database.close()
+
+
+def test_streamed_aggregation_memory_does_not_scale_with_cell_count(tmp_path):
+    database = _create_spool(tmp_path / "memory.sqlite3")
+    for seq in range(5_000):
+        _insert_stream_trade(
+            database,
+            seq,
+            f"cell-{seq:05d}",
+            f"candidate-{seq}",
+            "2024-01-01T00:00:00+00:00",
+            (1.0,) * 5,
+        )
+    tracemalloc.start()
+    for _ in _stream_spooled_cell_metrics(database, progress_rows=0):
+        pass
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < 2_000_000
+    database.close()
