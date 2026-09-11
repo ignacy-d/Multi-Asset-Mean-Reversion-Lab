@@ -11,6 +11,7 @@ from mr_lab.ornstein_uhlenbeck import frozen_ou_eligibility_spec
 from mr_lab.stage4_discovery_atlas import (
     DiscoveryAtlasError,
     _cell_metrics,
+    _create_spool,
     _scenario_values,
     build_atlas,
 )
@@ -506,6 +507,28 @@ def test_large_single_cell_decodes_each_trade_payload_only_once(tmp_path, monkey
     assert _rows(output / "cost-robustness.csv")[0]["trade_count"] == "2000"
     assert decoded_trades == len(trades)
     assert list((tmp_path / "spool").iterdir()) == []
+
+
+def test_spool_schema_does_not_retain_serialized_trade_payloads(tmp_path):
+    database = _create_spool(tmp_path / "spool.sqlite3")
+    try:
+        columns = {
+            row[1] for row in database.execute("PRAGMA table_info(trades)").fetchall()
+        }
+    finally:
+        database.close()
+    assert "payload" not in columns
+    assert {
+        "cell_key",
+        "setup_key",
+        "execution_family",
+        "execution_key",
+        "gross_pips",
+        "net_mean",
+        "net_p75",
+        "net_p90",
+        "net_p95",
+    } <= columns
 
 
 def test_fused_cell_metrics_match_previous_implementation(tmp_path):

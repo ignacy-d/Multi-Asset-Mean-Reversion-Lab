@@ -265,10 +265,10 @@ def _authenticate_run(
     run_key = _json(_manifest_identity(reference))
     insert_sql = (
         "INSERT INTO trades(role, run_key, candidate_id, cell_key, setup_key, "
-        "execution_family, execution_key, hypothesis_key, instrument, session, "
-        "timestamp, gross_pips, benchmark_family, lookback, net_mean, net_p75, "
-        "net_p90, net_p95, module_candidate, payload) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        "execution_family, execution_key, timestamp, gross_pips, "
+        "benchmark_family, lookback, net_mean, net_p75, "
+        "net_p90, net_p95, module_candidate) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     )
     pending = []
 
@@ -281,17 +281,16 @@ def _authenticate_run(
             raise DiscoveryAtlasError("duplicate trade identity") from error
         pending.clear()
 
+    event_timestamps = dict(
+        database.execute("SELECT candidate_event_id, timestamp FROM events")
+    )
     for directory, _manifest in records:
         for row in _jsonl(directory / "trades.jsonl"):
             if not row.get("complete"):
                 continue
-            found = database.execute(
-                "SELECT timestamp FROM events WHERE candidate_event_id = ?",
-                (row.get("candidate_event_id"),),
-            ).fetchone()
-            if found is None or row.get("instrument") != reference["instrument"]:
+            timestamp = event_timestamps.get(row.get("candidate_event_id"))
+            if timestamp is None or row.get("instrument") != reference["instrument"]:
                 raise DiscoveryAtlasError("trade provenance mismatch")
-            timestamp = found[0]
             row.update(
                 timestamp=datetime.fromisoformat(timestamp),
                 role=role,
@@ -307,7 +306,6 @@ def _authenticate_run(
             cell = tuple(row.get(field) for field in CELL_FIELDS)
             setup = cell[: len(SETUP_FIELDS)]
             execution = tuple(row[field] for field in EXECUTION_FIELDS)
-            hypothesis = tuple(row.get(field) for field in HYPOTHESIS_FIELDS)
             scenario_values = [
                 _scenario_values([row], profile, statistic, slippage)[0]
                 for statistic, slippage in HEADLINE_COSTS
@@ -321,16 +319,12 @@ def _authenticate_run(
                     _json(setup),
                     _json(execution),
                     _json(row["execution_key"]),
-                    _json(hypothesis),
-                    row["instrument"],
-                    row["session"],
                     timestamp,
                     float(row["gross_return_pips_adverse_first"]),
                     row["benchmark_family"],
                     row["lookback"],
                     *scenario_values,
                     int(_module_candidate(row)),
-                    _json(row),
                 )
             )
             if len(pending) == 1000:
@@ -475,14 +469,20 @@ def _create_spool(path):
     database.execute(
         "CREATE TABLE trades(seq INTEGER PRIMARY KEY, role TEXT NOT NULL, run_key TEXT NOT NULL, "
         "candidate_id TEXT NOT NULL, cell_key TEXT NOT NULL, setup_key TEXT NOT NULL, "
-        "execution_family TEXT NOT NULL, execution_key TEXT NOT NULL, hypothesis_key TEXT NOT NULL, "
-        "instrument TEXT NOT NULL, session TEXT NOT NULL, timestamp TEXT NOT NULL, "
+        "execution_family TEXT NOT NULL, execution_key TEXT NOT NULL, "
+        "timestamp TEXT NOT NULL, "
         "gross_pips REAL NOT NULL, benchmark_family TEXT NOT NULL, lookback NOT NULL, "
         "net_mean REAL NOT NULL, net_p75 REAL NOT NULL, net_p90 REAL NOT NULL, "
         "net_p95 REAL NOT NULL, "
-        "module_candidate INTEGER NOT NULL, payload TEXT NOT NULL, "
+        "module_candidate INTEGER NOT NULL, "
         "UNIQUE(role, run_key, candidate_id, cell_key))"
     )
+
+    return database
+
+
+def _index_spool(database):
+    """Add read-path indexes after bulk ingestion has completed."""
     database.execute("CREATE INDEX trades_cell ON trades(role, cell_key)")
     database.execute(
         "CREATE INDEX trades_setup ON trades(role, setup_key, execution_key)"
@@ -493,7 +493,6 @@ def _create_spool(path):
     database.execute(
         "CREATE INDEX trades_overlap ON trades(role, module_candidate, execution_key)"
     )
-    return database
 
 
 class _ExactFloatSum:
@@ -519,7 +518,7 @@ def _spooled_cell_metrics(database, cell_key):
     """Return gross and all headline metrics with one numeric row pass.
 
     A second narrow, chronologically ordered cursor preserves the historical
-    monthly-total and losing-streak order without reading or decoding payloads.
+    monthly-total and losing-streak order using only normalized spool columns.
     """
     scenarios = ("gross", *(statistic for statistic, _ in HEADLINE_COSTS))
     states = {
@@ -655,6 +654,7 @@ def build_atlas(
                 else ([], set(), 0, 0, 0)
             )
             commitments.extend(module_commitments)
+            _index_spool(database)
             LOGGER.info(
                 "authenticated_shards=%d candidate_rows_processed=%d "
                 "trade_rows_spooled=%d elapsed_seconds=%.3f",
@@ -781,14 +781,14 @@ def build_atlas(
                         "benchmark_variants_firing": "|".join(
                             row[0]
                             for row in database.execute(
-                                f"SELECT DISTINCT json_extract(payload, '$.benchmark_family') FROM trades WHERE {where} ORDER BY 1",
+                                f"SELECT DISTINCT benchmark_family FROM trades WHERE {where} ORDER BY 1",
                                 parameters,
                             )
                         ),
                         "lookbacks_firing": "|".join(
                             str(row[0])
                             for row in database.execute(
-                                f"SELECT DISTINCT json_extract(payload, '$.lookback') FROM trades WHERE {where} ORDER BY 1",
+                                f"SELECT DISTINCT lookback FROM trades WHERE {where} ORDER BY 1",
                                 parameters,
                             )
                         ),

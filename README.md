@@ -16,15 +16,16 @@ uv run mr-lab-stage4-discovery-atlas \
   --output-dir results/stage4-discovery-atlas
 ```
 
-The atlas authenticates candidate and trade JSONL as streams and stores the
-minimal join metadata plus complete trades in a temporary SQLite spool. The
+The atlas authenticates candidate and trade JSONL as streams and stores only
+the normalized metadata and numeric values required by its outputs in a
+temporary SQLite spool; raw serialized trade payloads are not retained. The
 spool is removed on success or failure; `--spool-dir` selects its parent when
 the system temporary filesystem is too small. Progress logs report authenticated
 shards, candidate and trade rows, exact-cell groups, and elapsed time.
 Gross and all four frozen cost-scenario values are calculated once during
 batched ingestion. Exact-cell aggregation then uses one insertion-order numeric
 cursor for performance totals and one narrow chronological cursor for monthly
-and losing-streak statistics; it does not repeatedly decode JSON payloads.
+and losing-streak statistics.
 
 The generated matrices retain setup families, deduplicate correlated variants
 at execution time, aggregate equivalent cross-asset hypotheses, preserve the
