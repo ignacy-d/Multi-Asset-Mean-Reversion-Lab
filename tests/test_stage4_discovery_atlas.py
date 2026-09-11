@@ -6,13 +6,16 @@ from pathlib import Path
 
 import pytest
 
+import mr_lab.stage4_discovery_atlas as atlas_module
 from mr_lab.ornstein_uhlenbeck import frozen_ou_eligibility_spec
 from mr_lab.stage4_discovery_atlas import (
     DiscoveryAtlasError,
     _cell_metrics,
+    _scenario_values,
     build_atlas,
 )
 from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
+from mr_lab.stage4c import CostProfile
 
 PROFILE = Path("configs/stage4c-ftmo-cost-profile-v1.json")
 
@@ -473,13 +476,13 @@ def test_spool_is_cleaned_after_aggregation_exception(tmp_path, monkeypatch):
     def fail(*_args, **_kwargs):
         raise RuntimeError("synthetic aggregation failure")
 
-    monkeypatch.setattr("mr_lab.stage4_discovery_atlas._spooled_metrics", fail)
+    monkeypatch.setattr("mr_lab.stage4_discovery_atlas._spooled_cell_metrics", fail)
     with pytest.raises(RuntimeError, match="synthetic aggregation failure"):
         build_atlas([source], tmp_path / "out", PROFILE, registry, spool_dir=spool)
     assert list(spool.iterdir()) == []
 
 
-def test_large_single_cell_is_consumed_by_streaming_cursors(tmp_path, monkeypatch):
+def test_large_single_cell_decodes_each_trade_payload_only_once(tmp_path, monkeypatch):
     registry = _registry(tmp_path)
     trades = [
         _trade(f"event-{index}", gross=(-1) ** index * 4)
@@ -488,13 +491,48 @@ def test_large_single_cell_is_consumed_by_streaming_cursors(tmp_path, monkeypatc
     ]
     source = _shard(tmp_path, registry, trades)
 
-    def reject_legacy_materialization(*_args, **_kwargs):
-        raise AssertionError("legacy row materialization was used")
+    original_loads = atlas_module.json.loads
+    decoded_trades = 0
 
-    monkeypatch.setattr(
-        "mr_lab.stage4_discovery_atlas._spooled_rows", reject_legacy_materialization
-    )
+    def counting_loads(value, *args, **kwargs):
+        nonlocal decoded_trades
+        if isinstance(value, str) and "gross_return_pips_adverse_first" in value:
+            decoded_trades += 1
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(atlas_module.json, "loads", counting_loads)
     output = tmp_path / "out"
     build_atlas([source], output, PROFILE, registry, spool_dir=tmp_path / "spool")
     assert _rows(output / "cost-robustness.csv")[0]["trade_count"] == "2000"
+    assert decoded_trades == len(trades)
     assert list((tmp_path / "spool").iterdir()) == []
+
+
+def test_fused_cell_metrics_match_previous_implementation(tmp_path):
+    trades = [
+        _trade("third", gross=-3),
+        _trade("first", gross=-2),
+        _trade("second", gross=7),
+    ]
+    for row, day in zip(trades, (3, 1, 2), strict=True):
+        row["_timestamp"] = f"2024-02-{day:02d}T10:00:00+00:00"
+    output, _, _ = _run(tmp_path, trades)
+    rows = [
+        row | {"timestamp": datetime.fromisoformat(row["_timestamp"])} for row in trades
+    ]
+    profile = CostProfile.load(PROFILE)
+    actual = {
+        row["cost_scenario"]: row for row in _rows(output / "cost-robustness.csv")
+    }
+    gross = _cell_metrics(
+        rows, [float(row["gross_return_pips_adverse_first"]) for row in rows]
+    )
+    for statistic, slippage in atlas_module.HEADLINE_COSTS:
+        scenario = f"{statistic}+{slippage:g}"
+        expected = _cell_metrics(
+            rows, _scenario_values(rows, profile, statistic, slippage)
+        )
+        for field, value in expected.items():
+            assert actual[scenario][field] == str(value)
+        for field, value in gross.items():
+            assert actual[scenario][f"gross_{field}"] == str(value)

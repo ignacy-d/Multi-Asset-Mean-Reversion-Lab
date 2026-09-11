@@ -21,6 +21,10 @@ minimal join metadata plus complete trades in a temporary SQLite spool. The
 spool is removed on success or failure; `--spool-dir` selects its parent when
 the system temporary filesystem is too small. Progress logs report authenticated
 shards, candidate and trade rows, exact-cell groups, and elapsed time.
+Gross and all four frozen cost-scenario values are calculated once during
+batched ingestion. Exact-cell aggregation then uses one insertion-order numeric
+cursor for performance totals and one narrow chronological cursor for monthly
+and losing-streak statistics; it does not repeatedly decode JSON payloads.
 
 The generated matrices retain setup families, deduplicate correlated variants
 at execution time, aggregate equivalent cross-asset hypotheses, preserve the

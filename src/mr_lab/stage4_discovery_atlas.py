@@ -20,6 +20,7 @@ import tempfile
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
+from fractions import Fraction
 from pathlib import Path
 
 from mr_lab.ornstein_uhlenbeck import frozen_ou_eligibility_spec
@@ -144,7 +145,9 @@ def _manifest_identity(manifest):
     return tuple(_json(manifest.get(field)) for field in fields)
 
 
-def _authenticate_run(records, registry, registry_sha, role, database, run_number):
+def _authenticate_run(
+    records, registry, registry_sha, role, database, run_number, profile
+):
     """Authenticate one complete logical run, never indexes across runs."""
     records.sort(key=lambda item: item[1].get("shard_index", -1))
     reference = records[0][1]
@@ -260,6 +263,24 @@ def _authenticate_run(records, registry, registry_sha, role, database, run_numbe
         for field in ("filter_family", "filter_spec_id", "process_spec_id")
     )
     run_key = _json(_manifest_identity(reference))
+    insert_sql = (
+        "INSERT INTO trades(role, run_key, candidate_id, cell_key, setup_key, "
+        "execution_family, execution_key, hypothesis_key, instrument, session, "
+        "timestamp, gross_pips, benchmark_family, lookback, net_mean, net_p75, "
+        "net_p90, net_p95, module_candidate, payload) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
+    pending = []
+
+    def flush_pending():
+        if not pending:
+            return
+        try:
+            database.executemany(insert_sql, pending)
+        except sqlite3.IntegrityError as error:
+            raise DiscoveryAtlasError("duplicate trade identity") from error
+        pending.clear()
+
     for directory, _manifest in records:
         for row in _jsonl(directory / "trades.jsonl"):
             if not row.get("complete"):
@@ -287,28 +308,35 @@ def _authenticate_run(records, registry, registry_sha, role, database, run_numbe
             setup = cell[: len(SETUP_FIELDS)]
             execution = tuple(row[field] for field in EXECUTION_FIELDS)
             hypothesis = tuple(row.get(field) for field in HYPOTHESIS_FIELDS)
-            try:
-                database.execute(
-                    "INSERT INTO trades(role, run_key, candidate_id, cell_key, "
-                    "setup_key, execution_family, execution_key, hypothesis_key, "
-                    "instrument, module_candidate, payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        role,
-                        run_key,
-                        row["candidate_event_id"],
-                        _json(cell),
-                        _json(setup),
-                        _json(execution),
-                        _json(row["execution_key"]),
-                        _json(hypothesis),
-                        row["instrument"],
-                        int(_module_candidate(row)),
-                        _json(row),
-                    ),
+            scenario_values = [
+                _scenario_values([row], profile, statistic, slippage)[0]
+                for statistic, slippage in HEADLINE_COSTS
+            ]
+            pending.append(
+                (
+                    role,
+                    run_key,
+                    row["candidate_event_id"],
+                    _json(cell),
+                    _json(setup),
+                    _json(execution),
+                    _json(row["execution_key"]),
+                    _json(hypothesis),
+                    row["instrument"],
+                    row["session"],
+                    timestamp,
+                    float(row["gross_return_pips_adverse_first"]),
+                    row["benchmark_family"],
+                    row["lookback"],
+                    *scenario_values,
+                    int(_module_candidate(row)),
+                    _json(row),
                 )
-            except sqlite3.IntegrityError as error:
-                raise DiscoveryAtlasError("duplicate trade identity") from error
+            )
+            if len(pending) == 1000:
+                flush_pending()
             trade_count += 1
+    flush_pending()
     database.commit()
     LOGGER.info(
         "authenticated run %d: shards=%d candidate_rows=%d trade_rows_spooled=%d",
@@ -330,7 +358,9 @@ def _time(value):
     return parsed
 
 
-def _collect(directories, registry, registry_sha, role, database, run_offset=0):
+def _collect(
+    directories, registry, registry_sha, role, database, profile, run_offset=0
+):
     directories = tuple(map(Path, directories))
     for directory in directories:
         _reject_sealed(directory)
@@ -347,7 +377,7 @@ def _collect(directories, registry, registry_sha, role, database, run_offset=0):
     candidates = trades = 0
     for number, records in enumerate(logical.values(), run_offset + 1):
         manifest, run_commitments, run_candidates, run_trades = _authenticate_run(
-            records, registry, registry_sha, role, database, number
+            records, registry, registry_sha, role, database, number, profile
         )
         provenance.add(
             tuple(
@@ -446,7 +476,11 @@ def _create_spool(path):
         "CREATE TABLE trades(seq INTEGER PRIMARY KEY, role TEXT NOT NULL, run_key TEXT NOT NULL, "
         "candidate_id TEXT NOT NULL, cell_key TEXT NOT NULL, setup_key TEXT NOT NULL, "
         "execution_family TEXT NOT NULL, execution_key TEXT NOT NULL, hypothesis_key TEXT NOT NULL, "
-        "instrument TEXT NOT NULL, module_candidate INTEGER NOT NULL, payload TEXT NOT NULL, "
+        "instrument TEXT NOT NULL, session TEXT NOT NULL, timestamp TEXT NOT NULL, "
+        "gross_pips REAL NOT NULL, benchmark_family TEXT NOT NULL, lookback NOT NULL, "
+        "net_mean REAL NOT NULL, net_p75 REAL NOT NULL, net_p90 REAL NOT NULL, "
+        "net_p95 REAL NOT NULL, "
+        "module_candidate INTEGER NOT NULL, payload TEXT NOT NULL, "
         "UNIQUE(role, run_key, candidate_id, cell_key))"
     )
     database.execute("CREATE INDEX trades_cell ON trades(role, cell_key)")
@@ -462,78 +496,108 @@ def _create_spool(path):
     return database
 
 
-def _spooled_rows(database, where, parameters=()):
-    for (payload,) in database.execute(
-        f"SELECT payload FROM trades WHERE {where} ORDER BY seq", parameters
-    ):
-        row = json.loads(payload)
-        row["timestamp"] = datetime.fromisoformat(row["timestamp"])
-        row["execution_key"] = tuple(row["execution_key"])
-        yield row
+class _ExactFloatSum:
+    """Incremental, correctly rounded equivalent of ``math.fsum`` for finite values."""
+
+    def __init__(self):
+        self.numerator = 0
+        self.exponent = 0
+
+    def add(self, value):
+        numerator, denominator = float(value).as_integer_ratio()
+        exponent = denominator.bit_length() - 1
+        if exponent > self.exponent:
+            self.numerator <<= exponent - self.exponent
+            self.exponent = exponent
+        self.numerator += numerator << (self.exponent - exponent)
+
+    def value(self):
+        return float(Fraction(self.numerator, 1 << self.exponent))
 
 
-def _spooled_metrics(database, cell_key, profile, statistic=None, slippage=0.0):
-    """Compute one exact cell using repeatable cursor passes, never a row list."""
+def _spooled_cell_metrics(database, cell_key):
+    """Return gross and all headline metrics with one numeric row pass.
 
-    def observations(order="seq"):
-        query = (
-            "SELECT payload FROM trades WHERE role='evidence' AND cell_key=? "
-            f"ORDER BY {order}"
-        )
-        for (payload,) in database.execute(query, (cell_key,)):
-            row = json.loads(payload)
-            gross = float(row["gross_return_pips_adverse_first"])
-            if statistic is None:
-                value = gross
-            else:
-                spread, commission = profile.costs(
-                    row["instrument"], row["session"], statistic
-                )
-                value = net_pips(gross, row["instrument"], spread, slippage, commission)
-            yield row, value
+    A second narrow, chronologically ordered cursor preserves the historical
+    monthly-total and losing-streak order without reading or decoding payloads.
+    """
+    scenarios = ("gross", *(statistic for statistic, _ in HEADLINE_COSTS))
+    states = {
+        name: {
+            "exact_sum": _ExactFloatSum(),
+            "total": 0.0,
+            "gains": 0.0,
+            "losses": 0.0,
+            "wins": 0,
+            "monthly": defaultdict(float),
+            "observed": set(),
+            "streak": 0,
+            "longest": 0,
+        }
+        for name in scenarios
+    }
+    count = 0
+    query = (
+        "SELECT gross_pips, net_mean, net_p75, net_p90, net_p95 FROM trades "
+        "WHERE role='evidence' AND cell_key=? ORDER BY seq"
+    )
+    for row in database.execute(query, (cell_key,)):
+        count += 1
+        for name, value in zip(scenarios, row, strict=True):
+            state = states[name]
+            state["exact_sum"].add(value)
+            state["total"] += value
+            if value > 0:
+                state["gains"] += value
+                state["wins"] += 1
+            elif value < 0:
+                state["losses"] -= value
 
-    count = database.execute(
-        "SELECT COUNT(*) FROM trades WHERE role='evidence' AND cell_key=?",
-        (cell_key,),
-    ).fetchone()[0]
+    chronological = (
+        "SELECT gross_pips, net_mean, net_p75, net_p90, net_p95, timestamp "
+        "FROM trades "
+        "WHERE role='evidence' AND cell_key=? ORDER BY timestamp, candidate_id"
+    )
+    for row in database.execute(chronological, (cell_key,)):
+        month = datetime.fromisoformat(row[5]).month
+        for name, value in zip(scenarios, row[:5], strict=True):
+            state = states[name]
+            state["monthly"][month] += value
+            state["observed"].add(month)
+            state["streak"] = state["streak"] + 1 if value < 0 else 0
+            state["longest"] = max(state["longest"], state["streak"])
+
     candidate_count = database.execute(
         "SELECT COUNT(DISTINCT candidate_id) FROM trades "
         "WHERE role='evidence' AND cell_key=?",
         (cell_key,),
     ).fetchone()[0]
-    expectancy = statistics.fmean(value for _, value in observations())
-    total = sum(value for _, value in observations())
-    gains = sum(value for _, value in observations() if value > 0)
-    losses = -sum(value for _, value in observations() if value < 0)
-    wins = sum(value > 0 for _, value in observations())
-    monthly, observed = defaultdict(float), set()
-    streak = longest = 0
-    for row, value in observations(
-        "json_extract(payload, '$.timestamp'), candidate_id"
-    ):
-        month = datetime.fromisoformat(row["timestamp"]).month
-        monthly[month] += value
-        observed.add(month)
-        streak = streak + 1 if value < 0 else 0
-        longest = max(longest, streak)
-    month_values = [monthly.get(month, 0.0) for month in range(1, 13)]
-    return {
-        "trade_count": count,
-        "trades_per_month": count / 12,
-        "candidate_count": candidate_count,
-        "expectancy": expectancy,
-        "total_pips": total,
-        "profit_factor": gains / losses if losses else (math.inf if gains else 0.0),
-        "win_rate": wins / count,
-        "positive_months": sum(monthly[m] > 0 for m in observed),
-        "negative_months": sum(monthly[m] < 0 for m in observed),
-        "no_trade_months": 12 - len(observed),
-        "worst_month": min(month_values),
-        "best_month": max(month_values),
-        "monthly_mean": statistics.fmean(month_values),
-        "monthly_standard_deviation": statistics.pstdev(month_values),
-        "max_losing_streak": longest,
-    }
+    results = {}
+    for name in scenarios:
+        state = states[name]
+        monthly = state["monthly"]
+        observed = state["observed"]
+        month_values = [monthly.get(month, 0.0) for month in range(1, 13)]
+        losses = state["losses"]
+        gains = state["gains"]
+        results[name] = {
+            "trade_count": count,
+            "trades_per_month": count / 12,
+            "candidate_count": candidate_count,
+            "expectancy": state["exact_sum"].value() / count,
+            "total_pips": state["total"],
+            "profit_factor": gains / losses if losses else (math.inf if gains else 0.0),
+            "win_rate": state["wins"] / count,
+            "positive_months": sum(monthly[m] > 0 for m in observed),
+            "negative_months": sum(monthly[m] < 0 for m in observed),
+            "no_trade_months": 12 - len(observed),
+            "worst_month": min(month_values),
+            "best_month": max(month_values),
+            "monthly_mean": statistics.fmean(month_values),
+            "monthly_standard_deviation": statistics.pstdev(month_values),
+            "max_losing_streak": state["longest"],
+        }
+    return results
 
 
 def build_atlas(
@@ -562,7 +626,14 @@ def build_atlas(
         database = _create_spool(Path(temporary) / "atlas.sqlite3")
         try:
             commitments, evidence_provenance, candidate_count, trade_count, runs = (
-                _collect(stage4b_dirs, registry, registry_sha, "evidence", database)
+                _collect(
+                    stage4b_dirs,
+                    registry,
+                    registry_sha,
+                    "evidence",
+                    database,
+                    profile,
+                )
             )
             (
                 module_commitments,
@@ -577,6 +648,7 @@ def build_atlas(
                     registry_sha,
                     "module_a",
                     database,
+                    profile,
                     runs,
                 )
                 if module_a_dirs
@@ -616,12 +688,11 @@ def build_atlas(
             cost_rows, cell_results = [], {}
             for position, encoded_key in enumerate(cell_keys, 1):
                 key = tuple(json.loads(encoded_key))
-                gross_metrics = _spooled_metrics(database, encoded_key, profile)
+                metric_bundle = _spooled_cell_metrics(database, encoded_key)
+                gross_metrics = metric_bundle["gross"]
                 for statistic, slippage in HEADLINE_COSTS:
-                    metrics = _spooled_metrics(
-                        database, encoded_key, profile, statistic, slippage
-                    )
                     scenario = f"{statistic}+{slippage:g}"
+                    metrics = metric_bundle[statistic]
                     cell_results[(encoded_key, scenario)] = metrics
                     cost_rows.append(
                         dict(zip(CELL_FIELDS, key, strict=True))
