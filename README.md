@@ -12,8 +12,20 @@ uv run mr-lab-stage4-discovery-atlas \
   --stage4b-dir results/stage4b/EURUSD/shard-0 \
   --stage4b-dir results/stage4b/EURUSD/shard-1 \
   --module-a-dir results/stage4b-module-a/EURUSD/shard-0 \
+  --spool-dir /tmp/mr-lab-atlas-spool \
   --output-dir results/stage4-discovery-atlas
 ```
+
+The atlas authenticates candidate and trade JSONL as streams and stores only
+the normalized metadata and numeric values required by its outputs in a
+temporary SQLite spool; raw serialized trade payloads are not retained. The
+spool is removed on success or failure; `--spool-dir` selects its parent when
+the system temporary filesystem is too small. Progress logs report authenticated
+shards, candidate and trade rows, exact-cell groups, and elapsed time.
+Gross and all four frozen cost-scenario values are calculated once during
+batched ingestion. Exact-cell aggregation then uses one insertion-order numeric
+cursor for performance totals and one narrow chronological cursor for monthly
+and losing-streak statistics.
 
 The generated matrices retain setup families, deduplicate correlated variants
 at execution time, aggregate equivalent cross-asset hypotheses, preserve the
