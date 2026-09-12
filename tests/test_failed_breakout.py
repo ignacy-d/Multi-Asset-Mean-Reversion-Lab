@@ -131,7 +131,7 @@ def test_upper_breakout_reclaim_emits_short_event():
         _bar(2, close=1.1008, high=1.1012, low=1.1002),
         _bar(3, close=1.0997, high=1.1009, low=1.0995),
     )
-    event = detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.10))[0]
+    event = detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.05))[0]
     assert event.direction is Direction.SHORT
     assert event.minutes_to_reclaim == 2
     assert event.outside_close_count == 2
@@ -154,7 +154,7 @@ def test_lower_breakout_reclaim_emits_long_event():
         _bar(1, close=1.0990, high=1.1002, low=1.0985),
         _bar(2, close=1.1003, high=1.1005, low=1.0989),
     )
-    event = detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.10))[0]
+    event = detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.05))[0]
     assert event.direction is Direction.LONG
     assert event.minutes_to_reclaim == 1
 
@@ -175,7 +175,7 @@ def test_insufficient_breakout_depth_does_not_emit():
         _bar(1, close=1.1002, high=1.1004, low=1.0999),
         _bar(2, close=1.0999),
     )
-    assert detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.10)) == ()
+    assert detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.05)) == ()
 
 
 def test_reclaim_after_window_is_rejected():
@@ -196,10 +196,64 @@ def test_reclaim_after_window_is_rejected():
     )
     assert (
         detect_failed_breakouts(
-            bars, (level,), FailedBreakoutSpec(0.10, reclaim_window_minutes=30)
+            bars, (level,), FailedBreakoutSpec(0.05, reclaim_window_minutes=30)
         )
         == ()
     )
+
+
+def test_reclaim_exactly_at_30_minute_deadline_is_included():
+    level = StructuralLevel(
+        "EURUSD",
+        "pdh",
+        "pdh-pdl",
+        UPPER,
+        1.1000,
+        0.0100,
+        datetime(2024, 1, 2, 8, 0, tzinfo=UTC),
+        datetime(2024, 1, 2, 10, 0, tzinfo=UTC),
+    )
+    bars = tuple(
+        [_bar(0, close=1.0995), _bar(1, close=1.1010, high=1.1015)]
+        + [_bar(minute, close=1.1005) for minute in range(2, 31)]
+        + [_bar(31, close=1.0998)]
+    )
+
+    event = detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.05))[0]
+
+    assert event.minutes_to_reclaim == 30
+
+
+def test_level_rearms_after_completed_reclaim_without_duplicate_event():
+    level = StructuralLevel(
+        "EURUSD",
+        "pdh",
+        "pdh-pdl",
+        UPPER,
+        1.1000,
+        0.0100,
+        datetime(2024, 1, 2, 8, 0, tzinfo=UTC),
+        datetime(2024, 1, 2, 10, 0, tzinfo=UTC),
+    )
+    bars = (
+        _bar(0, close=1.0995),
+        _bar(1, close=1.1010, high=1.1015),
+        _bar(2, close=1.0998),
+        _bar(3, close=1.1010, high=1.1015),
+        _bar(4, close=1.0998),
+    )
+
+    events = detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.05))
+
+    assert len(events) == 2
+    assert len({event.candidate_event_id for event in events}) == 2
+
+
+def test_detector_spec_rejects_non_preregistered_grid_values():
+    with pytest.raises(ValueError, match="preregistered grid"):
+        FailedBreakoutSpec(0.10)
+    with pytest.raises(ValueError, match="frozen at 30"):
+        FailedBreakoutSpec(0.05, reclaim_window_minutes=15)
 
 
 def test_gap_cancels_episode_fail_closed():
@@ -218,7 +272,7 @@ def test_gap_cancels_episode_fail_closed():
         _bar(1, close=1.1011, high=1.1015, low=1.1001),
         _bar(3, close=1.0998),
     )
-    assert detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.10)) == ()
+    assert detect_failed_breakouts(bars, (level,), FailedBreakoutSpec(0.05)) == ()
 
 
 def test_future_bars_do_not_change_prefix_events():
@@ -242,7 +296,7 @@ def test_future_bars_do_not_change_prefix_events():
         _bar(3, close=1.1001, high=1.1003, low=1.0995),
         _bar(4, close=1.0995),
     )
-    spec = FailedBreakoutSpec(0.10)
+    spec = FailedBreakoutSpec(0.05)
     prefix_events = detect_failed_breakouts(prefix, (level,), spec)
     complete_events = detect_failed_breakouts(complete, (level,), spec)
     assert prefix_events == complete_events[: len(prefix_events)]

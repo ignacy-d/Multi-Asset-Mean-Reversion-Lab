@@ -83,3 +83,37 @@ The 50% threshold is an architecture/research triage rule, not a profitability t
 Do not promote on one best cell. Promote only if the family shows a broad, interpretable pattern with adequate event count, at least two instruments with meaningful samples, non-negative median aggregate directional outcome, positive aggregate mean at the primary horizon, and no single instrument or quarter dominating the effect.
 
 If sample size is inadequate, classify as inconclusive rather than lowering thresholds after observing results.
+
+## Stage-0 execution and outputs
+
+The deterministic runner consumes only the five authenticated 2024 registry
+entries and expects one established offline-corpus directory per instrument:
+
+```bash
+uv run mr-lab-failed-breakout-stage0 \
+  --corpus-root /path/to/frozen-2024-corpora \
+  --output-dir results/failed-breakout-stage0 \
+  --registry configs/stage4a-2024-corpus-registry.json
+```
+
+It generates structural levels and both depth cells, measures exact-clock
+15/30/60/120-minute signed outcomes through the common Stage 4A M1 path
+semantics, records MFE/MAE, and compares distinct signal clocks with the existing
+frozen OU Module A candidates at exact, 15, 30, and 60-minute windows. The
+runner emits deterministic event JSONL, the complete anchor/depth/instrument
+matrix (including zero-event cells), metrics and overlap JSON, a report, and a
+hash-bearing summary.
+
+The Stage-0 triage floors are declared in code rather than inferred from output:
+100 aggregate events with exact 60-minute outcomes, at least 20 events in each
+of at least two instruments, positive aggregate mean, non-negative aggregate
+median, positive replication in at least two instruments, positive behavior in
+both preregistered depth cells, no instrument above 60% of events, and no quarter
+above 50%. Samples below the event/outcome floor are `INCONCLUSIVE`; adequately
+sampled evidence that misses promotion criteria is `KILL`. Independence remains
+a separate label based on the preregistered 50% unique-at-30-minutes rule.
+
+Exact coverage of the prior UTC day remains a deliberate fail-closed part of
+the frozen scale definition. This may reduce usable anchors around weekends or
+provider gaps; coverage and zero-event cells must be reported rather than
+silently substituting a different scale after observing results.

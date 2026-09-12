@@ -116,16 +116,13 @@ class FailedBreakoutSpec:
             isinstance(self.minimum_depth_fraction, bool)
             or not isinstance(self.minimum_depth_fraction, int | float)
             or not math.isfinite(self.minimum_depth_fraction)
-            or self.minimum_depth_fraction <= 0
+            or self.minimum_depth_fraction not in PREREGISTERED_MINIMUM_DEPTHS
         ):
             raise FailedBreakoutError(
-                "minimum_depth_fraction must be finite and positive"
+                "minimum_depth_fraction must be in the preregistered grid"
             )
-        if (
-            type(self.reclaim_window_minutes) is not int
-            or self.reclaim_window_minutes < 1
-        ):
-            raise FailedBreakoutError("reclaim_window_minutes must be positive")
+        if self.reclaim_window_minutes != 30:
+            raise FailedBreakoutError("reclaim_window_minutes is frozen at 30")
         if self.specification_version != FAILED_BREAKOUT_SPEC_VERSION:
             raise FailedBreakoutError("unsupported failed-breakout specification")
 
