@@ -1,21 +1,19 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from mr_lab.data import Bar, PriceBasis, Timeframe, VolumeSemantics, resample_bars
-from mr_lab.ornstein_uhlenbeck import (
-    FrozenOuEligibilityFilter,
-    ResidualObservation,
-    build_candidate_ou_states,
-    candidate_process_keys,
-    frozen_ou_eligibility_spec,
+from mr_lab.replay import (
+    FrozenOuReplayEngine,
+    IncrementalResampler,
+    build_frozen_ou_decisions,
 )
-from mr_lab.replay import FrozenOuReplayEngine, IncrementalResampler
 from mr_lab.replay.engine import ReplayError
 from mr_lab.replay.parity import ParityError, compare_event_streams
 from mr_lab.research import Direction
 from mr_lab.signals import AlphaSignal
-from mr_lab.stage4b import SignalState, deduplicate_states
+from mr_lab.stage4b import SignalState
 from mr_lab.vwap_benchmark import VwapStrategySpec
 
 START = datetime(2024, 2, 1, tzinfo=UTC)
@@ -47,10 +45,10 @@ def m1_bars(count=15 * 135, missing=frozenset()):
     return tuple(bars)
 
 
-def state_builder(bars):
+def state_builder(prefix):
     spec_id = VwapStrategySpec(20, 2.0).strategy_spec_id
     states = []
-    for index, bar in enumerate(bars):
+    for index, bar in enumerate(prefix.completed_m15):
         # A deterministic synthetic residual series.  Both prices and the
         # candidate decision use only the current completed prefix.
         residual = 0.0007 + 0.0001 * ((index % 11) - 5) + index * 0.0000001
@@ -74,57 +72,6 @@ def state_builder(bars):
             )
         )
     return tuple(states)
-
-
-def reference_signals(states):
-    spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
-    candidates = deduplicate_states(states)
-    ou_states = build_candidate_ou_states(
-        states, spec.process_spec, candidate_process_keys(candidates)
-    )
-    index = {(state.process_id, state.available_at): state for state in ou_states}
-    gate = FrozenOuEligibilityFilter(spec, ou_states)
-    output = []
-    for candidate in candidates:
-        signal = candidate.signal
-        observation = ResidualObservation(
-            signal.instrument,
-            signal.benchmark_family,
-            signal.signal_timeframe,
-            signal.session,
-            signal.lookback,
-            signal.strategy_spec_id,
-            signal.signal_timestamp,
-            signal.p0,
-            signal.e0,
-        )
-        state = index[(observation.process_id, signal.signal_timestamp)]
-        decision = gate.evaluate(candidate)
-        metadata = dict(decision.metadata)
-        output.append(
-            AlphaSignal(
-                candidate.candidate_event_id,
-                signal.signal_timestamp,
-                signal.instrument,
-                signal.direction.name,
-                signal.benchmark_family,
-                signal.lookback,
-                signal.p0,
-                signal.e0,
-                signal.normalized_deviation,
-                state.process_id,
-                state.process_spec_id,
-                state.status,
-                state.is_structurally_valid,
-                state.invalid_reason,
-                state.ornstein_uhlenbeck_score,
-                state.half_life_minutes,
-                decision.eligible,
-                metadata["eligibility_reason"],
-                decision.filter_spec_id,
-            )
-        )
-    return tuple(output)
 
 
 def test_incremental_m1_to_m15_exactly_equals_batch():
@@ -167,28 +114,64 @@ def test_duplicate_and_out_of_order_are_rejected():
 def test_replay_exact_identity_ou_eligibility_and_rearm_parity():
     bars = m1_bars()
     batch_m15 = resample_bars(bars, Timeframe("15m")).bars
-    expected = reference_signals(state_builder(batch_m15))
+    from mr_lab.replay.engine import ReplayPrefix
+
+    expected = build_frozen_ou_decisions(
+        state_builder(ReplayPrefix(bars, batch_m15, batch_m15[-1].available_at))
+    )
     actual = FrozenOuReplayEngine(state_builder).run(bars)
     report = compare_event_streams(expected, actual)
     assert report.passed and report.mismatch_count == 0
     assert report.reference_event_count == report.replay_event_count == 2
-    assert [x.source_event_id for x in actual] == [x.source_event_id for x in expected]
-    assert [x.process_status for x in actual] == [x.process_status for x in expected]
-    assert [x.eligible for x in actual] == [x.eligible for x in expected]
+    assert [x.signal.source_event_id for x in actual] == [
+        x.signal.source_event_id for x in expected
+    ]
+    assert [x.details.process_status for x in actual] == [
+        x.details.process_status for x in expected
+    ]
+    assert [x.details.eligible for x in actual] == [
+        x.details.eligible for x in expected
+    ]
 
 
 def test_parity_fails_on_first_field_mismatch_with_compact_categories():
     bars = m1_bars()
-    signal = FrozenOuReplayEngine(state_builder).run(bars)[0]
-    changed = AlphaSignal(
-        "changed",
-        *tuple(
-            getattr(signal, field)
-            for field in signal.__dataclass_fields__
-            if field != "source_event_id"
-        ),
-    )
+    record = FrozenOuReplayEngine(state_builder).run(bars)[0]
+    changed = replace(record, signal=replace(record.signal, source_event_id="changed"))
     with pytest.raises(ParityError) as exc:
-        compare_event_streams((signal,), (changed,))
-    assert exc.value.report.first_mismatch.field == "source_event_id"
+        compare_event_streams((record,), (changed,))
+    assert exc.value.report.first_mismatch.field == "signal.source_event_id"
     assert exc.value.report.identity_mismatches == 1
+
+
+def test_generic_alpha_signal_does_not_require_ou_fields():
+    signal = AlphaSignal("bollinger-v1", "event-1", "EURUSD", START, "LONG")
+    assert signal.module_id == "bollinger-v1" and signal.reference is None
+    with pytest.raises(ValueError, match="source_event_id"):
+        AlphaSignal("bollinger-v1", "", "EURUSD", START, "LONG")
+
+
+def test_builder_receives_exact_causal_m1_and_m15_prefixes():
+    bars = m1_bars(30)
+    observed = []
+
+    def capture(prefix):
+        observed.append(prefix)
+        return ()
+
+    FrozenOuReplayEngine(capture).run(bars)
+    assert [len(prefix.completed_m1) for prefix in observed] == [15, 30]
+    assert [len(prefix.completed_m15) for prefix in observed] == [1, 2]
+    assert all(
+        prefix.completed_m1[-1].available_at == prefix.available_at
+        for prefix in observed
+    )
+
+
+def test_future_builder_state_is_rejected():
+    def future(prefix):
+        state = state_builder(prefix)[-1]
+        return (replace(state, timestamp=prefix.available_at + timedelta(minutes=15)),)
+
+    with pytest.raises(ReplayError, match="future information"):
+        FrozenOuReplayEngine(future).run(m1_bars(15))

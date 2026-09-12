@@ -178,39 +178,7 @@ def assemble_signal_states(dataset, manifest):
         observations = build_research_observations(
             resample_bars(dataset.bars, timeframe).bars, DEFAULT_SESSION_SPEC
         )
-        for lookback in LOOKBACKS:
-            native = build_vwap_features(observations, DEFAULT_SESSION_SPEC, lookback)
-            canonical = build_canonical_m1_vwap_features(
-                m1, observations, DEFAULT_SESSION_SPEC, lookback
-            )
-            for family, features, spec in (
-                (
-                    "vwap",
-                    native,
-                    VwapStrategySpec(lookback, SIGNAL_THRESHOLD).strategy_spec_id,
-                ),
-                (
-                    "vwap-canonical-m1",
-                    canonical,
-                    VwapRobustnessStrategySpec(
-                        lookback, SIGNAL_THRESHOLD, CANONICAL_M1
-                    ).strategy_spec_id,
-                ),
-            ):
-                for feature in features:
-                    states.extend(
-                        _two_sides(
-                            feature,
-                            family,
-                            feature.anchor_session,
-                            lookback,
-                            feature.vwap_deviation_z,
-                            feature.vwap,
-                            manifest,
-                            spec,
-                            vwap_direction,
-                        )
-                    )
+        states.extend(assemble_vwap_signal_states(m1, observations, manifest))
         for lookback in LOOKBACKS:
             spec = BollingerStrategySpec(lookback, SIGNAL_THRESHOLD).strategy_spec_id
             for feature in build_bollinger_features(observations, lookback):
@@ -237,6 +205,45 @@ def assemble_signal_states(dataset, manifest):
                             bollinger_direction,
                         )
                     )
+    return tuple(states)
+
+
+def assemble_vwap_signal_states(m1_observations, observations, manifest):
+    """Shared native and canonical-M1 VWAP state assembly for one timeframe."""
+    states = []
+    for lookback in LOOKBACKS:
+        native = build_vwap_features(observations, DEFAULT_SESSION_SPEC, lookback)
+        canonical = build_canonical_m1_vwap_features(
+            m1_observations, observations, DEFAULT_SESSION_SPEC, lookback
+        )
+        for family, features, spec in (
+            (
+                "vwap",
+                native,
+                VwapStrategySpec(lookback, SIGNAL_THRESHOLD).strategy_spec_id,
+            ),
+            (
+                "vwap-canonical-m1",
+                canonical,
+                VwapRobustnessStrategySpec(
+                    lookback, SIGNAL_THRESHOLD, CANONICAL_M1
+                ).strategy_spec_id,
+            ),
+        ):
+            for feature in features:
+                states.extend(
+                    _two_sides(
+                        feature,
+                        family,
+                        feature.anchor_session,
+                        lookback,
+                        feature.vwap_deviation_z,
+                        feature.vwap,
+                        manifest,
+                        spec,
+                        vwap_direction,
+                    )
+                )
     return tuple(states)
 
 
