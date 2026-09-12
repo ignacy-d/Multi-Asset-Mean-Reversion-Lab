@@ -65,6 +65,15 @@ For each anchor/depth cell and instrument, measure common discovery outcomes at 
 
 Primary family horizon: 60 minutes.
 
+Anchor-specific detections remain raw structural events for the anchor/depth
+matrix. Family evidence deduplicates simultaneous signals by `(instrument,
+signal_timestamp, direction)`. All contributing anchor families and levels
+remain in the raw event artifact; coincident anchors do not create independent
+family samples. Reports label `raw_structural_event_count`,
+`unique_family_opportunity_count`, and `unique_global_signal_clocks` separately.
+Depth aggregates apply the same family-opportunity deduplication within each
+depth before measuring the parameter plateau.
+
 ## Orthogonality test against Module A
 
 Measure timestamp overlap with frozen Module A at:
@@ -73,6 +82,11 @@ Measure timestamp overlap with frozen Module A at:
 - +/-15 minutes,
 - +/-30 minutes,
 - +/-60 minutes.
+
+The frozen Module A reference exposed to this runner is instrument and clock
+based. Therefore overlap compares each direction-specific Failed Breakout family
+opportunity with Module A clocks for the same instrument, without claiming that
+the Module A direction also matches. Module A itself is not modified.
 
 Operational interpretation before Stage 1:
 

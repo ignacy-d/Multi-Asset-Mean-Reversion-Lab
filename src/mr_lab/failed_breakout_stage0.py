@@ -17,6 +17,7 @@ from mr_lab.failed_breakout import (
     PREREGISTERED_MINIMUM_DEPTHS,
     FailedBreakoutEvent,
 )
+from mr_lab.research import Direction
 from mr_lab.stage4a import DirectionalPathDiagnostic
 
 FORWARD_HORIZONS = (15, 30, 60, 120)
@@ -89,7 +90,7 @@ def _quarter(timestamp: datetime) -> str:
     return f"{timestamp.year}-Q{(timestamp.month - 1) // 3 + 1}"
 
 
-def _physical_key(item: FailedBreakoutObservation) -> tuple[object, ...]:
+def _raw_structural_key(item: FailedBreakoutObservation) -> tuple[object, ...]:
     event = item.event
     return (
         event.instrument,
@@ -101,9 +102,44 @@ def _physical_key(item: FailedBreakoutObservation) -> tuple[object, ...]:
     )
 
 
+def _family_opportunity_key(
+    item: FailedBreakoutObservation,
+) -> tuple[str, datetime, Direction]:
+    event = item.event
+    return event.instrument, event.signal_timestamp, event.direction
+
+
+def _deduplicate_family_opportunities(
+    items: Iterable[FailedBreakoutObservation],
+) -> tuple[FailedBreakoutObservation, ...]:
+    """Select one deterministic path per actionable family opportunity."""
+    selected: dict[tuple[str, datetime, Direction], FailedBreakoutObservation] = {}
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            item.event.instrument,
+            item.event.signal_timestamp,
+            item.event.direction.name,
+            item.event.anchor_family,
+            item.event.level_id,
+            item.event.candidate_event_id,
+        ),
+    )
+    for item in ordered:
+        key = _family_opportunity_key(item)
+        existing = selected.get(key)
+        if existing is not None and existing.path != item.path:
+            raise FailedBreakoutStage0Error(
+                "colliding anchor events must have identical family outcome paths"
+            )
+        selected.setdefault(key, item)
+    return tuple(selected.values())
+
+
 def _aggregate(items: Sequence[FailedBreakoutObservation]) -> dict[str, object]:
     timestamps = {item.event.signal_timestamp for item in items}
-    physical = {_physical_key(item) for item in items}
+    raw_structural = {_raw_structural_key(item) for item in items}
+    family_opportunities = {_family_opportunity_key(item) for item in items}
     months = sorted({timestamp.strftime("%Y-%m") for timestamp in timestamps})
     counts_by_month = {
         month: sum(
@@ -120,8 +156,8 @@ def _aggregate(items: Sequence[FailedBreakoutObservation]) -> dict[str, object]:
         for quarter in sorted({_quarter(item.event.signal_timestamp) for item in items})
     }
     row: dict[str, object] = {
-        "event_count": len(items),
-        "unique_physical_opportunities": len(physical),
+        "raw_structural_event_count": len(raw_structural),
+        "unique_family_opportunity_count": len(family_opportunities),
         "unique_global_signal_clocks": len(timestamps),
         "events_per_month": counts_by_month,
         "active_months": len(months),
@@ -226,12 +262,13 @@ def aggregate_observations(
                     | _aggregate(selected)
                 )
     for depth in PREREGISTERED_MINIMUM_DEPTHS:
-        depth_selected = tuple(
-            {
-                _physical_key(item): item
-                for item in items
-                if item.minimum_depth_fraction == depth
-            }.values()
+        raw_depth = tuple(
+            item for item in items if item.minimum_depth_fraction == depth
+        )
+        depth_selected = _deduplicate_family_opportunities(raw_depth)
+        depth_metrics = _aggregate(depth_selected)
+        depth_metrics["raw_structural_event_count"] = len(
+            {_raw_structural_key(item) for item in raw_depth}
         )
         rows.append(
             {
@@ -241,11 +278,29 @@ def aggregate_observations(
                 "minimum_depth_fraction": depth,
                 "instrument": None,
             }
-            | _aggregate(depth_selected)
+            | depth_metrics
         )
-    physical: dict[tuple[object, ...], FailedBreakoutObservation] = {}
-    for item in items:
-        physical.setdefault(_physical_key(item), item)
+    family_opportunities = _deduplicate_family_opportunities(items)
+    family_metrics = _aggregate(family_opportunities)
+    raw_structural = {
+        _raw_structural_key(item): item
+        for item in sorted(
+            items,
+            key=lambda item: (
+                item.minimum_depth_fraction,
+                item.event.candidate_event_id,
+            ),
+        )
+    }
+    family_metrics["raw_structural_event_count"] = len(raw_structural)
+    family_metrics["contributing_anchor_event_counts"] = {
+        anchor: sum(
+            item.event.anchor_family == anchor for item in raw_structural.values()
+        )
+        for anchor in sorted(
+            {item.event.anchor_family for item in raw_structural.values()}
+        )
+    }
     rows.append(
         {
             "scope": "family",
@@ -254,7 +309,7 @@ def aggregate_observations(
             "minimum_depth_fraction": None,
             "instrument": None,
         }
-        | _aggregate(tuple(physical.values()))
+        | family_metrics
     )
     return tuple(rows)
 
@@ -268,10 +323,10 @@ def calculate_overlap(
     module_by_instrument: dict[str, set[datetime]] = defaultdict(set)
     for reference in module_a:
         module_by_instrument[reference.instrument].add(reference.signal_timestamp)
-    scopes: list[tuple[str, str | None, str | None, set[tuple[str, datetime]]]] = []
-    all_keys = {
-        (item.event.instrument, item.event.signal_timestamp) for item in observations
-    }
+    scopes: list[
+        tuple[str, str | None, str | None, set[tuple[str, datetime, Direction]]]
+    ] = []
+    all_keys = {_family_opportunity_key(item) for item in observations}
     scopes.append(("aggregate", None, None, all_keys))
     for instrument in sorted({item.event.instrument for item in observations}):
         scopes.append(
@@ -284,7 +339,7 @@ def calculate_overlap(
         )
     for anchor in sorted({item.event.anchor_family for item in observations}):
         keys = {
-            (item.event.instrument, item.event.signal_timestamp)
+            _family_opportunity_key(item)
             for item in observations
             if item.event.anchor_family == anchor
         }
@@ -295,7 +350,7 @@ def calculate_overlap(
             "scope": scope,
             "instrument": scope_instrument,
             "anchor_family": scope_anchor,
-            "failed_breakout_physical_opportunity_count": len(keys),
+            "failed_breakout_family_opportunity_count": len(keys),
         }
         for window in OVERLAP_WINDOWS:
             overlap = sum(
@@ -303,7 +358,7 @@ def calculate_overlap(
                     abs((candidate - timestamp).total_seconds()) <= window * 60
                     for candidate in module_by_instrument[name]
                 )
-                for name, timestamp in keys
+                for name, timestamp, _direction in keys
             )
             row |= {
                 f"overlap_count_w{window}": overlap,
@@ -321,7 +376,7 @@ def calculate_overlap(
 def classify_family(rows, overlap_rows) -> dict[str, str]:
     family = next(row for row in rows if row["scope"] == "family")
     depth_rows = [row for row in rows if row["scope"] == "depth"]
-    count = int(family["event_count"])
+    count = int(family["unique_family_opportunity_count"])
     meaningful = [
         count
         for count in family["instrument_event_counts"].values()
@@ -370,9 +425,11 @@ def render_report(rows, overlap_rows, classification, *, execution_status: str) 
         "## A. Family summary",
         "",
         f"- Execution status: **{execution_status}**",
-        f"- Event observations: {family['event_count']}",
-        f"- Unique physical opportunities: {family['unique_physical_opportunities']}",
+        f"- Raw structural events: {family['raw_structural_event_count']}",
+        f"- Unique family opportunities: {family['unique_family_opportunity_count']}",
         f"- Unique global signal clocks: {family['unique_global_signal_clocks']}",
+        "- Contributing raw anchor events: "
+        f"{json.dumps(family['contributing_anchor_event_counts'], sort_keys=True)}",
         "",
         "## OBSERVED RESULT",
         "",
@@ -538,7 +595,8 @@ def write_outputs(
             }
             for row in rows
         ]
-        writer = csv.DictWriter(stream, fieldnames=list(flat[0]))
+        fieldnames = sorted({field for row in flat for field in row})
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(flat)
     paths["metrics.json"].write_text(
@@ -560,7 +618,10 @@ def write_outputs(
             {
                 "schema_version": STAGE0_SCHEMA_VERSION,
                 "execution_status": execution_status,
-                "event_count": family["event_count"],
+                "raw_structural_event_count": family["raw_structural_event_count"],
+                "unique_family_opportunity_count": family[
+                    "unique_family_opportunity_count"
+                ],
                 "grid_observation_count": len(ordered),
                 "classification": classification,
                 "hashes": hashes,

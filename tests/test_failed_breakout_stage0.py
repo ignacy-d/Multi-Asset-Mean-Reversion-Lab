@@ -196,14 +196,14 @@ def test_overlap_windows_deduplicate_timestamps_and_isolate_instruments():
         if row["scope"] == "instrument" and row["instrument"] == "EURUSD"
     )
 
-    assert aggregate["failed_breakout_physical_opportunity_count"] == 3
+    assert aggregate["failed_breakout_family_opportunity_count"] == 3
     assert [aggregate[f"overlap_count_w{window}"] for window in (0, 15, 30, 60)] == [
         1,
         1,
         2,
         2,
     ]
-    assert eurusd["failed_breakout_physical_opportunity_count"] == 2
+    assert eurusd["failed_breakout_family_opportunity_count"] == 2
     assert eurusd["overlap_count_w30"] == 2
 
 
@@ -219,10 +219,12 @@ def test_parameter_month_quarter_aggregation_and_all_cells():
     assert family["active_months"] == 2
     assert set(family["monthly_expectancy_h60"]) == {"2024-01", "2024-04"}
     assert set(family["quarterly_expectancy_h60"]) == {"2024-Q1", "2024-Q2"}
-    assert any(row["event_count"] == 0 for row in rows if row["scope"] == "cell")
+    assert any(
+        row["raw_structural_event_count"] == 0 for row in rows if row["scope"] == "cell"
+    )
 
 
-def test_family_distinguishes_physical_opportunities_from_global_clocks():
+def test_family_distinguishes_opportunities_from_global_clocks():
     rows = aggregate_observations(
         (
             _observation(instrument="EURUSD", suffix="eur"),
@@ -232,8 +234,44 @@ def test_family_distinguishes_physical_opportunities_from_global_clocks():
     )
     family = next(row for row in rows if row["scope"] == "family")
 
-    assert family["unique_physical_opportunities"] == 2
+    assert family["unique_family_opportunity_count"] == 2
     assert family["unique_global_signal_clocks"] == 1
+
+
+def test_anchor_collisions_count_once_at_family_and_depth_but_remain_diagnostic():
+    observations = tuple(
+        _observation(anchor=anchor, suffix=anchor)
+        for anchor in ("previous-day", "asia-session", "london-or60")
+    )
+
+    rows = aggregate_observations(observations, ("EURUSD",))
+    family = next(row for row in rows if row["scope"] == "family")
+    depth = next(
+        row
+        for row in rows
+        if row["scope"] == "depth" and row["minimum_depth_fraction"] == 0.05
+    )
+    populated_anchor_cells = [
+        row
+        for row in rows
+        if row["scope"] == "cell" and row["raw_structural_event_count"] == 1
+    ]
+
+    assert family["raw_structural_event_count"] == 3
+    assert family["unique_family_opportunity_count"] == 1
+    assert family["n_h60"] == 1
+    assert (
+        family["forward_pips_h60_mean"]
+        == observations[0].path.horizons[2].signed_return_pips
+    )
+    assert family["contributing_anchor_event_counts"] == {
+        "asia-session": 1,
+        "london-or60": 1,
+        "previous-day": 1,
+    }
+    assert depth["raw_structural_event_count"] == 3
+    assert depth["unique_family_opportunity_count"] == 1
+    assert len(populated_anchor_cells) == 3
 
 
 def test_depth_plateau_uses_all_observations_not_unweighted_cell_means():
@@ -271,7 +309,7 @@ def test_depth_plateau_uses_all_observations_not_unweighted_cell_means():
     cell_means = [
         row["forward_pips_h60_mean"]
         for row in rows
-        if row["scope"] == "cell" and row["event_count"]
+        if row["scope"] == "cell" and row["raw_structural_event_count"]
     ]
 
     assert sum(cell_means) / len(cell_means) == pytest.approx(-2.0)
@@ -288,7 +326,9 @@ def test_report_outputs_are_byte_deterministic(tmp_path):
     for name in first:
         assert first[name].read_bytes() == second[name].read_bytes()
     summary = json.loads(first["summary.json"].read_text())
-    assert summary["event_count"] == summary["grid_observation_count"] == 1
+    assert summary["raw_structural_event_count"] == 1
+    assert summary["unique_family_opportunity_count"] == 1
+    assert summary["grid_observation_count"] == 1
     assert summary["classification"]["family_classification"] == "INCONCLUSIVE"
     report = first["report.md"].read_text()
     assert "## OBSERVED RESULT" in report
