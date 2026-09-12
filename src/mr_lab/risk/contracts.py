@@ -7,7 +7,12 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from mr_lab.portfolio.contracts import require_text, require_utc
+from mr_lab.portfolio.contracts import (
+    PlanReference,
+    ProposalProvenance,
+    require_text,
+    require_utc,
+)
 
 
 def require_finite(name: str, value: Decimal, *, positive: bool = False) -> None:
@@ -137,6 +142,9 @@ class RiskRequest:
     direction: str
     timestamp: datetime
     strategy_policy_id: str
+    entry_plan: PlanReference
+    protective_plan: PlanReference
+    proposal_provenance: ProposalProvenance
     protective_boundary: ProtectiveBoundary
     factor_tags: tuple[str, ...] = ()
 
@@ -216,6 +224,7 @@ class RiskDecision:
     policy_version: str
     sizing_context_id: str
     sizing_context_version: str
+    decided_at: datetime
 
     def __post_init__(self) -> None:
         for name in (
@@ -239,6 +248,7 @@ class RiskDecision:
             require_finite(name, value)
             if value < 0:
                 raise ValueError(f"{name} cannot be negative")
+        require_utc("decided_at", self.decided_at)
         if self.decision is RiskDecisionState.ACCEPT and (
             self.approved_monetary_risk <= 0 or self.approved_quantity <= 0
         ):
@@ -267,9 +277,13 @@ class SizedExecutionIntent:
     direction: str
     quantity: Decimal
     strategy_policy_id: str
+    entry_plan: PlanReference
+    protective_plan: PlanReference
+    proposal_provenance: ProposalProvenance
     risk_specification_id: str
     protective_boundary: ProtectiveBoundary
-    timestamp: datetime
+    proposal_timestamp: datetime
+    approved_at: datetime
     factor_tags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -286,5 +300,6 @@ class SizedExecutionIntent:
             require_text(name, getattr(self, name))
         require_direction(self.direction)
         require_finite("quantity", self.quantity, positive=True)
-        require_utc("timestamp", self.timestamp)
+        require_utc("proposal_timestamp", self.proposal_timestamp)
+        require_utc("approved_at", self.approved_at)
         self.protective_boundary.validate_for(self.direction)

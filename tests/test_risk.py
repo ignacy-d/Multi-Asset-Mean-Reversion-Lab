@@ -213,6 +213,47 @@ def test_complete_batch_is_order_invariant_and_joint_limit_is_enforced():
     )  # explicit lower priority value wins
 
 
+def test_equal_priority_group_is_atomic_when_capacity_cannot_fit_every_request():
+    first = request(proposal(suffix="first"))
+    second = request(proposal(instrument="GBPUSD", suffix="second"))
+    first_context = context(first)
+    second_context = context(second)
+    kernel = RiskKernel(policy(aggregate="0.015"))
+
+    forward = kernel.evaluate(
+        (first, second), account(), (first_context, second_context)
+    )
+    reverse = kernel.evaluate(
+        (second, first), account(), (second_context, first_context)
+    )
+    assert forward == reverse
+    assert {item.decision for item in forward} == {RiskDecisionState.DEFER}
+    assert {item.reason for item in forward} == {
+        "equal-priority candidates contend for insufficient risk capacity"
+    }
+
+    renamed_first = replace(first, risk_request_id="zzz")
+    renamed_second = replace(second, risk_request_id="aaa")
+    renamed = kernel.evaluate(
+        (renamed_first, renamed_second),
+        account(),
+        (
+            replace(first_context, risk_request_id="zzz"),
+            replace(second_context, risk_request_id="aaa"),
+        ),
+    )
+    assert {item.decision for item in renamed} == {RiskDecisionState.DEFER}
+
+
+def test_equal_priority_group_accepts_all_when_capacity_fits():
+    first = request(proposal(suffix="first"))
+    second = request(proposal(instrument="GBPUSD", suffix="second"))
+    decisions = RiskKernel(policy(aggregate="0.03")).evaluate(
+        (second, first), account(), (context(second), context(first))
+    )
+    assert all(item.decision is RiskDecisionState.ACCEPT for item in decisions)
+
+
 def test_same_instrument_requests_use_independent_request_specific_contexts():
     mr = request(proposal(direction="SHORT", suffix="mr"), protective="1.1050")
     trend = request(proposal("trend", "EURUSD", "SHORT", "trend"), protective="1.1120")
@@ -355,6 +396,62 @@ def test_duplicate_restart_processing_and_ids_are_deterministic():
             account(),
             (context(req),),
         )
+
+
+def test_strategy_plans_survive_into_execution_intent_and_affect_identity():
+    item = proposal()
+    req = request(item)
+    decision = RiskKernel(policy()).evaluate((req,), account(), (context(req),))[0]
+    intent = build_execution_intent(req, decision)
+    assert req.entry_plan == item.entry_plan == intent.entry_plan
+    assert req.protective_plan == item.protective_plan == intent.protective_plan
+    assert intent.proposal_provenance == item.provenance
+
+    changed_entry = request(
+        replace(item, entry_plan=PlanReference("reference", "entry-v2"))
+    )
+    changed_protection = request(
+        replace(
+            item,
+            protective_plan=PlanReference("invalidation", "protect-v2"),
+        )
+    )
+    entry_decision = RiskKernel(policy()).evaluate(
+        (changed_entry,), account(), (context(changed_entry),)
+    )[0]
+    protection_decision = RiskKernel(policy()).evaluate(
+        (changed_protection,), account(), (context(changed_protection),)
+    )[0]
+    assert (
+        intent.execution_intent_id
+        != build_execution_intent(changed_entry, entry_decision).execution_intent_id
+    )
+    assert (
+        intent.execution_intent_id
+        != build_execution_intent(
+            changed_protection, protection_decision
+        ).execution_intent_id
+    )
+
+
+def test_risk_approval_time_is_snapshot_time_and_changes_downstream_identity():
+    req = request()
+    kernel = RiskKernel(policy())
+    snapshot = account()
+    first = kernel.evaluate((req,), snapshot, (context(req),))[0]
+    restarted = kernel.evaluate((req,), snapshot, (context(req),))[0]
+    first_intent = build_execution_intent(req, first)
+    assert first == restarted
+    assert first.decided_at == snapshot.timestamp
+    assert first_intent.proposal_timestamp == req.timestamp
+    assert first_intent.approved_at == snapshot.timestamp
+
+    later_snapshot = replace(snapshot, timestamp=NOW + timedelta(seconds=1))
+    later = kernel.evaluate((req,), later_snapshot, (context(req),))[0]
+    later_intent = build_execution_intent(req, later)
+    assert later.decided_at == later_snapshot.timestamp
+    assert later.risk_decision_id != first.risk_decision_id
+    assert later_intent.execution_intent_id != first_intent.execution_intent_id
 
 
 def test_economic_changes_propagate_through_stable_identities():

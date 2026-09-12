@@ -50,6 +50,9 @@ def build_risk_request(
         proposal.direction,
         proposal.timestamp,
         proposal.strategy_policy_id,
+        proposal.entry_plan,
+        proposal.protective_plan,
+        proposal.provenance,
         protective_boundary.entry_price,
         protective_boundary.protective_price,
         protective_boundary.risk_specification_id,
@@ -65,6 +68,9 @@ def build_risk_request(
         proposal.direction,
         proposal.timestamp,
         proposal.strategy_policy_id,
+        proposal.entry_plan,
+        proposal.protective_plan,
+        proposal.provenance,
         protective_boundary,
         tuple(sorted(factor_tags)),
     )
@@ -95,78 +101,134 @@ class RiskKernel:
         )
         accepted_total = Decimal(0)
         accepted_count = 0
-        ordered = sorted(
-            candidates,
-            key=lambda item: (
-                (
-                    self.policy.sleeve(item.sleeve_id).priority
-                    if self.policy.sleeve(item.sleeve_id)
-                    else 2**31
-                ),
-                item.risk_request_id,
-            ),
-        )
+        groups: dict[int, list[RiskRequest]] = {}
+        for item in candidates:
+            limit = self.policy.sleeve(item.sleeve_id)
+            groups.setdefault(limit.priority if limit else 2**31, []).append(item)
         decisions: list[RiskDecision] = []
-        for request in ordered:
-            context = contexts.get(request.risk_request_id)
-            state, reason, monetary, fraction, quantity = self._assess(
-                request,
-                context,
+        for priority in sorted(groups):
+            assessments = []
+            for request in groups[priority]:
+                context = contexts.get(request.risk_request_id)
+                result = self._assess(
+                    request,
+                    context,
+                    account,
+                    existing_total + accepted_total,
+                    sleeve_used,
+                    accepted_count,
+                    aggregate_cap,
+                )
+                assessments.append((request, context, result))
+            accepted = [
+                item for item in assessments if item[2][0] is RiskDecisionState.ACCEPT
+            ]
+            if len(accepted) > 1 and self._tie_group_contends(
+                tuple(item[0] for item in accepted),
                 account,
                 existing_total + accepted_total,
                 sleeve_used,
                 accepted_count,
                 aggregate_cap,
-            )
-            context_id = context.sizing_context_id if context else "unavailable"
-            context_version = context.version if context else "unavailable"
-            decision_id = stable_id(
-                "risk-decision",
-                request.risk_request_id,
-                self.policy.policy_id,
-                self.policy.policy_version,
-                account.timestamp,
-                account.account_currency,
-                account.balance,
-                account.equity,
-                account.reference_balance,
-                account.realized_pnl,
-                account.unrealized_pnl,
-                account.loss_limit_state,
-                tuple(
-                    sorted(account.open_exposures, key=lambda item: item.exposure_id)
-                ),
-                context,
-                state,
-                reason,
-                monetary,
-                fraction,
-                quantity,
-            )
-            decisions.append(
-                RiskDecision(
-                    decision_id,
-                    request.risk_request_id,
-                    request.portfolio_decision_id,
-                    request.proposal_id,
-                    state,
-                    monetary,
-                    fraction,
-                    quantity,
-                    reason,
-                    self.policy.policy_id,
-                    self.policy.policy_version,
-                    context_id,
-                    context_version,
+            ):
+                zero = Decimal(0)
+                deferred = (
+                    RiskDecisionState.DEFER,
+                    "equal-priority candidates contend for insufficient risk capacity",
+                    zero,
+                    zero,
+                    zero,
                 )
-            )
-            if state is RiskDecisionState.ACCEPT:
-                accepted_total += monetary
-                sleeve_used[request.sleeve_id] = (
-                    sleeve_used.get(request.sleeve_id, Decimal(0)) + monetary
-                )
-                accepted_count += 1
+                accepted_ids = {item[0].risk_request_id for item in accepted}
+                assessments = [
+                    (
+                        request,
+                        context,
+                        deferred if request.risk_request_id in accepted_ids else result,
+                    )
+                    for request, context, result in assessments
+                ]
+            for request, context, result in assessments:
+                decisions.append(self._decision(request, context, account, result))
+                state, _, monetary, _, _ = result
+                if state is RiskDecisionState.ACCEPT:
+                    accepted_total += monetary
+                    sleeve_used[request.sleeve_id] = (
+                        sleeve_used.get(request.sleeve_id, Decimal(0)) + monetary
+                    )
+                    accepted_count += 1
         return tuple(sorted(decisions, key=lambda item: item.risk_request_id))
+
+    def _decision(self, request, context, account, result):
+        state, reason, monetary, fraction, quantity = result
+        context_id = context.sizing_context_id if context else "unavailable"
+        context_version = context.version if context else "unavailable"
+        decision_id = stable_id(
+            "risk-decision",
+            request.risk_request_id,
+            self.policy.policy_id,
+            self.policy.policy_version,
+            account,
+            context,
+            state,
+            reason,
+            monetary,
+            fraction,
+            quantity,
+        )
+        return RiskDecision(
+            decision_id,
+            request.risk_request_id,
+            request.portfolio_decision_id,
+            request.proposal_id,
+            state,
+            monetary,
+            fraction,
+            quantity,
+            reason,
+            self.policy.policy_id,
+            self.policy.policy_version,
+            context_id,
+            context_version,
+            account.timestamp,
+        )
+
+    def _tie_group_contends(
+        self, requests, account, used_total, sleeve_used, accepted_count, aggregate_cap
+    ):
+        desired_by_sleeve: dict[str, Decimal] = {}
+        desired_total = Decimal(0)
+        for request in requests:
+            desired = (
+                account.equity
+                * self.policy.sleeve(request.sleeve_id).risk_fraction_per_trade
+            )
+            desired_total += desired
+            desired_by_sleeve[request.sleeve_id] = (
+                desired_by_sleeve.get(request.sleeve_id, Decimal(0)) + desired
+            )
+        if (
+            self.policy.maximum_new_positions is not None
+            and accepted_count + len(requests) > self.policy.maximum_new_positions
+        ):
+            return True
+        if used_total + desired_total > aggregate_cap:
+            return True
+        for sleeve_id, desired in desired_by_sleeve.items():
+            limit = self.policy.sleeve(sleeve_id)
+            if sleeve_used.get(sleeve_id, Decimal(0)) + desired > (
+                account.equity * limit.maximum_open_risk_fraction
+            ):
+                return True
+        loss_limits = account.loss_limit_state
+        worst_case_equity = account.equity - used_total - desired_total
+        return loss_limits is not None and any(
+            floor is not None and worst_case_equity < floor
+            for floor in (
+                loss_limits.total_equity_floor,
+                loss_limits.daily_equity_floor,
+            )
+        )
 
     def _assess(
         self,
@@ -347,8 +409,12 @@ def build_execution_intent(
         request.direction,
         decision.approved_quantity,
         request.strategy_policy_id,
+        request.entry_plan,
+        request.protective_plan,
+        request.proposal_provenance,
         request.protective_boundary,
         request.timestamp,
+        decision.decided_at,
     )
     return SizedExecutionIntent(
         intent_id,
@@ -360,8 +426,12 @@ def build_execution_intent(
         request.direction,
         decision.approved_quantity,
         request.strategy_policy_id,
+        request.entry_plan,
+        request.protective_plan,
+        request.proposal_provenance,
         request.protective_boundary.risk_specification_id,
         request.protective_boundary,
         request.timestamp,
+        decision.decided_at,
         request.factor_tags,
     )
