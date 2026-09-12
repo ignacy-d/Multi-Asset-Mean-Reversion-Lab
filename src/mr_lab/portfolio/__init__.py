@@ -14,6 +14,7 @@ from mr_lab.portfolio.kernel import (
     PolicyResult,
     PortfolioKernel,
     PortfolioPolicy,
+    PortfolioPolicyInvariantError,
 )
 from mr_lab.portfolio.opportunity import OpportunityEngine, OpportunityInvariantError
 from mr_lab.portfolio.planning import build_trade_proposal
@@ -37,6 +38,7 @@ __all__ = [
     "PortfolioDecisionState",
     "PortfolioKernel",
     "PortfolioPolicy",
+    "PortfolioPolicyInvariantError",
     "ProposalProvenance",
     "RegistryInvariantError",
     "TradeProposal",

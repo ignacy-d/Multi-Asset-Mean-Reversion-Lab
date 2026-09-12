@@ -25,6 +25,8 @@ def build_trade_proposal(
     proposal_id = stable_id(
         "proposal",
         opportunity.opportunity_id,
+        opportunity.instrument,
+        opportunity.direction,
         opportunity.timestamp,
         strategy_policy_id,
         entry_plan.kind,

@@ -14,6 +14,7 @@ from mr_lab.portfolio import (
     PolicyResult,
     PortfolioDecisionState,
     PortfolioKernel,
+    PortfolioPolicyInvariantError,
     ProposalProvenance,
     RegistryInvariantError,
     build_trade_proposal,
@@ -58,8 +59,41 @@ class AcceptFixturePolicy:
     policy_id = "fixture-accept"
     policy_version = "1"
 
-    def evaluate(self, proposal):
-        return PolicyResult(PortfolioDecisionState.ACCEPT, "accepted by fixture")
+    def evaluate(self, proposals):
+        return tuple(
+            PolicyResult(
+                item.proposal_id,
+                PortfolioDecisionState.ACCEPT,
+                "accepted by fixture",
+            )
+            for item in proposals
+        )
+
+
+class CrossSleeveConflictPolicy:
+    policy_id = "fixture-cross-sleeve-conflict"
+    policy_version = "1"
+
+    def evaluate(self, proposals):
+        has_mean_reversion = any(
+            item.sleeve_id == "mean-reversion" for item in proposals
+        )
+        return tuple(
+            PolicyResult(
+                item.proposal_id,
+                (
+                    PortfolioDecisionState.DEFER
+                    if item.sleeve_id == "trend" and has_mean_reversion
+                    else PortfolioDecisionState.ACCEPT
+                ),
+                (
+                    "deferred for simultaneous mean-reversion candidate"
+                    if item.sleeve_id == "trend" and has_mean_reversion
+                    else "accepted by cross-sleeve fixture"
+                ),
+            )
+            for item in proposals
+        )
 
 
 def proposal(opportunity):
@@ -163,6 +197,76 @@ def test_input_order_restart_and_all_downstream_ids_are_deterministic():
     assert first_proposals == restarted_proposals
     kernel = PortfolioKernel(AcceptFixturePolicy())
     assert kernel.evaluate(first_proposals) == kernel.evaluate(restarted_proposals)
+
+
+def test_batch_policy_observes_siblings_and_is_input_order_invariant():
+    opportunities = OpportunityEngine(registry()).build(
+        (
+            signal("mr-ou-v1", "mr-short", "SHORT"),
+            signal("trend-test-v1", "trend-long", "LONG"),
+        )
+    )
+    proposals = tuple(proposal(item) for item in opportunities)
+
+    forward = PortfolioKernel(CrossSleeveConflictPolicy()).evaluate(proposals)
+    reverse = PortfolioKernel(CrossSleeveConflictPolicy()).evaluate(
+        tuple(reversed(proposals))
+    )
+
+    assert forward == reverse
+    by_sleeve = {decision.sleeve_id: decision.decision for decision in forward}
+    assert by_sleeve == {
+        "mean-reversion": PortfolioDecisionState.ACCEPT,
+        "trend": PortfolioDecisionState.DEFER,
+    }
+    trend_only = next(item for item in proposals if item.sleeve_id == "trend")
+    assert (
+        PortfolioKernel(CrossSleeveConflictPolicy()).evaluate((trend_only,))[0].decision
+        is PortfolioDecisionState.ACCEPT
+    )
+
+
+def test_policy_must_return_one_result_for_every_candidate():
+    candidate = proposal(
+        OpportunityEngine(registry()).build((signal("macro-test-v1", "event"),))[0]
+    )
+
+    class MissingResultPolicy:
+        policy_id = "invalid-missing"
+        policy_version = "1"
+
+        def evaluate(self, proposals):
+            return ()
+
+    with pytest.raises(PortfolioPolicyInvariantError, match="exactly one"):
+        PortfolioKernel(MissingResultPolicy()).evaluate((candidate,))
+
+    class DuplicateResultPolicy:
+        policy_id = "invalid-duplicate"
+        policy_version = "1"
+
+        def evaluate(self, proposals):
+            result = PolicyResult(
+                proposals[0].proposal_id,
+                PortfolioDecisionState.ACCEPT,
+                "duplicate",
+            )
+            return (result, result)
+
+    with pytest.raises(PortfolioPolicyInvariantError, match="duplicate"):
+        PortfolioKernel(DuplicateResultPolicy()).evaluate((candidate,))
+
+
+def test_proposal_identity_includes_economic_direction():
+    opportunity = OpportunityEngine(registry()).build(
+        (signal("trend-test-v1", "direction-event", "LONG"),)
+    )[0]
+    long_proposal = proposal(opportunity)
+    short_proposal = proposal(replace(opportunity, direction="SHORT"))
+
+    assert long_proposal.opportunity_id == short_proposal.opportunity_id
+    assert long_proposal.proposal_id != short_proposal.proposal_id
+    assert long_proposal.proposal_id == proposal(opportunity).proposal_id
 
 
 @pytest.mark.parametrize("module", ["trend-test-v1", "macro-test-v1"])
