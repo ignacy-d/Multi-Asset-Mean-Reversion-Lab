@@ -21,8 +21,9 @@ Generation consumes immutable canonical M1 `Bar` values, requires exact minute
 coverage for each construction window, and never fills missing observations.
 
 Each level records explicit `available_at` and `expires_at` UTC instants. The
-previous-day pair becomes available only after the complete prior UTC day and
-expires at the next UTC midnight. The Asia pair becomes available at the
+previous-day pair is the prior completed 17:00-to-17:00 America/New_York FX
+trading day, becomes available at its closing boundary, and expires at the next
+FX-day boundary. The Asia pair becomes available at the
 historical session close and expires at the next Asia open. London OR60 becomes
 available only after all first-60-minute bars are complete and expires at that
 London session's close. Session boundaries use the existing versioned IANA
@@ -30,11 +31,13 @@ timezone session specification, including historical DST.
 
 ## Frozen normalization
 
-Every anchor uses the same pre-event scale: the high-low range of the immediately
-preceding complete UTC day. That day must have exact M1 coverage, the range must
-be positive, and every contributing bar must already be available. Otherwise the
-anchor fails closed. This definition is intentionally independent from VWAP,
-z-scores, and OU state and is not selected from observed results.
+Every anchor uses the same pre-event scale: the high-low range of the most recent
+completed 17:00-to-17:00 America/New_York FX trading day. Historical IANA
+timezone rules determine both boundaries. The FX day must have exact M1
+coverage, the range must be positive, and every contributing bar must already
+be available. Otherwise the anchor fails closed. This definition is
+intentionally independent from VWAP, z-scores, and OU state and is not selected
+from observed results.
 
 ## Detector grid
 
@@ -107,13 +110,15 @@ hash-bearing summary.
 The Stage-0 triage floors are declared in code rather than inferred from output:
 100 aggregate events with exact 60-minute outcomes, at least 20 events in each
 of at least two instruments, positive aggregate mean, non-negative aggregate
-median, positive replication in at least two instruments, positive behavior in
-both preregistered depth cells, no instrument above 60% of events, and no quarter
+median, positive replication in at least two instruments, positive aggregate
+expectancy across all physical observations in each preregistered depth cell,
+no instrument above 60% of events, and no quarter
 above 50%. Samples below the event/outcome floor are `INCONCLUSIVE`; adequately
 sampled evidence that misses promotion criteria is `KILL`. Independence remains
 a separate label based on the preregistered 50% unique-at-30-minutes rule.
 
-Exact coverage of the prior UTC day remains a deliberate fail-closed part of
-the frozen scale definition. This may reduce usable anchors around weekends or
-provider gaps; coverage and zero-event cells must be reported rather than
-silently substituting a different scale after observing results.
+Exact coverage of the previous completed FX trading day remains a deliberate
+fail-closed part of the frozen scale definition. Closed weekend intervals are
+skipped rather than treated as trading days, while incomplete open-market days
+cannot supply a scale. Coverage and zero-event cells must be reported rather
+than silently substituting a different scale after observing results.

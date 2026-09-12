@@ -89,8 +89,21 @@ def _quarter(timestamp: datetime) -> str:
     return f"{timestamp.year}-Q{(timestamp.month - 1) // 3 + 1}"
 
 
+def _physical_key(item: FailedBreakoutObservation) -> tuple[object, ...]:
+    event = item.event
+    return (
+        event.instrument,
+        event.anchor_family,
+        event.level_id,
+        event.breakout_timestamp,
+        event.reclaim_timestamp,
+        event.direction,
+    )
+
+
 def _aggregate(items: Sequence[FailedBreakoutObservation]) -> dict[str, object]:
     timestamps = {item.event.signal_timestamp for item in items}
+    physical = {_physical_key(item) for item in items}
     months = sorted({timestamp.strftime("%Y-%m") for timestamp in timestamps})
     counts_by_month = {
         month: sum(
@@ -108,7 +121,8 @@ def _aggregate(items: Sequence[FailedBreakoutObservation]) -> dict[str, object]:
     }
     row: dict[str, object] = {
         "event_count": len(items),
-        "unique_event_timestamps": len(timestamps),
+        "unique_physical_opportunities": len(physical),
+        "unique_global_signal_clocks": len(timestamps),
         "events_per_month": counts_by_month,
         "active_months": len(months),
         "instrument_event_counts": counts_by_instrument,
@@ -211,18 +225,27 @@ def aggregate_observations(
                     }
                     | _aggregate(selected)
                 )
+    for depth in PREREGISTERED_MINIMUM_DEPTHS:
+        depth_selected = tuple(
+            {
+                _physical_key(item): item
+                for item in items
+                if item.minimum_depth_fraction == depth
+            }.values()
+        )
+        rows.append(
+            {
+                "scope": "depth",
+                "family": FAILED_BREAKOUT_FAMILY,
+                "anchor_family": None,
+                "minimum_depth_fraction": depth,
+                "instrument": None,
+            }
+            | _aggregate(depth_selected)
+        )
     physical: dict[tuple[object, ...], FailedBreakoutObservation] = {}
     for item in items:
-        event = item.event
-        key = (
-            event.instrument,
-            event.anchor_family,
-            event.level_id,
-            event.breakout_timestamp,
-            event.reclaim_timestamp,
-            event.direction,
-        )
-        physical.setdefault(key, item)
+        physical.setdefault(_physical_key(item), item)
     rows.append(
         {
             "scope": "family",
@@ -267,12 +290,12 @@ def calculate_overlap(
         }
         scopes.append(("anchor", None, anchor, keys))
     rows = []
-    for scope, scope_instrument, anchor, keys in scopes:
+    for scope, scope_instrument, scope_anchor, keys in scopes:
         row: dict[str, object] = {
             "scope": scope,
             "instrument": scope_instrument,
-            "anchor_family": anchor,
-            "failed_breakout_count": len(keys),
+            "anchor_family": scope_anchor,
+            "failed_breakout_physical_opportunity_count": len(keys),
         }
         for window in OVERLAP_WINDOWS:
             overlap = sum(
@@ -285,8 +308,9 @@ def calculate_overlap(
             row |= {
                 f"overlap_count_w{window}": overlap,
                 f"overlap_percentage_w{window}": overlap / len(keys) if keys else None,
-                f"unique_count_w{window}": len(keys) - overlap,
-                f"unique_percentage_w{window}": (len(keys) - overlap) / len(keys)
+                f"unique_to_module_a_count_w{window}": len(keys) - overlap,
+                f"unique_to_module_a_percentage_w{window}": (len(keys) - overlap)
+                / len(keys)
                 if keys
                 else None,
             }
@@ -296,7 +320,7 @@ def calculate_overlap(
 
 def classify_family(rows, overlap_rows) -> dict[str, str]:
     family = next(row for row in rows if row["scope"] == "family")
-    cells = [row for row in rows if row["scope"] == "cell"]
+    depth_rows = [row for row in rows if row["scope"] == "depth"]
     count = int(family["event_count"])
     meaningful = [
         count
@@ -305,15 +329,7 @@ def classify_family(rows, overlap_rows) -> dict[str, str]:
     ]
     primary_mean = family["forward_pips_h60_mean"]
     primary_median = family["forward_pips_h60_median"]
-    depth_means = []
-    for depth in PREREGISTERED_MINIMUM_DEPTHS:
-        values = [
-            row["forward_pips_h60_mean"]
-            for row in cells
-            if row["minimum_depth_fraction"] == depth
-            and row["forward_pips_h60_mean"] is not None
-        ]
-        depth_means.append(_mean(values))
+    depth_means = [row["forward_pips_h60_mean"] for row in depth_rows]
     evidence = (
         count >= MIN_AGGREGATE_EVENTS
         and family["n_h60"] >= MIN_AGGREGATE_EVENTS
@@ -331,7 +347,7 @@ def classify_family(rows, overlap_rows) -> dict[str, str]:
     adequate = count >= MIN_AGGREGATE_EVENTS and family["n_h60"] >= MIN_AGGREGATE_EVENTS
     classification = "PASS" if evidence else "KILL" if adequate else "INCONCLUSIVE"
     aggregate_overlap = next(row for row in overlap_rows if row["scope"] == "aggregate")
-    unique = aggregate_overlap["unique_percentage_w30"]
+    unique = aggregate_overlap["unique_to_module_a_percentage_w30"]
     if unique is None or not adequate:
         independence = "INSUFFICIENT EVIDENCE"
     elif unique >= 0.5 and evidence:
@@ -355,7 +371,8 @@ def render_report(rows, overlap_rows, classification, *, execution_status: str) 
         "",
         f"- Execution status: **{execution_status}**",
         f"- Event observations: {family['event_count']}",
-        f"- Unique timestamps: {family['unique_event_timestamps']}",
+        f"- Unique physical opportunities: {family['unique_physical_opportunities']}",
+        f"- Unique global signal clocks: {family['unique_global_signal_clocks']}",
         "",
         "## OBSERVED RESULT",
         "",
@@ -422,7 +439,8 @@ def render_report(rows, overlap_rows, classification, *, execution_status: str) 
             f"- {row['scope']} {row['instrument'] or row['anchor_family'] or 'all'}: "
             + ", ".join(
                 f"±{window}m overlap={row[f'overlap_count_w{window}']}, "
-                f"unique={row[f'unique_percentage_w{window}']}"
+                "unique to Module A="
+                f"{row[f'unique_to_module_a_percentage_w{window}']}"
                 for window in OVERLAP_WINDOWS
             )
         )
@@ -431,7 +449,7 @@ def render_report(rows, overlap_rows, classification, *, execution_status: str) 
         lines.append(
             f"- {row['scope']} {row['instrument'] or row['anchor_family'] or 'all'}: "
             + ", ".join(
-                f"±{window}m={row[f'unique_percentage_w{window}']}"
+                f"±{window}m={row[f'unique_to_module_a_percentage_w{window}']}"
                 for window in OVERLAP_WINDOWS
             )
         )

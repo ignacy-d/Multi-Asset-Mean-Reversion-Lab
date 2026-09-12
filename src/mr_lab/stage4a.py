@@ -380,7 +380,13 @@ def _diagnose_directional_request(request, by_time, horizons, path_minutes):
     p0 = request.p0
     if signal_timestamp.tzinfo is None or signal_timestamp.utcoffset() != timedelta(0):
         raise EventPathError("signal_timestamp must be timezone-aware UTC")
-    if not isinstance(direction, Direction) or not math.isfinite(p0):
+    if (
+        not isinstance(direction, Direction)
+        or isinstance(p0, bool)
+        or not isinstance(p0, int | float)
+        or not math.isfinite(p0)
+        or p0 <= 0
+    ):
         raise EventPathError("direction and p0 must be valid")
     if (
         type(path_minutes) is not int
@@ -561,11 +567,11 @@ def _diagnose_event_from_index(
         max_reversion,
         mae,
         scale(mae, pip_size),
-        scale(mae, signal.p0) * 10_000 if mae is not None else None,
+        mae / signal.p0 * 10_000 if mae is not None else None,
         scale(mae, abs(signal.d0)),
         mfe,
         scale(mfe, pip_size),
-        scale(mfe, signal.p0) * 10_000 if mfe is not None else None,
+        mfe / signal.p0 * 10_000 if mfe is not None else None,
         scale(mfe, abs(signal.d0)),
         mae_time,
         mfe_time,

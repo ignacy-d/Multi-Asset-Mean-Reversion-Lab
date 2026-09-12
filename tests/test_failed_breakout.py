@@ -58,9 +58,20 @@ def _history(start, minutes):
 
 
 def test_structural_levels_are_causal_complete_and_use_one_pre_event_scale():
-    bars = _history(datetime(2024, 1, 2, tzinfo=UTC), 2 * 24 * 60)
+    bars = _history(datetime(2024, 1, 1, 22, tzinfo=UTC), 3 * 24 * 60)
     levels = generate_structural_levels(bars)
-    day = [level for level in levels if level.level_id.endswith("2024-01-03")]
+    day = [
+        level
+        for level in levels
+        if (
+            level.anchor_family == "previous-day"
+            and level.level_id.endswith("2024-01-02")
+        )
+        or (
+            level.anchor_family != "previous-day"
+            and level.level_id.endswith("2024-01-03")
+        )
+    ]
 
     assert {level.anchor_family for level in day} == {
         "previous-day",
@@ -70,13 +81,15 @@ def test_structural_levels_are_causal_complete_and_use_one_pre_event_scale():
     assert len(day) == 6
     assert len({level.scale for level in day}) == 1
     assert all(level.available_at < level.expires_at for level in day)
-    assert all(level.available_at >= datetime(2024, 1, 3, tzinfo=UTC) for level in day)
+    assert all(
+        level.available_at >= datetime(2024, 1, 2, 22, tzinfo=UTC) for level in day
+    )
 
 
 @pytest.mark.parametrize(("month", "day", "expected_hour"), [(1, 2, 9), (7, 2, 8)])
 def test_london_or60_uses_historical_dst(month, day, expected_hour):
-    start = datetime(2024, month, day - 1, tzinfo=UTC)
-    levels = generate_structural_levels(_history(start, 2 * 24 * 60))
+    start = datetime(2024, month, day - 1, 21, tzinfo=UTC)
+    levels = generate_structural_levels(_history(start, 3 * 24 * 60))
     london = next(
         level
         for level in levels
@@ -86,8 +99,40 @@ def test_london_or60_uses_historical_dst(month, day, expected_hour):
     assert london.available_at.hour == expected_hour
 
 
+@pytest.mark.parametrize(
+    ("start", "level_day", "expected_hour"),
+    (
+        (datetime(2024, 1, 1, 22, tzinfo=UTC), "2024-01-02", 22),
+        (datetime(2024, 7, 1, 21, tzinfo=UTC), "2024-07-02", 21),
+    ),
+)
+def test_previous_fx_day_boundary_uses_new_york_dst(start, level_day, expected_hour):
+    levels = generate_structural_levels(_history(start, 2 * 24 * 60 + 1))
+    pdh = next(
+        level for level in levels if level.level_id == f"previous-day-high-{level_day}"
+    )
+
+    assert pdh.available_at.hour == expected_hour
+    assert pdh.expires_at - pdh.available_at == timedelta(days=1)
+
+
+def test_previous_completed_fx_day_skips_closed_weekend_fail_closed():
+    thursday = _history(datetime(2024, 1, 4, 22, tzinfo=UTC), 24 * 60)
+    sunday = _history(datetime(2024, 1, 7, 22, tzinfo=UTC), 2)
+
+    levels = generate_structural_levels((*thursday, *sunday))
+
+    sunday_pdh = next(
+        level for level in levels if level.level_id == "previous-day-high-2024-01-07"
+    )
+    assert sunday_pdh.price == max(bar.high for bar in thursday)
+    assert sunday_pdh.scale == max(bar.high for bar in thursday) - min(
+        bar.low for bar in thursday
+    )
+
+
 def test_missing_anchor_observation_fails_closed_without_mutating_input():
-    bars = _history(datetime(2024, 1, 2, tzinfo=UTC), 2 * 24 * 60)
+    bars = _history(datetime(2024, 1, 1, 22, tzinfo=UTC), 3 * 24 * 60)
     missing_at = datetime(2024, 1, 3, 0, 30, tzinfo=UTC)
     incomplete = tuple(bar for bar in bars if bar.open_time != missing_at)
     before = tuple(incomplete)
@@ -102,7 +147,7 @@ def test_missing_anchor_observation_fails_closed_without_mutating_input():
 
 
 def test_structural_level_generation_is_prefix_invariant():
-    bars = _history(datetime(2024, 1, 2, tzinfo=UTC), 3 * 24 * 60)
+    bars = _history(datetime(2024, 1, 1, 22, tzinfo=UTC), 4 * 24 * 60)
     cutoff = datetime(2024, 1, 3, 10, tzinfo=UTC)
     prefix = tuple(bar for bar in bars if bar.available_at <= cutoff)
 

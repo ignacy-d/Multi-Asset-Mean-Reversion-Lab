@@ -25,7 +25,9 @@ UPPER = "upper"
 LOWER = "lower"
 SIDES = (UPPER, LOWER)
 PREREGISTERED_MINIMUM_DEPTHS = (0.05, 0.15)
-PRE_EVENT_SCALE = "previous-complete-utc-day-range"
+PRE_EVENT_SCALE = "previous-complete-fx-trading-day-range"
+FX_DAY_TIMEZONE = "America/New_York"
+FX_DAY_BOUNDARY = time(17)
 
 
 class FailedBreakoutError(ValueError):
@@ -75,7 +77,8 @@ class StructuralLevel:
 class StructuralLevelSpec:
     """Configuration for the three preregistered causal anchor families.
 
-    All anchors use the range of the immediately preceding complete UTC day.
+    All anchors use the range of the immediately preceding complete FX trading
+    day, bounded by 17:00 America/New_York on both sides.
     This scale is deliberately simple, fixed before event detection, and
     independent of Module A features.
     """
@@ -252,6 +255,14 @@ def _window_bounds(window: TimeWindow, instance: date) -> tuple[datetime, dateti
     return start.astimezone(UTC), end.astimezone(UTC)
 
 
+def _fx_day_bounds(instance: date) -> tuple[datetime, datetime]:
+    """Map a New York-local FX trading-day start date to canonical UTC."""
+    zone = ZoneInfo(FX_DAY_TIMEZONE)
+    start = datetime.combine(instance, FX_DAY_BOUNDARY, zone)
+    end = datetime.combine(instance + timedelta(days=1), FX_DAY_BOUNDARY, zone)
+    return start.astimezone(UTC), end.astimezone(UTC)
+
+
 def _complete_window(
     by_open: dict[datetime, Bar], start: datetime, end: datetime
 ) -> tuple[Bar, ...] | None:
@@ -325,29 +336,38 @@ def generate_structural_levels(
     if len(by_open) != len(items):
         raise FailedBreakoutError("M1 open timestamps must be unique")
 
-    utc_dates = sorted({bar.open_time.date() for bar in items})
-    daily: dict[date, tuple[Bar, ...]] = {}
-    for day in utc_dates:
-        start = datetime.combine(day, time(), UTC)
-        complete = _complete_window(by_open, start, start + timedelta(days=1))
+    fx_zone = ZoneInfo(FX_DAY_TIMEZONE)
+    local_dates = sorted({bar.open_time.astimezone(fx_zone).date() for bar in items})
+    fx_days: dict[date, tuple[datetime, datetime, tuple[Bar, ...]]] = {}
+    for day in local_dates:
+        start, end = _fx_day_bounds(day)
+        complete = _complete_window(by_open, start, end)
         if complete is not None:
-            daily[day] = complete
+            fx_days[day] = (start, end, complete)
+
+    def previous_fx_day(at: datetime) -> tuple[Bar, ...] | None:
+        completed = [
+            observations for _, end, observations in fx_days.values() if end <= at
+        ]
+        return completed[-1] if completed else None
 
     windows = {window.name: window for window in spec.session_spec.major_sessions}
     asia = windows[spec.asia_session]
     london = windows[spec.london_session]
-    local_dates: set[date] = set()
+    session_dates: set[date] = set()
     for bar in items:
-        local_dates.add(bar.open_time.astimezone(ZoneInfo(asia.timezone)).date())
-        local_dates.add(bar.open_time.astimezone(ZoneInfo(london.timezone)).date())
+        session_dates.add(bar.open_time.astimezone(ZoneInfo(asia.timezone)).date())
+        session_dates.add(bar.open_time.astimezone(ZoneInfo(london.timezone)).date())
 
     levels: list[StructuralLevel] = []
-    for day in utc_dates:
-        previous = daily.get(day - timedelta(days=1))
+    latest_available = items[-1].available_at
+    for day in local_dates:
+        start, end = _fx_day_bounds(day)
+        if start > latest_available:
+            continue
+        previous = previous_fx_day(start)
         if previous is None:
             continue
-        start = datetime.combine(day, time(), UTC)
-        end = start + timedelta(days=1)
         scale = max(bar.high for bar in previous) - min(bar.low for bar in previous)
         if scale <= 0:
             continue
@@ -365,7 +385,7 @@ def generate_structural_levels(
                 )
             )
 
-    for local_day in sorted(local_dates):
+    for local_day in sorted(session_dates):
         for family, window, width in (
             ("asia-session", asia, None),
             ("london-or60", london, spec.london_opening_range_minutes),
@@ -375,7 +395,7 @@ def generate_structural_levels(
                 session_end if width is None else start + timedelta(minutes=width)
             )
             observations = _complete_window(by_open, start, anchor_end)
-            scale_bars = daily.get(start.date() - timedelta(days=1))
+            scale_bars = previous_fx_day(anchor_end)
             if observations is None or scale_bars is None:
                 continue
             scale = max(bar.high for bar in scale_bars) - min(
@@ -539,6 +559,8 @@ def detect_failed_breakouts(
 __all__ = [
     "FAILED_BREAKOUT_FAMILY",
     "FAILED_BREAKOUT_SPEC_VERSION",
+    "FX_DAY_BOUNDARY",
+    "FX_DAY_TIMEZONE",
     "LOWER",
     "PREREGISTERED_MINIMUM_DEPTHS",
     "PRE_EVENT_SCALE",

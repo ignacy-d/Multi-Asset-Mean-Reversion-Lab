@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -17,7 +18,7 @@ from mr_lab.failed_breakout_stage0 import (
     write_outputs,
 )
 from mr_lab.research import Direction
-from mr_lab.stage4a import diagnose_directional_path
+from mr_lab.stage4a import ForwardOutcome, diagnose_directional_path
 
 T = datetime(2024, 1, 31, 23, tzinfo=UTC)
 
@@ -135,6 +136,42 @@ def test_missing_exact_clock_is_not_filled_and_path_metrics_fail_closed():
     assert result.mfe_price is result.mae_price is None
 
 
+def test_generic_path_uses_verified_jpy_pip_conversion():
+    result = diagnose_directional_path(
+        instrument="USDJPY",
+        signal_timestamp=T,
+        direction=Direction.LONG,
+        p0=100.0,
+        m1_bars=_path(instrument="USDJPY"),
+    )
+
+    assert result.horizons[0].signed_return_pips == pytest.approx(15.0)
+
+
+def test_generic_path_is_invariant_to_bars_after_requested_path():
+    prefix = _path()
+    future = tuple(
+        _bar(T + timedelta(minutes=minute), 500.0) for minute in range(121, 141)
+    )
+
+    expected = diagnose_directional_path(
+        instrument="EURUSD",
+        signal_timestamp=T,
+        direction=Direction.LONG,
+        p0=100.0,
+        m1_bars=prefix,
+    )
+    actual = diagnose_directional_path(
+        instrument="EURUSD",
+        signal_timestamp=T,
+        direction=Direction.LONG,
+        p0=100.0,
+        m1_bars=(*prefix, *future),
+    )
+
+    assert actual == expected
+
+
 def test_overlap_windows_deduplicate_timestamps_and_isolate_instruments():
     duplicate = _observation(suffix="duplicate")
     observations = (
@@ -159,14 +196,14 @@ def test_overlap_windows_deduplicate_timestamps_and_isolate_instruments():
         if row["scope"] == "instrument" and row["instrument"] == "EURUSD"
     )
 
-    assert aggregate["failed_breakout_count"] == 3
+    assert aggregate["failed_breakout_physical_opportunity_count"] == 3
     assert [aggregate[f"overlap_count_w{window}"] for window in (0, 15, 30, 60)] == [
         1,
         1,
         2,
         2,
     ]
-    assert eurusd["failed_breakout_count"] == 2
+    assert eurusd["failed_breakout_physical_opportunity_count"] == 2
     assert eurusd["overlap_count_w30"] == 2
 
 
@@ -183,6 +220,62 @@ def test_parameter_month_quarter_aggregation_and_all_cells():
     assert set(family["monthly_expectancy_h60"]) == {"2024-01", "2024-04"}
     assert set(family["quarterly_expectancy_h60"]) == {"2024-Q1", "2024-Q2"}
     assert any(row["event_count"] == 0 for row in rows if row["scope"] == "cell")
+
+
+def test_family_distinguishes_physical_opportunities_from_global_clocks():
+    rows = aggregate_observations(
+        (
+            _observation(instrument="EURUSD", suffix="eur"),
+            _observation(instrument="GBPUSD", suffix="gbp"),
+        ),
+        ("EURUSD", "GBPUSD"),
+    )
+    family = next(row for row in rows if row["scope"] == "family")
+
+    assert family["unique_physical_opportunities"] == 2
+    assert family["unique_global_signal_clocks"] == 1
+
+
+def test_depth_plateau_uses_all_observations_not_unweighted_cell_means():
+    observations = []
+    for index in range(10):
+        item = _observation(
+            timestamp=T + timedelta(minutes=index * 180), suffix=f"large-{index}"
+        )
+        observations.append(
+            replace(
+                item,
+                path=replace(
+                    item.path,
+                    horizons=(ForwardOutcome(60, 0.0001, 0.0, 0.0, 1.0),),
+                ),
+            )
+        )
+    small = _observation(instrument="GBPUSD", anchor="asia-session", suffix="small")
+    observations.append(
+        replace(
+            small,
+            path=replace(
+                small.path,
+                horizons=(ForwardOutcome(60, -0.0005, 0.0, 0.0, -5.0),),
+            ),
+        )
+    )
+
+    rows = aggregate_observations(observations, ("EURUSD", "GBPUSD"))
+    depth = next(
+        row
+        for row in rows
+        if row["scope"] == "depth" and row["minimum_depth_fraction"] == 0.05
+    )
+    cell_means = [
+        row["forward_pips_h60_mean"]
+        for row in rows
+        if row["scope"] == "cell" and row["event_count"]
+    ]
+
+    assert sum(cell_means) / len(cell_means) == pytest.approx(-2.0)
+    assert depth["forward_pips_h60_mean"] == pytest.approx(5 / 11)
 
 
 def test_report_outputs_are_byte_deterministic(tmp_path):
