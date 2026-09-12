@@ -11,19 +11,24 @@ import math
 import statistics
 from collections import defaultdict
 from dataclasses import asdict
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
+from mr_lab.ornstein_uhlenbeck import frozen_ou_eligibility_spec
 from mr_lab.ou_monte_carlo import (
     AccountRules,
     MonteCarloInputError,
     PortfolioEvent,
+    SimTrade,
     block_bootstrap_indices,
     deduplicate_events,
     parse_utc,
     r_multiple,
     reject_sealed_path,
-    replay_r_days,
+    replay_events,
+    research_calendar_2024,
 )
+from mr_lab.stage4b import SIGNAL_THRESHOLD, STAGE4B_METHODOLOGY_ID, pip_size
 from mr_lab.stage4c import CostProfile, net_pips
 
 UNIVERSES = {"strict": ("EURUSD", "GBPUSD"), "broad": ("EURUSD", "GBPUSD", "AUDUSD")}
@@ -36,18 +41,14 @@ COST_SCENARIOS = (
 RISK_LEVELS = (0.0025, 0.0035, 0.005, 0.0075)
 PORTFOLIO_CAPS = (0.01, 0.015, 0.02)
 POLICY_FIELDS = (
+    "benchmark_family",
+    "lookback",
     "entry_mode",
     "tp_target_fraction",
     "sl_extension_fraction",
     "time_stop_minutes",
 )
-REQUIRED_ECONOMIC_FIELDS = (
-    "signal_timestamp",
-    "entry_timestamp",
-    "entry_price",
-    "initial_stop_price",
-    "exit_timestamp",
-)
+REQUIRED_TRADE_FIELDS = ("entry_wait_minutes", "r_at_entry", "exit_timestamp")
 
 
 def _json(path: Path) -> dict:
@@ -60,20 +61,60 @@ def _json(path: Path) -> dict:
     return value
 
 
-def _audit(instrument: str, audit_path: Path, stage4c_path: Path) -> dict:
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _audit(
+    instrument: str,
+    audit_path: Path,
+    stage4c_path: Path,
+    trades_path: Path,
+    candidates_path: Path,
+    cost_profile_sha256: str,
+) -> dict:
     audit, overlay = _json(audit_path), _json(stage4c_path)
     if audit.get("instrument") != instrument:
         raise MonteCarloInputError(f"wrong instrument in audit: expected {instrument}")
-    if audit.get("filter_family") != "ornstein-uhlenbeck" or not audit.get(
-        "filter_spec_id"
-    ):
+    spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    expected = {
+        "filter_family": "ornstein-uhlenbeck",
+        "filter_spec_id": spec.filter_spec_id,
+        "process_spec_id": spec.process_spec.process_spec_id,
+    }
+    if any(audit.get(field) != value for field, value in expected.items()):
         raise MonteCarloInputError("invalid OU provenance")
-    if not audit.get("process_spec_id"):
-        raise MonteCarloInputError("missing OU process provenance")
+    if audit.get("stage4b_methodology_id") != STAGE4B_METHODOLOGY_ID:
+        raise MonteCarloInputError("Stage4B methodology mismatch")
+    output_hashes = audit.get("output_sha256", {})
+    for name, path in (
+        ("trades.jsonl", trades_path),
+        ("candidate-events.jsonl", candidates_path),
+    ):
+        if output_hashes.get(name) != _sha256(path):
+            raise MonteCarloInputError(f"Stage4B {name} SHA mismatch")
+    embedded = audit.get("eligibility_filter_spec")
+    canonical_spec = json.loads(json.dumps(asdict(spec)))
+    if embedded != canonical_spec:
+        raise MonteCarloInputError("frozen OU eligibility specification mismatch")
     if overlay.get("instrument", instrument) != instrument:
         raise MonteCarloInputError(
             f"wrong instrument in Stage4C artifact: expected {instrument}"
         )
+    if overlay.get("stage4b_methodology_id") != STAGE4B_METHODOLOGY_ID:
+        raise MonteCarloInputError("Stage4C Stage4B methodology mismatch")
+    if any(overlay.get(field) != value for field, value in expected.items()):
+        raise MonteCarloInputError("Stage4C OU provenance mismatch")
+    source_hashes = overlay.get("source_trade_sha256")
+    accepted = (
+        set(source_hashes.values())
+        if isinstance(source_hashes, dict)
+        else {source_hashes}
+    )
+    if _sha256(trades_path) not in accepted:
+        raise MonteCarloInputError("Stage4C source trade SHA mismatch")
+    if overlay.get("cost_profile_sha256") != cost_profile_sha256:
+        raise MonteCarloInputError("Stage4C cost-profile SHA mismatch")
     return audit
 
 
@@ -84,6 +125,26 @@ def _policy(row: dict) -> str:
     return "|".join(f"{field}={row[field]}" for field in POLICY_FIELDS)
 
 
+def load_candidates(instrument: str, path: Path) -> dict[str, dict]:
+    candidates = {}
+    with path.open() as stream:
+        for line_number, line in enumerate(stream, 1):
+            try:
+                row = json.loads(line)
+                identity = row["candidate_event_id"]
+                signal = row["signal"]
+            except (json.JSONDecodeError, KeyError, TypeError) as error:
+                raise MonteCarloInputError(
+                    f"malformed candidate event line {line_number}"
+                ) from error
+            if signal.get("instrument") != instrument:
+                raise MonteCarloInputError("candidate instrument mismatch")
+            if identity in candidates and candidates[identity] != signal:
+                raise MonteCarloInputError("incompatible duplicate candidate event")
+            candidates[identity] = signal
+    return candidates
+
+
 def load_trades(
     instrument: str,
     path: Path,
@@ -91,6 +152,7 @@ def load_trades(
     profile: CostProfile,
     statistic: str,
     slippage: float,
+    candidates: dict[str, dict],
 ) -> list[PortfolioEvent]:
     result = []
     with path.open() as stream:
@@ -105,31 +167,89 @@ def load_trades(
                 raise MonteCarloInputError(
                     f"wrong instrument at trade line {line_number}"
                 )
+            candidate_id = row.get("candidate_event_id")
+            if not candidate_id or candidate_id not in candidates:
+                raise MonteCarloInputError("trade has no matching candidate event")
+            signal = candidates[candidate_id]
             expected = {
                 "benchmark_family": {"vwap", "vwap-canonical-m1"},
                 "signal_timeframe": {"15m", "M15"},
                 "session": {"london"},
                 "direction": {"SHORT"},
                 "lookback": {20, 40},
+                "signal_threshold": {SIGNAL_THRESHOLD},
+                "entry_mode": {"immediate"},
+                "tp_target_fraction": {0.75, 1.0},
+                "sl_extension_fraction": {0.25, 0.5},
+                "time_stop_minutes": {60, 120},
             }
             if any(row.get(k) not in allowed for k, allowed in expected.items()):
                 raise MonteCarloInputError(
                     f"wrong frozen OU filter at trade line {line_number}"
                 )
+            if any(
+                signal.get(k) != row.get(k)
+                for k in (
+                    "instrument",
+                    "benchmark_family",
+                    "signal_timeframe",
+                    "lookback",
+                    "session",
+                )
+            ):
+                raise MonteCarloInputError(
+                    "candidate/trade strategy provenance mismatch"
+                )
+            if signal.get("direction") != row.get("direction"):
+                raise MonteCarloInputError("candidate/trade direction mismatch")
+            if signal.get("threshold") != SIGNAL_THRESHOLD:
+                raise MonteCarloInputError("candidate signal threshold mismatch")
+            if not row.get("complete"):
+                continue
             missing = [
-                field for field in REQUIRED_ECONOMIC_FIELDS if row.get(field) is None
+                field for field in REQUIRED_TRADE_FIELDS if row.get(field) is None
             ]
             if missing:
                 available = sorted(row)
                 raise MonteCarloInputError(
-                    "cannot reconstruct exact initial entry-to-stop risk at "
+                    "cannot reconstruct exact Stage4B entry-to-stop risk at "
                     f"line {line_number}; available fields={available}; "
                     f"missing required quantity fields={missing}"
                 )
-            entry = float(row["entry_price"])
-            stop = float(row["initial_stop_price"])
-            pip_size = 0.0001
-            stop_pips = abs(entry - stop) / pip_size
+            try:
+                signal_timestamp = parse_utc(
+                    signal["signal_timestamp"], "signal_timestamp"
+                )
+                if signal_timestamp.year != 2024:
+                    raise MonteCarloInputError(
+                        "candidate is outside 2024 research year"
+                    )
+                if signal_timestamp.weekday() >= 5:
+                    raise MonteCarloInputError(
+                        "candidate is outside Monday-Friday research calendar"
+                    )
+                p0 = float(signal["p0"])
+                d0 = float(signal["d0"])
+                wait = int(row["entry_wait_minutes"])
+                r_at_entry = float(row["r_at_entry"])
+                sl_fraction = float(row["sl_extension_fraction"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise MonteCarloInputError(
+                    "malformed Stage4B reconstruction fields"
+                ) from error
+            if not all(math.isfinite(x) for x in (p0, d0, r_at_entry, sl_fraction)):
+                raise MonteCarloInputError("non-finite Stage4B reconstruction field")
+            if d0 == 0 or wait < 0 or sl_fraction <= 0:
+                raise MonteCarloInputError(
+                    "impossible Stage4B entry/stop reconstruction"
+                )
+            direction = -1 if row["direction"] == "SHORT" else 1
+            entry_timestamp = signal_timestamp + timedelta(minutes=wait)
+            entry = p0 + direction * r_at_entry * abs(d0)
+            stop = p0 - direction * sl_fraction * abs(d0)
+            stop_pips = abs(entry - stop) / pip_size(instrument)
+            if stop_pips <= 0 or direction * (entry - stop) <= 0:
+                raise MonteCarloInputError("initial stop is not adverse to entry")
             gross = row.get("gross_return_pips_adverse_first")
             if not isinstance(gross, int | float) or not math.isfinite(gross):
                 raise MonteCarloInputError("missing finite adverse-first gross pips")
@@ -137,13 +257,16 @@ def load_trades(
                 instrument, row.get("session"), statistic
             )
             net = net_pips(float(gross), instrument, spread, slippage, commission)
+            exit_timestamp = parse_utc(row["exit_timestamp"], "exit_timestamp")
+            if exit_timestamp <= entry_timestamp or exit_timestamp.year != 2024:
+                raise MonteCarloInputError("impossible Stage4B entry/exit timestamps")
             result.append(
                 PortfolioEvent(
                     instrument,
-                    str(row.get("candidate_event_id") or ""),
-                    parse_utc(row["signal_timestamp"], "signal_timestamp"),
-                    parse_utc(row["entry_timestamp"], "entry_timestamp"),
-                    parse_utc(row["exit_timestamp"], "exit_timestamp"),
+                    str(candidate_id),
+                    signal_timestamp,
+                    entry_timestamp,
+                    exit_timestamp,
                     _policy(row),
                     float(gross),
                     float(gross) - net,
@@ -163,34 +286,66 @@ def _q(values, p):
     return ordered[min(len(ordered) - 1, max(0, math.ceil(p * len(ordered)) - 1))]
 
 
-def simulate(events, *, paths, seed, block_days, horizon, risk, cap, rules):
+def bootstrap_samples(paths, seed, block_days, horizon):
+    day_count = len(research_calendar_2024())
+    return tuple(
+        block_bootstrap_indices(day_count, horizon, block_days, seed + index)
+        for index in range(paths)
+    )
+
+
+def _synthetic_trades(events, picks, calendar):
     by_day = defaultdict(list)
     for event in events:
-        by_day[event.signal_timestamp.date()].append((event.entry_timestamp, event.r))
-    days = [by_day[day] for day in sorted(by_day)]
-    if not days:
+        by_day[event.signal_timestamp.date()].append(event)
+    result = []
+    for synthetic_index, source_index in enumerate(picks):
+        source_day = calendar[source_index]
+        target_day = calendar[synthetic_index]
+        source_midnight = datetime.combine(source_day, time(), UTC)
+        target_midnight = datetime.combine(target_day, time(), UTC)
+        for event in by_day[source_day]:
+            result.append(
+                SimTrade(
+                    target_midnight + (event.entry_timestamp - source_midnight),
+                    target_midnight + (event.exit_timestamp - source_midnight),
+                    event.r,
+                    f"{synthetic_index}:{event.instrument}:{event.candidate_event_id}",
+                )
+            )
+    return result
+
+
+def simulate_matrix(events, *, samples, horizon, risks, caps, rules):
+    """Batch one policy/cost over shared bootstrap paths and trade reconstruction."""
+    calendar = research_calendar_2024()[:horizon]
+    if not events:
         raise MonteCarloInputError("no comparable trades")
-    results = []
-    for index in range(paths):
-        if paths >= 1000 and index and index % max(1, paths // 10) == 0:
-            logging.info("Monte Carlo progress %d/%d", index, paths)
-        picks = block_bootstrap_indices(len(days), horizon, block_days, seed + index)
-        results.append(replay_r_days([days[pick] for pick in picks], risk, cap, rules))
+    results = {(risk, cap): [] for risk in risks for cap in caps}
+    source_calendar = research_calendar_2024()
+    for index, picks in enumerate(samples):
+        if len(samples) >= 1000 and index and index % max(1, len(samples) // 10) == 0:
+            logging.info("Monte Carlo progress %d/%d", index, len(samples))
+        trades = _synthetic_trades(events, picks, source_calendar)
+        for risk in risks:
+            for cap in caps:
+                results[(risk, cap)].append(
+                    replay_events(trades, calendar, risk, cap, rules)
+                )
     return results
 
 
 def metrics(results, rules):
     n = len(results)
-    passing = [
-        r
-        for r in results
-        if r.target_day is not None and not r.daily_breach and not r.total_breach
-    ]
+    passing = [r for r in results if r.terminal_outcome == "PASS"]
     p_pass = len(passing) / n
-    fail = 1 - p_pass
+    p_breach = sum(r.terminal_outcome == "BREACH" for r in results) / n
+    p_unresolved = sum(r.terminal_outcome == "UNRESOLVED" for r in results) / n
+    fail = p_breach + p_unresolved
     row = {
         "p_pass_target_before_breach": p_pass,
-        "p_breach_before_target": fail,
+        "p_breach_before_target": p_breach,
+        "p_unresolved_at_horizon": p_unresolved,
         "p_fail_one_attempt": fail,
         "p_fail_two_attempts": fail**2,
         "p_fail_three_attempts": fail**3,
@@ -239,9 +394,14 @@ def metrics(results, rules):
             ("p99", 0.99),
         ):
             row[f"{field}_{label}"] = _q([getattr(r, field) for r in results], p)
-    for months, _day in ((3, 60), (6, 120), (12, 252)):
+    for months, day in ((3, 60), (6, 120), (12, 252)):
         row[f"p_survive_{months}_months"] = (
-            sum(not r.daily_breach and not r.total_breach for r in results) / n
+            sum(
+                (r.daily_breach_day is None or r.daily_breach_day > day)
+                and (r.total_breach_day is None or r.total_breach_day > day)
+                for r in results
+            )
+            / n
         )
     monthly = [r.returns[min(20, len(r.returns)) - 1] for r in results]
     row.update(
@@ -266,11 +426,54 @@ def _write_csv(path, rows):
         writer.writerows(rows)
 
 
+def policy_summaries(rows):
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[
+            (
+                row["universe"],
+                row["cost_scenario"],
+                row["risk_per_trade"],
+                row["max_portfolio_risk"],
+                row["block_days"],
+            )
+        ].append(row)
+    result = list(rows)
+    for key, policies in grouped.items():
+        pass_values = [row["p_pass_target_before_breach"] for row in policies]
+        monthly_values = [row["monthly_median"] for row in policies]
+        result.append(
+            {
+                "universe": key[0],
+                "cost_scenario": key[1],
+                "risk_per_trade": key[2],
+                "max_portfolio_risk": key[3],
+                "block_days": key[4],
+                "policy": "ACROSS_POLICIES",
+                "policy_count": len(policies),
+                "p_pass_policy_p25": _q(pass_values, 0.25),
+                "p_pass_policy_median": _q(pass_values, 0.5),
+                "p_pass_policy_p75": _q(pass_values, 0.75),
+                "p_pass_worst_policy": min(pass_values),
+                "monthly_policy_p25": _q(monthly_values, 0.25),
+                "monthly_policy_median": _q(monthly_values, 0.5),
+                "monthly_policy_p75": _q(monthly_values, 0.75),
+                "monthly_worst_policy": min(monthly_values),
+                "positive_monthly_plateau_fraction": sum(
+                    value > 0 for value in monthly_values
+                )
+                / len(monthly_values),
+            }
+        )
+    return result
+
+
 def run(args):
     all_paths = [
         value
         for key, value in vars(args).items()
-        if key.endswith(("_trades", "_audit", "_stage4c")) and value
+        if key.endswith(("_trades", "_candidate_events", "_audit", "_stage4c"))
+        and value
     ]
     all_paths += [args.cost_profile, args.output_dir]
     safe = [reject_sealed_path(value) for value in all_paths]
@@ -282,21 +485,44 @@ def run(args):
         prefix = instrument.lower()
         values = tuple(
             getattr(args, f"{prefix}_{suffix}")
-            for suffix in ("trades", "audit", "stage4c")
+            for suffix in ("trades", "candidate_events", "audit", "stage4c")
         )
         if any(value is None for value in values):
             raise MonteCarloInputError(
-                f"explicit {instrument} trades, audit, and Stage4C paths are required"
+                f"explicit {instrument} trades, candidate-events, audit, and "
+                "Stage4C paths are required"
             )
         paths = tuple(reject_sealed_path(value) for value in values)
-        artifacts[instrument] = (paths[0], _audit(instrument, paths[1], paths[2]))
+        artifacts[instrument] = (
+            paths[0],
+            load_candidates(instrument, paths[1]),
+            _audit(
+                instrument,
+                paths[2],
+                paths[3],
+                paths[0],
+                paths[1],
+                profile.sha256,
+            ),
+        )
     out = reject_sealed_path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     rows = []
     portfolio_rows = []
+    samples = bootstrap_samples(
+        args.paths, args.seed, args.block_days, args.horizon_days
+    )
     for scenario, statistic, slippage in COST_SCENARIOS:
         loaded = {
-            i: load_trades(i, *artifacts[i], profile, statistic, slippage)
+            i: load_trades(
+                i,
+                artifacts[i][0],
+                artifacts[i][2],
+                profile,
+                statistic,
+                slippage,
+                artifacts[i][1],
+            )
             for i in instruments
         }
         common = set.intersection(
@@ -304,50 +530,51 @@ def run(args):
         )
         if not common:
             raise MonteCarloInputError("no common/comparable execution policies")
+        if len(common) != 32:
+            raise MonteCarloInputError(
+                f"expected 32 common frozen strategy cells, found {len(common)}"
+            )
         for policy in sorted(common):
             events = [
                 e for i in instruments for e in loaded[i] if e.policy_id == policy
             ]
             if scenario == "p90+0.25":
                 portfolio_rows.extend(asdict(e) for e in events)
-            for risk in RISK_LEVELS:
-                for cap in PORTFOLIO_CAPS:
-                    rules = AccountRules(
-                        args.starting_balance,
-                        args.profit_target,
-                        args.max_daily_loss,
-                        args.max_total_loss,
-                        args.daily_reset_timezone,
+            rules = AccountRules(
+                args.starting_balance,
+                args.profit_target,
+                args.max_daily_loss,
+                args.max_total_loss,
+                args.daily_reset_timezone,
+            )
+            matrix = simulate_matrix(
+                events,
+                samples=samples,
+                horizon=args.horizon_days,
+                risks=RISK_LEVELS,
+                caps=PORTFOLIO_CAPS,
+                rules=rules,
+            )
+            for (risk, cap), result in matrix.items():
+                item = {
+                    "universe": args.universe,
+                    "policy": policy,
+                    "cost_scenario": scenario,
+                    "risk_per_trade": risk,
+                    "max_portfolio_risk": cap,
+                    "block_days": args.block_days,
+                    **metrics(result, rules),
+                }
+                if args.challenge_fee is not None:
+                    item["expected_fee_spend_until_first_pass"] = (
+                        None
+                        if item["expected_attempts_until_first_pass"] is None
+                        else item["expected_attempts_until_first_pass"]
+                        * args.challenge_fee
                     )
-                    result = simulate(
-                        events,
-                        paths=args.paths,
-                        seed=args.seed,
-                        block_days=args.block_days,
-                        horizon=args.horizon_days,
-                        risk=risk,
-                        cap=cap,
-                        rules=rules,
-                    )
-                    item = {
-                        "universe": args.universe,
-                        "policy": policy,
-                        "cost_scenario": scenario,
-                        "risk_per_trade": risk,
-                        "max_portfolio_risk": cap,
-                        "block_days": args.block_days,
-                        **metrics(result, rules),
-                    }
-                    if args.challenge_fee is not None:
-                        item["expected_fee_spend_until_first_pass"] = (
-                            None
-                            if item["expected_attempts_until_first_pass"] is None
-                            else item["expected_attempts_until_first_pass"]
-                            * args.challenge_fee
-                        )
-                    rows.append(item)
+                rows.append(item)
     _write_csv(out / "ou-monte-carlo-challenge.csv", rows)
-    _write_csv(out / "ou-monte-carlo-policies.csv", rows)
+    _write_csv(out / "ou-monte-carlo-policies.csv", policy_summaries(rows))
     _write_csv(out / "ou-monte-carlo-monthly.csv", rows)
     _write_csv(out / "ou-monte-carlo-drawdown.csv", rows)
     _write_csv(out / "portfolio-events.csv", portfolio_rows)
@@ -407,7 +634,7 @@ def run(args):
         "block_days": args.block_days,
         "input_sha256": {
             i: hashlib.sha256(path.read_bytes()).hexdigest()
-            for i, (path, _) in artifacts.items()
+            for i, (path, _, _) in artifacts.items()
         },
         "method": "chronological circular trading-day block bootstrap",
     }
@@ -423,11 +650,16 @@ def parser():
     )
     p.add_argument("--universe", choices=UNIVERSES, default="strict")
     for instrument in ("eurusd", "gbpusd", "audusd"):
-        for suffix in ("trades", "audit", "stage4c"):
+        for suffix in ("trades", "candidate-events", "audit", "stage4c"):
             p.add_argument(f"--{instrument}-{suffix}")
     p.add_argument("--cost-profile", required=True)
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--paths", type=int, default=50000)
+    p.add_argument(
+        "--paths",
+        type=int,
+        default=50000,
+        help="Monte Carlo paths; use 2000/5000 for diagnostics, 50000 for final",
+    )
     p.add_argument("--seed", type=int, default=20240930)
     p.add_argument("--block-days", type=int, choices=(1, 5), default=5)
     p.add_argument("--horizon-days", type=int, default=252)
@@ -444,8 +676,10 @@ def parser():
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parser().parse_args(argv)
-    if args.paths <= 0 or args.horizon_days < 252:
-        raise SystemExit("--paths must be positive and --horizon-days must be >=252")
+    if args.paths <= 0 or not 252 <= args.horizon_days <= 262:
+        raise SystemExit(
+            "--paths must be positive and --horizon-days must be within 252..262"
+        )
     try:
         run(args)
     except (MonteCarloInputError, OSError, ValueError) as error:

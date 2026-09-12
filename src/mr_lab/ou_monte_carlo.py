@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -116,6 +116,113 @@ class ReplayResult:
     max_drawdown: float
     max_losing_streak: int
     max_losing_days: int
+    terminal_outcome: str
+    terminal_day: int | None
+    daily_breach_day: int | None
+    total_breach_day: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class SimTrade:
+    entry_timestamp: datetime
+    exit_timestamp: datetime
+    r: float
+    identity: str = ""
+
+
+def research_calendar_2024() -> tuple[date, ...]:
+    """The explicit provisional Monday-Friday 2024 research calendar."""
+    current = date(2024, 1, 1)
+    end = date(2024, 12, 31)
+    result = []
+    while current <= end:
+        if current.weekday() < 5:
+            result.append(current)
+        current += timedelta(days=1)
+    return tuple(result)
+
+
+def replay_events(
+    trades: list[SimTrade],
+    calendar: list[date] | tuple[date, ...],
+    risk_fraction: float,
+    max_portfolio_risk: float,
+    rules: AccountRules,
+) -> ReplayResult:
+    """Replay positions, reserving risk while open and realizing P/L at exit."""
+    if not calendar:
+        raise MonteCarloInputError("replay calendar must not be empty")
+    zone = ZoneInfo(rules.daily_reset_timezone)
+    start = rules.starting_balance
+    equity = peak = start
+    open_positions: dict[str, tuple[float, float]] = {}
+    realized: dict[date, list[float]] = {}
+    events = []
+    for number, trade in enumerate(trades):
+        if trade.entry_timestamp >= trade.exit_timestamp:
+            raise MonteCarloInputError("trade exit must be strictly after entry")
+        identity = trade.identity or str(number)
+        # Existing exits release risk/equity before same-time new entries.
+        events.append((trade.entry_timestamp, 1, "entry", identity, trade.r))
+        events.append((trade.exit_timestamp, 0, "exit", identity, trade.r))
+    for timestamp, _, kind, identity, r_value in sorted(events):
+        if kind == "entry":
+            reserved = sum(value[0] for value in open_positions.values())
+            allocation = max(0.0, min(risk_fraction, max_portfolio_risk - reserved))
+            open_positions[identity] = (allocation, equity * allocation)
+        else:
+            allocation, amount = open_positions.pop(identity)
+            pnl = amount * r_value
+            equity += pnl
+            local_day = timestamp.astimezone(zone).date()
+            realized.setdefault(local_day, []).append(pnl)
+
+    equity = peak = start
+    returns = []
+    target_day = daily_day = total_day = terminal_day = None
+    terminal = "UNRESOLVED"
+    losing_streak = max_losing_streak = losing_days = max_losing_days = 0
+    max_dd = 0.0
+    for day_number, day in enumerate(calendar, 1):
+        day_start = equity
+        day_has_loss = False
+        for pnl in realized.get(day, ()):
+            equity += pnl
+            if pnl < 0:
+                losing_streak += 1
+                day_has_loss = True
+            else:
+                losing_streak = 0
+            max_losing_streak = max(max_losing_streak, losing_streak)
+            peak = max(peak, equity)
+            max_dd = max(max_dd, (peak - equity) / peak)
+            if daily_day is None and equity <= day_start - start * rules.max_daily_loss:
+                daily_day = day_number
+            if total_day is None and equity <= start * (1 - rules.max_total_loss):
+                total_day = day_number
+            if terminal == "UNRESOLVED":
+                if equity >= start * (1 + rules.profit_target) - 1e-9:
+                    target_day = terminal_day = day_number
+                    terminal = "PASS"
+                elif daily_day == day_number or total_day == day_number:
+                    terminal_day = day_number
+                    terminal = "BREACH"
+        losing_days = losing_days + 1 if day_has_loss else 0
+        max_losing_days = max(max_losing_days, losing_days)
+        returns.append(equity / start - 1)
+    return ReplayResult(
+        tuple(returns),
+        target_day,
+        daily_day is not None,
+        total_day is not None,
+        max_dd,
+        max_losing_streak,
+        max_losing_days,
+        terminal,
+        terminal_day,
+        daily_day,
+        total_day,
+    )
 
 
 def replay_r_days(
@@ -124,53 +231,18 @@ def replay_r_days(
     max_portfolio_risk: float,
     rules: AccountRules,
 ) -> ReplayResult:
-    """Replay close-time R using a labelled realized-equity daily approximation."""
-    zone = ZoneInfo(rules.daily_reset_timezone)
-    equity = peak = rules.starting_balance
-    returns: list[float] = []
-    target_day = None
-    daily_breach = total_breach = False
-    max_dd = 0.0
-    losing_streak = max_losing_streak = losing_days = max_losing_days = 0
-    for day_number, trades in enumerate(day_trades, 1):
-        day_start = equity
-        day_lost = False
-        # Deterministic ordering; simultaneous positions share a fixed risk budget.
-        ordered = sorted(trades, key=lambda value: value[0])
-        simultaneous: dict[datetime, int] = {}
-        for timestamp, _ in ordered:
-            simultaneous[timestamp] = simultaneous.get(timestamp, 0) + 1
-        for timestamp, r_value in ordered:
-            allowed = min(risk_fraction, max_portfolio_risk / simultaneous[timestamp])
-            pnl = account_risk_amount(equity, allowed) * r_value
-            equity += pnl
-            if pnl < 0:
-                losing_streak += 1
-                day_lost = True
-            else:
-                losing_streak = 0
-            max_losing_streak = max(max_losing_streak, losing_streak)
-            peak = max(peak, equity)
-            max_dd = max(max_dd, (peak - equity) / peak)
-            if equity <= rules.starting_balance * (1 - rules.max_total_loss):
-                total_breach = True
-            # Close timestamps define reset days; no intratrade path is asserted.
-            _ = timestamp.astimezone(zone).date()
-            if equity <= day_start - rules.starting_balance * rules.max_daily_loss:
-                daily_breach = True
-        losing_days = losing_days + 1 if day_lost else 0
-        max_losing_days = max(max_losing_days, losing_days)
-        returns.append(equity / rules.starting_balance - 1)
-        if target_day is None and (
-            equity / rules.starting_balance - 1 >= rules.profit_target - 1e-12
-        ):
-            target_day = day_number
-    return ReplayResult(
-        tuple(returns),
-        target_day,
-        daily_breach,
-        total_breach,
-        max_dd,
-        max_losing_streak,
-        max_losing_days,
-    )
+    """Compatibility helper for tests expressed as daily close-time R values."""
+    calendar = [date(2024, 1, 1) + timedelta(days=n) for n in range(len(day_trades))]
+    trades = []
+    for day, values in zip(calendar, day_trades, strict=True):
+        for number, (timestamp, r_value) in enumerate(values):
+            mapped = datetime.combine(day, time(timestamp.hour, timestamp.minute), UTC)
+            trades.append(
+                SimTrade(
+                    mapped,
+                    mapped + timedelta(microseconds=1),
+                    r_value,
+                    f"{day}:{number}",
+                )
+            )
+    return replay_events(trades, calendar, risk_fraction, max_portfolio_risk, rules)
