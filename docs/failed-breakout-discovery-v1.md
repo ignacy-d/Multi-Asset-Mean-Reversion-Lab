@@ -136,3 +136,16 @@ fail-closed part of the frozen scale definition. Closed weekend intervals are
 skipped rather than treated as trading days, while incomplete open-market days
 cannot supply a scale. Coverage and zero-event cells must be reported rather
 than silently substituting a different scale after observing results.
+
+## Current empirical execution status
+
+Execution is pending. In the current development environment none of the five
+registered offline corpus directories is mounted, GitHub authentication needed
+to retrieve the four pinned registry artifacts is unavailable, and the verified
+operator-managed GBPUSD checkpoint is not present. A fresh provider-wide
+acquisition was deliberately not substituted for these canonical sources.
+
+Consequently, no 2024 event counts, expectancy, overlap, or classification are
+claimed in this document. The next run must materialize the exact registry-pinned
+corpora, execute the frozen command above once, and preserve its deterministic
+outputs without changing the methodology after observing them.
