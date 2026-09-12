@@ -475,6 +475,32 @@ def build_candidate_ou_states(states, spec, required_keys):
     return _build_ou_states(states, spec, frozenset(required_keys))
 
 
+class IncrementalOuStateBuilder:
+    """Bounded per-process rolling OU state with batch-identical fit ordering."""
+
+    def __init__(self, spec: OrnsteinUhlenbeckProcessSpec):
+        self.spec = spec
+        self._processes = {}
+
+    def push(self, observation: ResidualObservation):
+        previous, transitions = self._processes.get(
+            observation.process_key, (None, deque(maxlen=self.spec.window_transitions))
+        )
+        if previous is not None and (
+            observation.available_at - previous.available_at
+            == observation.signal_timeframe.duration
+        ):
+            transitions.append(
+                (previous.current_deviation, observation.current_deviation)
+            )
+        self._processes[observation.process_key] = (observation, transitions)
+        return fit_ou_state(observation, transitions, self.spec)
+
+    @property
+    def retained_transition_count(self):
+        return sum(len(transitions) for _, transitions in self._processes.values())
+
+
 def candidate_process_keys(events):
     """Return direction-independent exact-time process keys for candidates."""
     keys = set()

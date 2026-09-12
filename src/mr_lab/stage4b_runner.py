@@ -11,7 +11,7 @@ import os
 import statistics
 import subprocess
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -23,7 +23,7 @@ from mr_lab.bollinger_benchmark import (
 from mr_lab.bollinger_benchmark import (
     signal_direction as bollinger_direction,
 )
-from mr_lab.data import resample_bars
+from mr_lab.data import VolumeSemantics, resample_bars
 from mr_lab.ornstein_uhlenbeck import (
     FROZEN_OU_FILTER_CHOICES,
     FrozenOuEligibilityFilter,
@@ -59,8 +59,11 @@ from mr_lab.stage4b import (
     target_already_passed,
 )
 from mr_lab.vwap_benchmark import (
+    VwapFeature,
     VwapStrategySpec,
+    _session_instance,
     build_vwap_features,
+    typical_price,
 )
 from mr_lab.vwap_benchmark import (
     signal_direction as vwap_direction,
@@ -178,39 +181,7 @@ def assemble_signal_states(dataset, manifest):
         observations = build_research_observations(
             resample_bars(dataset.bars, timeframe).bars, DEFAULT_SESSION_SPEC
         )
-        for lookback in LOOKBACKS:
-            native = build_vwap_features(observations, DEFAULT_SESSION_SPEC, lookback)
-            canonical = build_canonical_m1_vwap_features(
-                m1, observations, DEFAULT_SESSION_SPEC, lookback
-            )
-            for family, features, spec in (
-                (
-                    "vwap",
-                    native,
-                    VwapStrategySpec(lookback, SIGNAL_THRESHOLD).strategy_spec_id,
-                ),
-                (
-                    "vwap-canonical-m1",
-                    canonical,
-                    VwapRobustnessStrategySpec(
-                        lookback, SIGNAL_THRESHOLD, CANONICAL_M1
-                    ).strategy_spec_id,
-                ),
-            ):
-                for feature in features:
-                    states.extend(
-                        _two_sides(
-                            feature,
-                            family,
-                            feature.anchor_session,
-                            lookback,
-                            feature.vwap_deviation_z,
-                            feature.vwap,
-                            manifest,
-                            spec,
-                            vwap_direction,
-                        )
-                    )
+        states.extend(assemble_vwap_signal_states(m1, observations, manifest))
         for lookback in LOOKBACKS:
             spec = BollingerStrategySpec(lookback, SIGNAL_THRESHOLD).strategy_spec_id
             for feature in build_bollinger_features(observations, lookback):
@@ -238,6 +209,177 @@ def assemble_signal_states(dataset, manifest):
                         )
                     )
     return tuple(states)
+
+
+def assemble_vwap_signal_states(m1_observations, observations, manifest):
+    """Shared native and canonical-M1 VWAP state assembly for one timeframe."""
+    states = []
+    for lookback in LOOKBACKS:
+        native = build_vwap_features(observations, DEFAULT_SESSION_SPEC, lookback)
+        canonical = build_canonical_m1_vwap_features(
+            m1_observations, observations, DEFAULT_SESSION_SPEC, lookback
+        )
+        for family, features, spec in (
+            (
+                "vwap",
+                native,
+                VwapStrategySpec(lookback, SIGNAL_THRESHOLD).strategy_spec_id,
+            ),
+            (
+                "vwap-canonical-m1",
+                canonical,
+                VwapRobustnessStrategySpec(
+                    lookback, SIGNAL_THRESHOLD, CANONICAL_M1
+                ).strategy_spec_id,
+            ),
+        ):
+            for feature in features:
+                states.extend(
+                    _two_sides(
+                        feature,
+                        family,
+                        feature.anchor_session,
+                        lookback,
+                        feature.vwap_deviation_z,
+                        feature.vwap,
+                        manifest,
+                        spec,
+                        vwap_direction,
+                    )
+                )
+    return tuple(states)
+
+
+class IncrementalVwapSignalStateBuilder:
+    """Bounded causal equivalent of the frozen M1/M15 VWAP state assembly."""
+
+    def __init__(self, manifest):
+        self.manifest = manifest
+        self.windows = {
+            window.name: window for window in DEFAULT_SESSION_SPEC.major_sessions
+        }
+        self.m1_totals = {}
+        self.native_totals = {}
+        self.returns = {lookback: deque(maxlen=lookback) for lookback in LOOKBACKS}
+        self.previous = None
+
+    def _accumulate(self, totals, observation):
+        for anchor in observation.sessions.active_sessions:
+            key = (
+                anchor,
+                _session_instance(observation.bar.open_time, self.windows[anchor]),
+            )
+            current = totals.get(anchor)
+            if current is None or current[0] != key[1]:
+                current = [key[1], 0.0, 0.0]
+                totals[anchor] = current
+            if observation.is_research_active:
+                if (
+                    observation.bar.volume_semantics
+                    is not VolumeSemantics.QUOTE_ACTIVITY
+                ):
+                    raise ValueError("VWAP requires QUOTE_ACTIVITY volume")
+                if observation.bar.volume is None:
+                    raise ValueError("VWAP requires numeric volume")
+                current[1] += typical_price(observation.bar) * observation.bar.volume
+                current[2] += observation.bar.volume
+
+    def push_m1(self, observation):
+        self._accumulate(self.m1_totals, observation)
+
+    def push_target(self, observation):
+        adjacent = bool(
+            self.previous
+            and self.previous.bar.timeframe == observation.bar.timeframe
+            and self.previous.bar.close_time == observation.bar.open_time
+        )
+        active_pair = bool(
+            self.previous
+            and self.previous.is_research_active
+            and observation.is_research_active
+        )
+        current_return = None
+        if adjacent and active_pair:
+            current_return = observation.bar.close / self.previous.bar.close - 1.0
+        for window in self.returns.values():
+            if not adjacent or not active_pair:
+                window.clear()
+            window.append(current_return)
+        self._accumulate(self.native_totals, observation)
+        states = []
+        for lookback in LOOKBACKS:
+            window = self.returns[lookback]
+            volatility = None
+            if len(window) == lookback and all(value is not None for value in window):
+                volatility = statistics.stdev(
+                    value for value in window if value is not None
+                )
+                if volatility == 0:
+                    volatility = None
+            for family, totals, spec_id in (
+                (
+                    "vwap",
+                    self.native_totals,
+                    VwapStrategySpec(lookback, SIGNAL_THRESHOLD).strategy_spec_id,
+                ),
+                (
+                    "vwap-canonical-m1",
+                    self.m1_totals,
+                    VwapRobustnessStrategySpec(
+                        lookback, SIGNAL_THRESHOLD, CANONICAL_M1
+                    ).strategy_spec_id,
+                ),
+            ):
+                for anchor in observation.sessions.active_sessions:
+                    instance = _session_instance(
+                        observation.bar.open_time, self.windows[anchor]
+                    )
+                    current = totals.get(anchor)
+                    vwap = (
+                        current[1] / current[2]
+                        if current is not None
+                        and current[0] == instance
+                        and current[2] > 0
+                        else None
+                    )
+                    relative = observation.bar.close / vwap - 1.0 if vwap else None
+                    z = (
+                        relative / volatility
+                        if relative is not None and volatility
+                        else None
+                    )
+                    feature = VwapFeature(
+                        observation,
+                        anchor,
+                        instance,
+                        vwap,
+                        observation.bar.close,
+                        observation.bar.close - vwap if vwap is not None else None,
+                        relative,
+                        lookback,
+                        volatility,
+                        z,
+                    )
+                    states.extend(
+                        _two_sides(
+                            feature,
+                            family,
+                            anchor,
+                            lookback,
+                            z,
+                            vwap,
+                            self.manifest,
+                            spec_id,
+                            vwap_direction,
+                        )
+                    )
+        self.previous = observation
+        return tuple(states)
+
+    @property
+    def retained_rolling_values(self):
+        """Number of observations retained for volatility calculations."""
+        return sum(len(window) for window in self.returns.values())
 
 
 @dataclass
