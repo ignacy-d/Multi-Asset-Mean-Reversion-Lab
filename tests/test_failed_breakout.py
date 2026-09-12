@@ -9,6 +9,7 @@ from mr_lab.failed_breakout import (
     FailedBreakoutSpec,
     StructuralLevel,
     detect_failed_breakouts,
+    generate_structural_levels,
 )
 from mr_lab.research import Direction
 
@@ -29,6 +30,87 @@ def _bar(minute, *, close, high=None, low=None):
         price_basis=PriceBasis.BID,
         volume=1.0,
         volume_semantics=VolumeSemantics.TICK,
+    )
+
+
+def _history(start, minutes):
+    bars = []
+    for index in range(minutes):
+        opened = start + timedelta(minutes=index)
+        base = 1.10 + (index % 37) / 100_000
+        bars.append(
+            Bar(
+                instrument="EURUSD",
+                timeframe=Timeframe("1m"),
+                open_time=opened,
+                close_time=opened + timedelta(minutes=1),
+                available_at=opened + timedelta(minutes=1),
+                open=base,
+                high=base + 0.0002,
+                low=base - 0.0002,
+                close=base,
+                price_basis=PriceBasis.BID,
+                volume=1.0,
+                volume_semantics=VolumeSemantics.TICK,
+            )
+        )
+    return tuple(bars)
+
+
+def test_structural_levels_are_causal_complete_and_use_one_pre_event_scale():
+    bars = _history(datetime(2024, 1, 2, tzinfo=UTC), 2 * 24 * 60)
+    levels = generate_structural_levels(bars)
+    day = [level for level in levels if level.level_id.endswith("2024-01-03")]
+
+    assert {level.anchor_family for level in day} == {
+        "previous-day",
+        "asia-session",
+        "london-or60",
+    }
+    assert len(day) == 6
+    assert len({level.scale for level in day}) == 1
+    assert all(level.available_at < level.expires_at for level in day)
+    assert all(level.available_at >= datetime(2024, 1, 3, tzinfo=UTC) for level in day)
+
+
+@pytest.mark.parametrize(("month", "day", "expected_hour"), [(1, 2, 9), (7, 2, 8)])
+def test_london_or60_uses_historical_dst(month, day, expected_hour):
+    start = datetime(2024, month, day - 1, tzinfo=UTC)
+    levels = generate_structural_levels(_history(start, 2 * 24 * 60))
+    london = next(
+        level
+        for level in levels
+        if level.anchor_family == "london-or60" and level.side == UPPER
+    )
+
+    assert london.available_at.hour == expected_hour
+
+
+def test_missing_anchor_observation_fails_closed_without_mutating_input():
+    bars = _history(datetime(2024, 1, 2, tzinfo=UTC), 2 * 24 * 60)
+    missing_at = datetime(2024, 1, 3, 0, 30, tzinfo=UTC)
+    incomplete = tuple(bar for bar in bars if bar.open_time != missing_at)
+    before = tuple(incomplete)
+
+    levels = generate_structural_levels(incomplete)
+
+    assert not any(
+        level.anchor_family == "asia-session" and level.level_id.endswith("2024-01-03")
+        for level in levels
+    )
+    assert incomplete == before
+
+
+def test_structural_level_generation_is_prefix_invariant():
+    bars = _history(datetime(2024, 1, 2, tzinfo=UTC), 3 * 24 * 60)
+    cutoff = datetime(2024, 1, 3, 10, tzinfo=UTC)
+    prefix = tuple(bar for bar in bars if bar.available_at <= cutoff)
+
+    prefix_levels = generate_structural_levels(prefix)
+    full_levels = generate_structural_levels(bars)
+
+    assert prefix_levels == tuple(
+        level for level in full_levels if level.available_at <= cutoff
     )
 
 
@@ -112,9 +194,12 @@ def test_reclaim_after_window_is_rejected():
         + [_bar(m, close=1.1008, high=1.1010, low=1.1002) for m in range(2, 33)]
         + [_bar(33, close=1.0998)]
     )
-    assert detect_failed_breakouts(
-        bars, (level,), FailedBreakoutSpec(0.10, reclaim_window_minutes=30)
-    ) == ()
+    assert (
+        detect_failed_breakouts(
+            bars, (level,), FailedBreakoutSpec(0.10, reclaim_window_minutes=30)
+        )
+        == ()
+    )
 
 
 def test_gap_cancels_episode_fail_closed():
@@ -152,7 +237,8 @@ def test_future_bars_do_not_change_prefix_events():
         _bar(1, close=1.1010, high=1.1015, low=1.0998),
         _bar(2, close=1.0997),
     )
-    complete = prefix + (
+    complete = (
+        *prefix,
         _bar(3, close=1.1001, high=1.1003, low=1.0995),
         _bar(4, close=1.0995),
     )

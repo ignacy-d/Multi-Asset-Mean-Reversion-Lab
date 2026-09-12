@@ -11,17 +11,21 @@ import json
 import math
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from hashlib import sha256
+from zoneinfo import ZoneInfo
 
 from mr_lab.data import Bar, Timeframe
 from mr_lab.research import Direction
+from mr_lab.sessions import DEFAULT_SESSION_SPEC, SessionSpec, TimeWindow
 
 FAILED_BREAKOUT_FAMILY = "failed-breakout"
 FAILED_BREAKOUT_SPEC_VERSION = "failed-breakout-reclaim-v1"
 UPPER = "upper"
 LOWER = "lower"
 SIDES = (UPPER, LOWER)
+PREREGISTERED_MINIMUM_DEPTHS = (0.05, 0.15)
+PRE_EVENT_SCALE = "previous-complete-utc-day-range"
 
 
 class FailedBreakoutError(ValueError):
@@ -65,6 +69,38 @@ class StructuralLevel:
         _require_utc("expires_at", self.expires_at)
         if self.available_at >= self.expires_at:
             raise FailedBreakoutError("level availability must precede expiry")
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralLevelSpec:
+    """Configuration for the three preregistered causal anchor families.
+
+    All anchors use the range of the immediately preceding complete UTC day.
+    This scale is deliberately simple, fixed before event detection, and
+    independent of Module A features.
+    """
+
+    session_spec: SessionSpec = DEFAULT_SESSION_SPEC
+    asia_session: str = "asia"
+    london_session: str = "london"
+    london_opening_range_minutes: int = 60
+    scale_definition: str = PRE_EVENT_SCALE
+    discovery_year: int = 2024
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_spec, SessionSpec):
+            raise FailedBreakoutError("session_spec must be a SessionSpec")
+        windows = {window.name for window in self.session_spec.major_sessions}
+        if self.asia_session not in windows or self.london_session not in windows:
+            raise FailedBreakoutError("configured anchor sessions must exist")
+        if type(self.london_opening_range_minutes) is not int or not (
+            1 <= self.london_opening_range_minutes < 24 * 60
+        ):
+            raise FailedBreakoutError("opening-range minutes must be positive")
+        if self.scale_definition != PRE_EVENT_SCALE:
+            raise FailedBreakoutError("unsupported pre-event scale definition")
+        if type(self.discovery_year) is not int:
+            raise FailedBreakoutError("discovery_year must be an integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +246,171 @@ def _validate_bars(bars: tuple[Bar, ...]) -> str:
     return instrument
 
 
+def _window_bounds(window: TimeWindow, instance: date) -> tuple[datetime, datetime]:
+    """Map one session-local instance to UTC with historical timezone rules."""
+    zone = ZoneInfo(window.timezone)
+    start = datetime.combine(instance, window.start, zone)
+    end_date = instance + timedelta(days=window.start > window.end)
+    end = datetime.combine(end_date, window.end, zone)
+    return start.astimezone(UTC), end.astimezone(UTC)
+
+
+def _complete_window(
+    by_open: dict[datetime, Bar], start: datetime, end: datetime
+) -> tuple[Bar, ...] | None:
+    """Return exact M1 coverage or fail closed without synthesising observations."""
+    minutes = int((end - start).total_seconds() // 60)
+    if minutes <= 0:
+        return None
+    result = tuple(
+        by_open.get(start + timedelta(minutes=index)) for index in range(minutes)
+    )
+    if any(bar is None for bar in result):
+        return None
+    return result  # type: ignore[return-value]
+
+
+def _level_pair(
+    *,
+    instrument: str,
+    family: str,
+    instance: date,
+    observations: tuple[Bar, ...],
+    scale: float,
+    available_at: datetime,
+    expires_at: datetime,
+) -> tuple[StructuralLevel, StructuralLevel]:
+    slug = instance.isoformat()
+    return (
+        StructuralLevel(
+            instrument,
+            f"{family}-high-{slug}",
+            family,
+            UPPER,
+            max(bar.high for bar in observations),
+            scale,
+            available_at,
+            expires_at,
+        ),
+        StructuralLevel(
+            instrument,
+            f"{family}-low-{slug}",
+            family,
+            LOWER,
+            min(bar.low for bar in observations),
+            scale,
+            available_at,
+            expires_at,
+        ),
+    )
+
+
+def generate_structural_levels(
+    bars: Iterable[Bar], spec: StructuralLevelSpec | None = None
+) -> tuple[StructuralLevel, ...]:
+    """Generate PIT PDH/PDL, Asia, and London OR60 levels from canonical M1 bars.
+
+    A window contributes only when every expected M1 observation is present.
+    Delayed bars delay ``available_at``; they are never back-filled into an
+    earlier research instant. Inputs are materialised but never modified.
+    """
+    if spec is None:
+        spec = StructuralLevelSpec()
+    if not isinstance(spec, StructuralLevelSpec):
+        raise FailedBreakoutError("spec must be a StructuralLevelSpec")
+    items = tuple(bars)
+    if not items:
+        return ()
+    instrument = _validate_bars(items)
+    if any(bar.open_time.year != spec.discovery_year for bar in items):
+        raise FailedBreakoutError("all discovery bars must belong to discovery_year")
+    by_open = {bar.open_time: bar for bar in items}
+    if len(by_open) != len(items):
+        raise FailedBreakoutError("M1 open timestamps must be unique")
+
+    utc_dates = sorted({bar.open_time.date() for bar in items})
+    daily: dict[date, tuple[Bar, ...]] = {}
+    for day in utc_dates:
+        start = datetime.combine(day, time(), UTC)
+        complete = _complete_window(by_open, start, start + timedelta(days=1))
+        if complete is not None:
+            daily[day] = complete
+
+    windows = {window.name: window for window in spec.session_spec.major_sessions}
+    asia = windows[spec.asia_session]
+    london = windows[spec.london_session]
+    local_dates: set[date] = set()
+    for bar in items:
+        local_dates.add(bar.open_time.astimezone(ZoneInfo(asia.timezone)).date())
+        local_dates.add(bar.open_time.astimezone(ZoneInfo(london.timezone)).date())
+
+    levels: list[StructuralLevel] = []
+    for day in utc_dates:
+        previous = daily.get(day - timedelta(days=1))
+        if previous is None:
+            continue
+        start = datetime.combine(day, time(), UTC)
+        end = start + timedelta(days=1)
+        scale = max(bar.high for bar in previous) - min(bar.low for bar in previous)
+        if scale <= 0:
+            continue
+        available = max(start, max(bar.available_at for bar in previous))
+        if available < end:
+            levels.extend(
+                _level_pair(
+                    instrument=instrument,
+                    family="previous-day",
+                    instance=day,
+                    observations=previous,
+                    scale=scale,
+                    available_at=available,
+                    expires_at=end,
+                )
+            )
+
+    for local_day in sorted(local_dates):
+        for family, window, width in (
+            ("asia-session", asia, None),
+            ("london-or60", london, spec.london_opening_range_minutes),
+        ):
+            start, session_end = _window_bounds(window, local_day)
+            anchor_end = (
+                session_end if width is None else start + timedelta(minutes=width)
+            )
+            observations = _complete_window(by_open, start, anchor_end)
+            scale_bars = daily.get(start.date() - timedelta(days=1))
+            if observations is None or scale_bars is None:
+                continue
+            scale = max(bar.high for bar in scale_bars) - min(
+                bar.low for bar in scale_bars
+            )
+            if scale <= 0:
+                continue
+            available = max(
+                anchor_end,
+                *(bar.available_at for bar in observations),
+                *(bar.available_at for bar in scale_bars),
+            )
+            if family == "asia-session":
+                next_start, _ = _window_bounds(window, local_day + timedelta(days=1))
+                expires = next_start
+            else:
+                expires = session_end
+            if available < expires:
+                levels.extend(
+                    _level_pair(
+                        instrument=instrument,
+                        family=family,
+                        instance=local_day,
+                        observations=observations,
+                        scale=scale,
+                        available_at=available,
+                        expires_at=expires,
+                    )
+                )
+    return tuple(sorted(levels, key=lambda item: (item.available_at, item.level_id)))
+
+
 def detect_failed_breakouts(
     bars: Iterable[Bar],
     levels: Iterable[StructuralLevel],
@@ -326,7 +527,9 @@ def detect_failed_breakouts(
                             max_depth_fraction=episode.max_depth_fraction,
                             outside_close_count=episode.outside_close_count,
                             minutes_to_reclaim=minutes,
-                            reclaim_inside_fraction=_reclaim_inside_fraction(level, bar),
+                            reclaim_inside_fraction=_reclaim_inside_fraction(
+                                level, bar
+                            ),
                         )
                     )
                 episodes.pop(level_id, None)
@@ -340,10 +543,14 @@ __all__ = [
     "FAILED_BREAKOUT_FAMILY",
     "FAILED_BREAKOUT_SPEC_VERSION",
     "LOWER",
+    "PREREGISTERED_MINIMUM_DEPTHS",
+    "PRE_EVENT_SCALE",
     "UPPER",
     "FailedBreakoutError",
     "FailedBreakoutEvent",
     "FailedBreakoutSpec",
     "StructuralLevel",
+    "StructuralLevelSpec",
     "detect_failed_breakouts",
+    "generate_structural_levels",
 ]

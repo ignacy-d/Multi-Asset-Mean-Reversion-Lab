@@ -1,6 +1,6 @@
 # Failed Breakout discovery preregistration v1
 
-Scope: 2024 discovery only. 2025 remains sealed and is not an input to this work.
+Scope: 2024 discovery inputs only.
 
 ## Hypothesis
 
@@ -17,6 +17,24 @@ The implementation contract accepts precomputed causal structural levels. The fi
 - first 60 minutes of the London session opening range high / low.
 
 Anchor values and normalization scale must be available before the breakout can qualify.
+Generation consumes immutable canonical M1 `Bar` values, requires exact minute
+coverage for each construction window, and never fills missing observations.
+
+Each level records explicit `available_at` and `expires_at` UTC instants. The
+previous-day pair becomes available only after the complete prior UTC day and
+expires at the next UTC midnight. The Asia pair becomes available at the
+historical session close and expires at the next Asia open. London OR60 becomes
+available only after all first-60-minute bars are complete and expires at that
+London session's close. Session boundaries use the existing versioned IANA
+timezone session specification, including historical DST.
+
+## Frozen normalization
+
+Every anchor uses the same pre-event scale: the high-low range of the immediately
+preceding complete UTC day. That day must have exact M1 coverage, the range must
+be positive, and every contributing bar must already be available. Otherwise the
+anchor fails closed. This definition is intentionally independent from VWAP,
+z-scores, and OU state and is not selected from observed results.
 
 ## Detector grid
 
