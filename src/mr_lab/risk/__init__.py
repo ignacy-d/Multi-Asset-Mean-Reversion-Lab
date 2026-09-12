@@ -3,6 +3,7 @@
 from .contracts import (
     AccountSnapshot,
     InstrumentSizingContext,
+    LossLimitState,
     OpenExposure,
     ProtectiveBoundary,
     RiskDecision,
@@ -22,6 +23,7 @@ from .sizing import conservative_quantity
 __all__ = [
     "AccountSnapshot",
     "InstrumentSizingContext",
+    "LossLimitState",
     "OpenExposure",
     "ProtectiveBoundary",
     "RiskDecision",

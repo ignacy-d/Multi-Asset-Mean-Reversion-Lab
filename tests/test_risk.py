@@ -14,6 +14,7 @@ from mr_lab.portfolio import (
 from mr_lab.risk import (
     AccountSnapshot,
     InstrumentSizingContext,
+    LossLimitState,
     OpenExposure,
     ProtectiveBoundary,
     RiskDecisionState,
@@ -71,7 +72,7 @@ def request(item=None, *, entry="1.1000", protective="1.0900", tags=()):
     )
 
 
-def account(*exposures, equity="10000"):
+def account(*exposures, equity="10000", loss_limits=None):
     return AccountSnapshot(
         NOW,
         "USD",
@@ -80,13 +81,13 @@ def account(*exposures, equity="10000"):
         D("10000"),
         D("0"),
         D("0"),
-        D("10000"),
+        loss_limits,
         exposures,
     )
 
 
 def context(
-    item=None,
+    req=None,
     *,
     loss="0.01",
     minimum="1",
@@ -95,11 +96,12 @@ def context(
     entry="1.1000",
     protective="1.0900",
 ):
-    item = item or proposal()
+    req = req or request()
     return InstrumentSizingContext(
-        f"sizing-{item.instrument}",
+        f"sizing-{req.risk_request_id}",
         "1",
-        item.instrument,
+        req.risk_request_id,
+        req.instrument,
         "USD",
         NOW,
         D(entry),
@@ -117,8 +119,8 @@ def policy(
     aggregate="0.03",
     mr_trade="0.01",
     mr_cap="0.02",
-    floor=None,
     maximum_new=None,
+    require_loss_limits=False,
 ):
     return RiskPolicy(
         "synthetic-risk",
@@ -130,7 +132,7 @@ def policy(
             SleeveRiskLimit("macro", D("0.01"), D("0.01"), 30),
         ),
         timedelta(seconds=1),
-        D(floor) if floor else None,
+        require_loss_limits,
         maximum_new_positions=maximum_new,
     )
 
@@ -166,33 +168,29 @@ def test_protective_boundary_is_required_and_directionally_consistent():
 def test_sizing_is_exact_conservative_and_never_raises_to_minimum_or_above_maximum():
     req = request()
     decision = RiskKernel(policy(mr_trade="0.01005")).evaluate(
-        (req,), account(), (context(loss="0.03", step="100"),)
+        (req,), account(), (context(req, loss="0.03", step="100"),)
     )[0]
     assert decision.decision is RiskDecisionState.ACCEPT
     assert decision.approved_quantity == D("3300")
     assert decision.approved_monetary_risk == D("99.00")
 
     below = RiskKernel(policy(mr_trade="0.00001")).evaluate(
-        (req,), account(), (context(minimum="100", step="100"),)
+        (req,), account(), (context(req, minimum="100", step="100"),)
     )[0]
     above = RiskKernel(policy()).evaluate(
-        (req,), account(), (context(maximum="9000"),)
+        (req,), account(), (context(req, maximum="9000"),)
     )[0]
     assert below.decision is RiskDecisionState.REJECT
     assert above.decision is RiskDecisionState.REJECT
 
 
-def test_account_floor_and_existing_aggregate_and_sleeve_risk_fail_closed():
+def test_existing_aggregate_and_sleeve_risk_fail_closed():
     req = request()
-    floor_result = RiskKernel(policy(floor="9000")).evaluate(
-        (req,), account(equity="9000"), (context(),)
-    )[0]
-    assert floor_result.reason == "account equity at or below hard floor"
     existing = OpenExposure(
         "position-1", "USDJPY", "LONG", D("1"), D("150"), D("150"), D("250"), "trend"
     )
     aggregate_result = RiskKernel(policy(aggregate="0.03")).evaluate(
-        (req,), account(existing), (context(),)
+        (req,), account(existing), (context(req),)
     )[0]
     assert aggregate_result.reason == "aggregate open-risk limit exceeded"
 
@@ -201,7 +199,7 @@ def test_complete_batch_is_order_invariant_and_joint_limit_is_enforced():
     mr = request(proposal(suffix="mr"))
     trend_item = proposal("trend", "GBPUSD", "SHORT", "trend")
     trend = request(trend_item, protective="1.1100")
-    contexts = (context(), context(trend_item, entry="1.1000", protective="1.1100"))
+    contexts = (context(mr), context(trend, entry="1.1000", protective="1.1100"))
     kernel = RiskKernel(policy(aggregate="0.015"))
     forward = kernel.evaluate((mr, trend), account(), contexts)
     reverse = kernel.evaluate((trend, mr), account(), tuple(reversed(contexts)))
@@ -215,6 +213,113 @@ def test_complete_batch_is_order_invariant_and_joint_limit_is_enforced():
     )  # explicit lower priority value wins
 
 
+def test_same_instrument_requests_use_independent_request_specific_contexts():
+    mr = request(proposal(direction="SHORT", suffix="mr"), protective="1.1050")
+    trend = request(proposal("trend", "EURUSD", "SHORT", "trend"), protective="1.1120")
+    mr_context = context(mr, protective="1.1050", loss="0.005")
+    trend_context = context(trend, protective="1.1120", loss="0.012")
+    assert mr_context.loss_per_quantity != trend_context.loss_per_quantity
+
+    kernel = RiskKernel(policy(aggregate="0.03"))
+    forward = kernel.evaluate((mr, trend), account(), (mr_context, trend_context))
+    reverse = kernel.evaluate((trend, mr), account(), (trend_context, mr_context))
+    assert forward == reverse
+    assert all(item.decision is RiskDecisionState.ACCEPT for item in forward)
+    assert {item.approved_quantity for item in forward} == {D("20000"), D("8300")}
+
+
+def test_conflicting_or_wrong_request_sizing_context_fails_closed():
+    req = request()
+    valid = context(req)
+    conflicting = replace(
+        valid, sizing_context_id="different", loss_per_quantity=D("1")
+    )
+    with pytest.raises(RiskInvariantError, match="conflicting sizing contexts"):
+        RiskKernel(policy()).evaluate((req,), account(), (valid, conflicting))
+
+    other = request(proposal(suffix="other"))
+    wrongly_linked = replace(valid, risk_request_id=other.risk_request_id)
+    result = RiskKernel(policy()).evaluate((req,), account(), (wrongly_linked,))[0]
+    assert result.decision is RiskDecisionState.REJECT
+    assert result.reason == "matching sizing context unavailable"
+
+
+def test_resolved_total_and_daily_loss_floors_are_enforced_independently():
+    req = request()
+    total = LossLimitState("resolved-rules", "1", total_equity_floor=D("9950"))
+    daily = LossLimitState("resolved-rules", "1", daily_equity_floor=D("9950"))
+    total_result = RiskKernel(policy()).evaluate(
+        (req,), account(loss_limits=total), (context(req),)
+    )[0]
+    daily_result = RiskKernel(policy()).evaluate(
+        (req,), account(loss_limits=daily), (context(req),)
+    )[0]
+    assert total_result.reason == "new risk could breach resolved total equity floor"
+    assert daily_result.reason == "new risk could breach resolved daily equity floor"
+
+    inside = LossLimitState(
+        "resolved-rules",
+        "1",
+        total_equity_floor=D("9800"),
+        daily_equity_floor=D("9850"),
+    )
+    accepted = RiskKernel(policy()).evaluate(
+        (req,), account(loss_limits=inside), (context(req),)
+    )[0]
+    assert accepted.decision is RiskDecisionState.ACCEPT
+
+
+def test_resolved_loss_budget_includes_open_and_cumulative_batch_risk():
+    existing = OpenExposure(
+        "open", "USDJPY", "LONG", D("1"), D("150"), D("150"), D("75"), "trend"
+    )
+    exposure_floor = LossLimitState("resolved-rules", "1", total_equity_floor=D("9850"))
+    req = request()
+    assert (
+        RiskKernel(policy())
+        .evaluate(
+            (req,), account(existing, loss_limits=exposure_floor), (context(req),)
+        )[0]
+        .reason
+        == "new risk could breach resolved total equity floor"
+    )
+
+    trend = request(proposal("trend", "GBPUSD", "SHORT", "trend"), protective="1.1100")
+    floor = replace(exposure_floor, total_equity_floor=D("9800"))
+    decisions = RiskKernel(policy()).evaluate(
+        (req, trend),
+        account(loss_limits=floor),
+        (context(req), context(trend, protective="1.1100")),
+    )
+    assert [item.decision for item in decisions].count(RiskDecisionState.ACCEPT) == 2
+
+    tighter = replace(floor, total_equity_floor=D("9850"))
+    constrained = RiskKernel(policy()).evaluate(
+        (req, trend),
+        account(loss_limits=tighter),
+        (context(req), context(trend, protective="1.1100")),
+    )
+    assert [item.decision for item in constrained].count(RiskDecisionState.ACCEPT) == 1
+
+
+def test_loss_limit_state_is_required_and_part_of_decision_identity():
+    req = request()
+    strict = policy(require_loss_limits=True)
+    missing = RiskKernel(strict).evaluate((req,), account(), (context(req),))[0]
+    assert missing.reason == "required loss-limit state unavailable"
+
+    first_state = LossLimitState("rules", "1", total_equity_floor=D("9000"))
+    second_state = replace(first_state, total_equity_floor=D("8900"))
+    first = RiskKernel(strict).evaluate(
+        (req,), account(loss_limits=first_state), (context(req),)
+    )[0]
+    second = RiskKernel(strict).evaluate(
+        (req,), account(loss_limits=second_state), (context(req),)
+    )[0]
+    assert first.decision is second.decision is RiskDecisionState.ACCEPT
+    assert first.risk_decision_id != second.risk_decision_id
+
+
 def test_sleeve_limit_is_independent_and_unknown_sleeve_rejects():
     macro_item = proposal("macro", "AUDUSD", suffix="macro")
     macro = request(macro_item)
@@ -222,14 +327,14 @@ def test_sleeve_limit_is_independent_and_unknown_sleeve_rejects():
         "macro-open", "NZDUSD", "LONG", D("1"), D("1"), D("1"), D("50"), "macro"
     )
     macro_result = RiskKernel(policy()).evaluate(
-        (macro,), account(existing), (context(macro_item),)
+        (macro,), account(existing), (context(macro),)
     )[0]
     assert macro_result.reason == "sleeve open-risk limit exceeded"
     weather_item = proposal("weather", suffix="weather")
     weather = request(weather_item)
     assert (
         RiskKernel(policy())
-        .evaluate((weather,), account(), (context(weather_item),))[0]
+        .evaluate((weather,), account(), (context(weather),))[0]
         .reason
         == "unknown sleeve"
     )
@@ -238,8 +343,8 @@ def test_sleeve_limit_is_independent_and_unknown_sleeve_rejects():
 def test_duplicate_restart_processing_and_ids_are_deterministic():
     req = request(tags=("USD",))
     kernel = RiskKernel(policy())
-    first = kernel.evaluate((req, req), account(), (context(),))
-    restarted = RiskKernel(policy()).evaluate((req,), account(), (context(),))
+    first = kernel.evaluate((req, req), account(), (context(req),))
+    restarted = RiskKernel(policy()).evaluate((req,), account(), (context(req),))
     assert first == restarted
     assert build_execution_intent(req, first[0]) == build_execution_intent(
         req, restarted[0]
@@ -248,7 +353,7 @@ def test_duplicate_restart_processing_and_ids_are_deterministic():
         kernel.evaluate(
             (req, replace(req, strategy_policy_id="changed-payload")),
             account(),
-            (context(),),
+            (context(req),),
         )
 
 
@@ -261,9 +366,9 @@ def test_economic_changes_propagate_through_stable_identities():
         len({long.risk_request_id, changed_stop.risk_request_id, short.risk_request_id})
         == 3
     )
-    first = RiskKernel(policy()).evaluate((long,), account(), (context(),))[0]
+    first = RiskKernel(policy()).evaluate((long,), account(), (context(long),))[0]
     changed_policy = RiskKernel(policy(version="2")).evaluate(
-        (long,), account(), (context(),)
+        (long,), account(), (context(long),)
     )[0]
     assert first.risk_decision_id != changed_policy.risk_decision_id
     intent = build_execution_intent(long, first)
@@ -287,7 +392,7 @@ def test_alpha_family_details_and_confidence_are_not_risk_inputs(
     item = proposal(sleeve, instrument, direction, sleeve)
     req = request(item, protective=protective)
     result = RiskKernel(policy()).evaluate(
-        (req,), account(), (context(item, protective=protective),)
+        (req,), account(), (context(req, protective=protective),)
     )[0]
     assert result.decision is RiskDecisionState.ACCEPT
 
@@ -297,11 +402,13 @@ def test_stale_state_boundary_and_required_daily_anchor_fail_closed():
     stale_account = replace(account(), timestamp=NOW + timedelta(seconds=2))
     assert (
         "stale"
-        in RiskKernel(policy()).evaluate((req,), stale_account, (context(),))[0].reason
+        in RiskKernel(policy())
+        .evaluate((req,), stale_account, (context(req),))[0]
+        .reason
     )
-    no_anchor = replace(account(), daily_loss_anchor=None)
-    strict = replace(policy(), require_daily_loss_anchor=True)
+    no_anchor = replace(account(), loss_limit_state=None)
+    strict = replace(policy(), require_loss_limit_state=True)
     assert (
         "unavailable"
-        in RiskKernel(strict).evaluate((req,), no_anchor, (context(),))[0].reason
+        in RiskKernel(strict).evaluate((req,), no_anchor, (context(req),))[0].reason
     )

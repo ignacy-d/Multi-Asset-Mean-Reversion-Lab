@@ -108,7 +108,7 @@ class RiskKernel:
         )
         decisions: list[RiskDecision] = []
         for request in ordered:
-            context = contexts.get(request.instrument)
+            context = contexts.get(request.risk_request_id)
             state, reason, monetary, fraction, quantity = self._assess(
                 request,
                 context,
@@ -132,7 +132,7 @@ class RiskKernel:
                 account.reference_balance,
                 account.realized_pnl,
                 account.unrealized_pnl,
-                account.daily_loss_anchor,
+                account.loss_limit_state,
                 tuple(
                     sorted(account.open_exposures, key=lambda item: item.exposure_id)
                 ),
@@ -182,7 +182,7 @@ class RiskKernel:
         limit = self.policy.sleeve(request.sleeve_id)
         if limit is None:
             return RiskDecisionState.REJECT, "unknown sleeve", zero, zero, zero
-        if self.policy.require_daily_loss_anchor and account.daily_loss_anchor is None:
+        if self.policy.require_loss_limit_state and account.loss_limit_state is None:
             return (
                 RiskDecisionState.REJECT,
                 "required loss-limit state unavailable",
@@ -191,18 +191,8 @@ class RiskKernel:
                 zero,
             )
         if (
-            self.policy.account_equity_hard_floor is not None
-            and account.equity <= self.policy.account_equity_hard_floor
-        ):
-            return (
-                RiskDecisionState.REJECT,
-                "account equity at or below hard floor",
-                zero,
-                zero,
-                zero,
-            )
-        if (
             context is None
+            or context.risk_request_id != request.risk_request_id
             or context.instrument != request.instrument
             or context.account_currency != account.account_currency
         ):
@@ -249,18 +239,31 @@ class RiskKernel:
                 zero,
             )
         desired = account.equity * limit.risk_fraction_per_trade
-        if (
-            self.policy.account_equity_hard_floor is not None
-            and account.equity - used_total - desired
-            < self.policy.account_equity_hard_floor
-        ):
-            return (
-                RiskDecisionState.REJECT,
-                "new risk could breach account hard floor",
-                zero,
-                zero,
-                zero,
-            )
+        loss_limits = account.loss_limit_state
+        if loss_limits is not None:
+            worst_case_equity = account.equity - used_total - desired
+            if (
+                loss_limits.total_equity_floor is not None
+                and worst_case_equity < loss_limits.total_equity_floor
+            ):
+                return (
+                    RiskDecisionState.REJECT,
+                    "new risk could breach resolved total equity floor",
+                    zero,
+                    zero,
+                    zero,
+                )
+            if (
+                loss_limits.daily_equity_floor is not None
+                and worst_case_equity < loss_limits.daily_equity_floor
+            ):
+                return (
+                    RiskDecisionState.REJECT,
+                    "new risk could breach resolved daily equity floor",
+                    zero,
+                    zero,
+                    zero,
+                )
         sleeve_cap = account.equity * limit.maximum_open_risk_fraction
         if used_total + desired > aggregate_cap:
             return (
@@ -310,10 +313,10 @@ class RiskKernel:
     def _context_map(contexts):
         result = {}
         for context in contexts:
-            prior = result.get(context.instrument)
+            prior = result.get(context.risk_request_id)
             if prior is not None and prior != context:
-                raise RiskInvariantError("conflicting sizing contexts for instrument")
-            result[context.instrument] = context
+                raise RiskInvariantError("conflicting sizing contexts for risk request")
+            result[context.risk_request_id] = context
         return result
 
 

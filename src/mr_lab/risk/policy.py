@@ -32,8 +32,7 @@ class RiskPolicy:
     maximum_aggregate_open_risk_fraction: Decimal
     sleeve_limits: tuple[SleeveRiskLimit, ...]
     maximum_state_age: timedelta
-    account_equity_hard_floor: Decimal | None = None
-    require_daily_loss_anchor: bool = False
+    require_loss_limit_state: bool = False
     maximum_new_positions: int | None = None
 
     def __post_init__(self) -> None:
@@ -48,12 +47,6 @@ class RiskPolicy:
             raise ValueError("maximum aggregate risk fraction cannot exceed one")
         if self.maximum_state_age < timedelta(0):
             raise ValueError("maximum_state_age cannot be negative")
-        if self.account_equity_hard_floor is not None:
-            require_finite(
-                "account_equity_hard_floor",
-                self.account_equity_hard_floor,
-                positive=True,
-            )
         ids = [limit.sleeve_id for limit in self.sleeve_limits]
         if len(ids) != len(set(ids)):
             raise ValueError("sleeve limits must be unique")

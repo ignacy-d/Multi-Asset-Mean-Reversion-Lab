@@ -77,6 +77,26 @@ class OpenExposure:
 
 
 @dataclass(frozen=True, slots=True)
+class LossLimitState:
+    """Resolved account-equity floors supplied by an external rules layer."""
+
+    specification_id: str
+    version: str
+    total_equity_floor: Decimal | None = None
+    daily_equity_floor: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        require_text("specification_id", self.specification_id)
+        require_text("version", self.version)
+        if self.total_equity_floor is None and self.daily_equity_floor is None:
+            raise ValueError("loss-limit state must provide at least one equity floor")
+        for name in ("total_equity_floor", "daily_equity_floor"):
+            value = getattr(self, name)
+            if value is not None:
+                require_finite(name, value, positive=True)
+
+
+@dataclass(frozen=True, slots=True)
 class AccountSnapshot:
     timestamp: datetime
     account_currency: str
@@ -85,7 +105,7 @@ class AccountSnapshot:
     reference_balance: Decimal
     realized_pnl: Decimal
     unrealized_pnl: Decimal
-    daily_loss_anchor: Decimal | None
+    loss_limit_state: LossLimitState | None
     open_exposures: tuple[OpenExposure, ...] = ()
 
     def __post_init__(self) -> None:
@@ -95,8 +115,10 @@ class AccountSnapshot:
             require_finite(name, getattr(self, name), positive=True)
         for name in ("realized_pnl", "unrealized_pnl"):
             require_finite(name, getattr(self, name))
-        if self.daily_loss_anchor is not None:
-            require_finite("daily_loss_anchor", self.daily_loss_anchor, positive=True)
+        if self.loss_limit_state is not None and not isinstance(
+            self.loss_limit_state, LossLimitState
+        ):
+            raise ValueError("loss_limit_state must be a LossLimitState")
         seen: dict[str, OpenExposure] = {}
         for exposure in self.open_exposures:
             if exposure.exposure_id in seen:
@@ -139,6 +161,7 @@ class RiskRequest:
 class InstrumentSizingContext:
     sizing_context_id: str
     version: str
+    risk_request_id: str
     instrument: str
     account_currency: str
     timestamp: datetime
@@ -150,7 +173,13 @@ class InstrumentSizingContext:
     quantity_step: Decimal
 
     def __post_init__(self) -> None:
-        for name in ("sizing_context_id", "version", "instrument", "account_currency"):
+        for name in (
+            "sizing_context_id",
+            "version",
+            "risk_request_id",
+            "instrument",
+            "account_currency",
+        ):
             require_text(name, getattr(self, name))
         require_utc("timestamp", self.timestamp)
         for name in (
