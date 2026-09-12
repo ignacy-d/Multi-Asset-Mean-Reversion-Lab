@@ -226,40 +226,52 @@ def _event_id(s):
 
 
 def deduplicate_states(states) -> tuple[CandidateEvent, ...]:
-    armed = {}
+    deduplicator = SignalStateDeduplicator()
     events = []
     for state in sorted(states, key=_state_sort_key):
-        key = _state_key(state)
-        if not state.qualifying:
-            if abs(state.z) < SIGNAL_THRESHOLD:
-                armed[key] = True
-            continue
-        if abs(state.z) < SIGNAL_THRESHOLD:
-            raise Stage4BError("qualifying state below threshold")
-        if armed.get(key, True):
-            d0 = state.p0 - state.e0
-            signal = FrozenSignal(
-                state.instrument,
-                state.timestamp,
-                state.benchmark_family,
-                state.signal_timeframe,
-                state.session,
-                state.lookback,
-                SIGNAL_THRESHOLD,
-                state.direction,
-                state.p0,
-                state.e0,
-                d0,
-                state.z,
-                state.source_corpus_id,
-                state.assembled_dataset_id,
-                state.strategy_spec_id,
-            )
-            events.append(CandidateEvent(_event_id(state), signal))
-            armed[key] = False
+        event = deduplicator.push(state)
+        if event is not None:
+            events.append(event)
     return tuple(
         sorted(events, key=lambda e: (e.signal.signal_timestamp, e.candidate_event_id))
     )
+
+
+class SignalStateDeduplicator:
+    """Incremental form of the frozen per-cell Stage4B re-arm state machine."""
+
+    def __init__(self):
+        self._armed = {}
+
+    def push(self, state: SignalState) -> CandidateEvent | None:
+        key = _state_key(state)
+        if not state.qualifying:
+            if abs(state.z) < SIGNAL_THRESHOLD:
+                self._armed[key] = True
+            return None
+        if abs(state.z) < SIGNAL_THRESHOLD:
+            raise Stage4BError("qualifying state below threshold")
+        if not self._armed.get(key, True):
+            return None
+        signal = FrozenSignal(
+            state.instrument,
+            state.timestamp,
+            state.benchmark_family,
+            state.signal_timeframe,
+            state.session,
+            state.lookback,
+            SIGNAL_THRESHOLD,
+            state.direction,
+            state.p0,
+            state.e0,
+            state.p0 - state.e0,
+            state.z,
+            state.source_corpus_id,
+            state.assembled_dataset_id,
+            state.strategy_spec_id,
+        )
+        self._armed[key] = False
+        return CandidateEvent(_event_id(state), signal)
 
 
 def reversion_fraction(signal, price):

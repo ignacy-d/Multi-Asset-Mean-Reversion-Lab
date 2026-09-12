@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -10,6 +10,7 @@ from mr_lab.data import Bar, Timeframe
 from mr_lab.data.resampling import IncompleteWindow, _aligned_open, resample_bars
 from mr_lab.ornstein_uhlenbeck import (
     FrozenOuEligibilityFilter,
+    IncrementalOuStateBuilder,
     ResidualObservation,
     build_candidate_ou_states,
     candidate_process_keys,
@@ -19,8 +20,8 @@ from mr_lab.replay.parity import FrozenOuDecision, FrozenOuDecisionDetails
 from mr_lab.research import build_research_observations
 from mr_lab.sessions import DEFAULT_SESSION_SPEC
 from mr_lab.signals import AlphaSignal, SignalProvenance, SignalReference
-from mr_lab.stage4b import SignalState, deduplicate_states
-from mr_lab.stage4b_runner import assemble_vwap_signal_states
+from mr_lab.stage4b import SignalState, SignalStateDeduplicator, deduplicate_states
+from mr_lab.stage4b_runner import IncrementalVwapSignalStateBuilder
 
 
 class ReplayError(ValueError):
@@ -84,30 +85,88 @@ class IncrementalResampler:
 
 @dataclass(frozen=True, slots=True)
 class ReplayPrefix:
-    """All canonical information legally available at an M15 close."""
+    """A causal stream update containing only newly completed M1/M15 bars."""
 
     completed_m1: tuple[Bar, ...]
     completed_m15: tuple[Bar, ...]
     available_at: datetime
 
 
-StateBuilder = Callable[[ReplayPrefix], Iterable[SignalState]]
-
-
 class FrozenOuResearchBuilder:
-    """Production adapter over the same VWAP assembly used by Stage4B research."""
+    """Bounded production adapter over shared incremental VWAP primitives."""
 
     def __init__(self, manifest: dict[str, str | None]):
-        self._manifest = manifest
+        self._features = IncrementalVwapSignalStateBuilder(manifest)
 
-    def __call__(self, prefix: ReplayPrefix) -> tuple[SignalState, ...]:
-        m1 = build_research_observations(prefix.completed_m1, DEFAULT_SESSION_SPEC)
-        m15 = build_research_observations(prefix.completed_m15, DEFAULT_SESSION_SPEC)
+    def push_m1(self, bar: Bar) -> None:
+        observation = build_research_observations((bar,), DEFAULT_SESSION_SPEC)[0]
+        self._features.push_m1(observation)
+
+    def push_m15(self, bar: Bar) -> tuple[SignalState, ...]:
+        observation = build_research_observations((bar,), DEFAULT_SESSION_SPEC)[0]
         return tuple(
             state
-            for state in assemble_vwap_signal_states(m1, m15, self._manifest)
+            for state in self._features.push_target(observation)
             if state.session == "london" and state.direction.name == "SHORT"
         )
+
+    def advance(self, prefix: ReplayPrefix) -> tuple[SignalState, ...]:
+        """Consume every newly completed bar once through the typed boundary."""
+        for bar in prefix.completed_m1:
+            if bar.available_at > prefix.available_at:
+                raise ReplayError("replay prefix contains future M1 data")
+            self.push_m1(bar)
+        output = []
+        for bar in prefix.completed_m15:
+            if bar.available_at > prefix.available_at:
+                raise ReplayError("replay prefix contains future M15 data")
+            output.extend(self.push_m15(bar))
+        return tuple(output)
+
+    @property
+    def retained_rolling_values(self):
+        return self._features.retained_rolling_values
+
+
+def _decision(candidate, state, spec):
+    gate = FrozenOuEligibilityFilter(spec, (state,))
+    decision = gate.evaluate(candidate)
+    metadata = dict(decision.metadata)
+    signal = candidate.signal
+    return FrozenOuDecision(
+        AlphaSignal(
+            module_id="frozen-ou-crossasset-v1",
+            source_event_id=candidate.candidate_event_id,
+            instrument=signal.instrument,
+            timestamp=signal.signal_timestamp,
+            direction=signal.direction.name,
+            confidence=None,
+            reference=SignalReference(signal.p0, "completed-signal-close"),
+            invalidation=None,
+            provenance=SignalProvenance(
+                signal.strategy_spec_id,
+                signal.source_corpus_id,
+                signal.assembled_dataset_id,
+            ),
+        ),
+        FrozenOuDecisionDetails(
+            signal.benchmark_family,
+            signal.lookback,
+            signal.p0,
+            signal.e0,
+            signal.normalized_deviation,
+            state.process_id,
+            state.process_spec_id,
+            state.status,
+            state.is_structurally_valid,
+            state.invalid_reason,
+            state.ornstein_uhlenbeck_score,
+            state.half_life_minutes,
+            decision.eligible,
+            metadata["eligibility_reason"],
+            decision.filter_spec_id,
+        ),
+    )
 
 
 def build_frozen_ou_decisions(
@@ -123,7 +182,6 @@ def build_frozen_ou_decisions(
     state_index = {
         (state.process_id, state.available_at): state for state in candidate_states
     }
-    gate = FrozenOuEligibilityFilter(spec, candidate_states)
     output = []
     for candidate in candidates:
         signal = candidate.signal
@@ -145,94 +203,62 @@ def build_frozen_ou_decisions(
                 "candidate is missing its exact-time OU process state: "
                 f"{candidate.candidate_event_id}"
             )
-        decision = gate.evaluate(candidate)
-        metadata = dict(decision.metadata)
-        output.append(
-            FrozenOuDecision(
-                AlphaSignal(
-                    module_id="frozen-ou-crossasset-v1",
-                    source_event_id=candidate.candidate_event_id,
-                    instrument=signal.instrument,
-                    timestamp=signal.signal_timestamp,
-                    direction=signal.direction.name,
-                    confidence=None,
-                    reference=SignalReference(signal.p0, "completed-signal-close"),
-                    invalidation=None,
-                    provenance=SignalProvenance(
-                        signal.strategy_spec_id,
-                        signal.source_corpus_id,
-                        signal.assembled_dataset_id,
-                    ),
-                ),
-                FrozenOuDecisionDetails(
-                    signal.benchmark_family,
-                    signal.lookback,
-                    signal.p0,
-                    signal.e0,
-                    signal.normalized_deviation,
-                    state.process_id,
-                    state.process_spec_id,
-                    state.status,
-                    state.is_structurally_valid,
-                    state.invalid_reason,
-                    state.ornstein_uhlenbeck_score,
-                    state.half_life_minutes,
-                    decision.eligible,
-                    metadata["eligibility_reason"],
-                    decision.filter_spec_id,
-                ),
-            )
-        )
+        output.append(_decision(candidate, state, spec))
     return tuple(output)
 
 
 class FrozenOuReplayEngine:
     """Replay completed M1 candles through shared Stage4B/OU research code.
 
-    ``state_builder`` is the production boundary for an alpha module.  It is
-    called with only completed M1 and M15 prefixes, never future bars.  The
-    builder should use the existing research feature construction and return all
-    valid Stage4B states in that prefix. Rebuilding from the prefix is
-    intentionally simple for M0 and makes point-in-time parity auditable.
+    Every M1 is admitted once to the causal builder. Every complete M15 advances
+    four bounded VWAP/OU processes once; no complete input prefix is rebuilt.
     """
 
     def __init__(
-        self, state_builder: StateBuilder, filter_name="frozen-ou-crossasset-v1"
+        self,
+        state_builder: FrozenOuResearchBuilder,
+        filter_name="frozen-ou-crossasset-v1",
     ):
         self._resampler = IncrementalResampler()
-        self._m1: list[Bar] = []
-        self._bars: list[Bar] = []
         self._builder = state_builder
         self._spec = frozen_ou_eligibility_spec(filter_name)
-        self._emitted: set[str] = set()
-
-    @property
-    def completed_bars(self) -> tuple[Bar, ...]:
-        return tuple(self._bars)
+        self._deduplicator = SignalStateDeduplicator()
+        self._ou = IncrementalOuStateBuilder(self._spec.process_spec)
+        self.completed_m15_count = 0
 
     def push(self, bar: Bar) -> tuple[FrozenOuDecision, ...]:
         completed = self._resampler.push(bar)
-        self._m1.append(bar)
-        if completed is None:
-            return ()
-        self._bars.append(completed)
-        prefix = ReplayPrefix(
-            tuple(self._m1), tuple(self._bars), completed.available_at
+        completed_m15 = () if completed is None else (completed,)
+        states = self._builder.advance(
+            ReplayPrefix((bar,), completed_m15, bar.available_at)
         )
-        states = tuple(self._builder(prefix))
+        if completed is None:
+            if states:
+                raise ReplayError("state builder emitted before an M15 completion")
+            return ()
+        self.completed_m15_count += 1
         if any(state.timestamp > completed.available_at for state in states):
             raise ReplayError("state builder returned future information")
-        decisions = build_frozen_ou_decisions(states, self._spec.name)
         output = []
-        for decision in decisions:
-            event_id = decision.signal.source_event_id
-            if event_id in self._emitted:
-                continue
-            if decision.signal.timestamp != completed.available_at:
-                raise ReplayError("state history produced a retroactive candidate")
-            output.append(decision)
-            self._emitted.add(event_id)
-        return tuple(output)
+        for state in states:
+            observation = ResidualObservation(
+                state.instrument,
+                state.benchmark_family,
+                state.signal_timeframe,
+                state.session,
+                state.lookback,
+                state.strategy_spec_id,
+                state.timestamp,
+                state.p0,
+                state.e0,
+            )
+            process_state = self._ou.push(observation)
+            candidate = self._deduplicator.push(state)
+            if candidate is not None:
+                if candidate.signal.signal_timestamp != completed.available_at:
+                    raise ReplayError("state builder produced a retroactive candidate")
+                output.append(_decision(candidate, process_state, self._spec))
+        return tuple(sorted(output, key=lambda item: item.signal.source_event_id))
 
     def run(self, bars: Iterable[Bar]) -> tuple[FrozenOuDecision, ...]:
         output = []
@@ -244,3 +270,7 @@ class FrozenOuReplayEngine:
     @property
     def incomplete_windows(self) -> tuple[IncompleteWindow, ...]:
         return tuple(self._resampler.incomplete_windows)
+
+    @property
+    def retained_transition_count(self):
+        return self._ou.retained_transition_count

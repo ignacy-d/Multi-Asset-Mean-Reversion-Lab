@@ -74,7 +74,8 @@ def test_actual_stage4b_research_assembly_exactly_matches_candle_replay():
         assemble_signal_states(SimpleNamespace(bars=m1), MANIFEST)
     )
     reference = build_frozen_ou_decisions(research_states)
-    engine = FrozenOuReplayEngine(FrozenOuResearchBuilder(MANIFEST))
+    builder = FrozenOuResearchBuilder(MANIFEST)
+    engine = FrozenOuReplayEngine(builder)
     replay = engine.run(m1)
 
     report = compare_event_streams(reference, replay)
@@ -100,8 +101,10 @@ def test_actual_stage4b_research_assembly_exactly_matches_candle_replay():
     assert not any(record.details.eligible for record in reference)
     assert all(record.details.eligibility_reason for record in reference)
 
-    # The final replay prefix contains exactly the raw M1 and epoch-resampled M15
-    # histories used by research, demonstrating canonical-M1 boundary coverage.
+    # Replay emits the exact batch M15 count while retaining only bounded rolling
+    # feature and OU state rather than either complete input history.
     batch = resample_bars(m1, Timeframe("15m"))
-    assert engine.completed_bars == batch.bars
+    assert engine.completed_m15_count == len(batch.bars)
     assert batch.incomplete_windows == ()
+    assert builder.retained_rolling_values <= 20 + 40
+    assert engine.retained_transition_count <= 4 * 128
