@@ -48,13 +48,21 @@ class ProtectiveBoundary:
 
 @dataclass(frozen=True, slots=True)
 class OpenExposure:
+    """Economic exposure marked at the account snapshot's current state.
+
+    ``remaining_loss_to_protective_boundary`` is the incremental monetary loss
+    from current marked equity to the currently effective protective boundary.
+    It is not the position's initial risk at entry.  The account adapter is
+    responsible for calculating it in account currency.
+    """
+
     exposure_id: str
     instrument: str
     direction: str
     quantity: Decimal
     entry_price: Decimal
     current_price: Decimal
-    money_at_risk: Decimal
+    remaining_loss_to_protective_boundary: Decimal
     sleeve_id: str
     proposal_id: str | None = None
     opportunity_id: str | None = None
@@ -68,9 +76,12 @@ class OpenExposure:
         require_direction(self.direction)
         for name in ("quantity", "entry_price", "current_price"):
             require_finite(name, getattr(self, name), positive=True)
-        require_finite("money_at_risk", self.money_at_risk)
-        if self.money_at_risk < 0:
-            raise ValueError("money_at_risk cannot be negative")
+        require_finite(
+            "remaining_loss_to_protective_boundary",
+            self.remaining_loss_to_protective_boundary,
+        )
+        if self.remaining_loss_to_protective_boundary < 0:
+            raise ValueError("remaining_loss_to_protective_boundary cannot be negative")
         for name in ("protective_price", "unrealized_pnl"):
             value = getattr(self, name)
             if value is not None:
@@ -79,6 +90,7 @@ class OpenExposure:
             raise ValueError("factor_tags must be unique")
         for tag in self.factor_tags:
             require_text("factor_tag", tag)
+        object.__setattr__(self, "factor_tags", tuple(sorted(self.factor_tags)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +175,7 @@ class RiskRequest:
         self.protective_boundary.validate_for(self.direction)
         if len(set(self.factor_tags)) != len(self.factor_tags):
             raise ValueError("factor_tags must be unique")
+        object.__setattr__(self, "factor_tags", tuple(sorted(self.factor_tags)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,3 +316,6 @@ class SizedExecutionIntent:
         require_utc("proposal_timestamp", self.proposal_timestamp)
         require_utc("approved_at", self.approved_at)
         self.protective_boundary.validate_for(self.direction)
+        if len(set(self.factor_tags)) != len(self.factor_tags):
+            raise ValueError("factor_tags must be unique")
+        object.__setattr__(self, "factor_tags", tuple(sorted(self.factor_tags)))

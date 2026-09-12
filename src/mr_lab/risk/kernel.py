@@ -89,12 +89,17 @@ class RiskKernel:
         candidates = self._deduplicate(requests)
         contexts = self._context_map(sizing_contexts)
         existing_total = sum(
-            (item.money_at_risk for item in account.open_exposures), Decimal(0)
+            (
+                item.remaining_loss_to_protective_boundary
+                for item in account.open_exposures
+            ),
+            Decimal(0),
         )
         sleeve_used: dict[str, Decimal] = {}
         for exposure in account.open_exposures:
             sleeve_used[exposure.sleeve_id] = (
-                sleeve_used.get(exposure.sleeve_id, Decimal(0)) + exposure.money_at_risk
+                sleeve_used.get(exposure.sleeve_id, Decimal(0))
+                + exposure.remaining_loss_to_protective_boundary
             )
         aggregate_cap = (
             account.equity * self.policy.maximum_aggregate_open_risk_fraction
@@ -124,7 +129,7 @@ class RiskKernel:
                 item for item in assessments if item[2][0] is RiskDecisionState.ACCEPT
             ]
             if len(accepted) > 1 and self._tie_group_contends(
-                tuple(item[0] for item in accepted),
+                tuple(accepted),
                 account,
                 existing_total + accepted_total,
                 sleeve_used,
@@ -168,7 +173,15 @@ class RiskKernel:
             request.risk_request_id,
             self.policy.policy_id,
             self.policy.policy_version,
-            account,
+            account.timestamp,
+            account.account_currency,
+            account.balance,
+            account.equity,
+            account.reference_balance,
+            account.realized_pnl,
+            account.unrealized_pnl,
+            account.loss_limit_state,
+            tuple(sorted(account.open_exposures, key=lambda item: item.exposure_id)),
             context,
             state,
             reason,
@@ -194,34 +207,37 @@ class RiskKernel:
         )
 
     def _tie_group_contends(
-        self, requests, account, used_total, sleeve_used, accepted_count, aggregate_cap
+        self,
+        assessments,
+        account,
+        used_total,
+        sleeve_used,
+        accepted_count,
+        aggregate_cap,
     ):
-        desired_by_sleeve: dict[str, Decimal] = {}
-        desired_total = Decimal(0)
-        for request in requests:
-            desired = (
-                account.equity
-                * self.policy.sleeve(request.sleeve_id).risk_fraction_per_trade
-            )
-            desired_total += desired
-            desired_by_sleeve[request.sleeve_id] = (
-                desired_by_sleeve.get(request.sleeve_id, Decimal(0)) + desired
+        actual_by_sleeve: dict[str, Decimal] = {}
+        actual_total = Decimal(0)
+        for request, _, result in assessments:
+            actual = result[2]
+            actual_total += actual
+            actual_by_sleeve[request.sleeve_id] = (
+                actual_by_sleeve.get(request.sleeve_id, Decimal(0)) + actual
             )
         if (
             self.policy.maximum_new_positions is not None
-            and accepted_count + len(requests) > self.policy.maximum_new_positions
+            and accepted_count + len(assessments) > self.policy.maximum_new_positions
         ):
             return True
-        if used_total + desired_total > aggregate_cap:
+        if used_total + actual_total > aggregate_cap:
             return True
-        for sleeve_id, desired in desired_by_sleeve.items():
+        for sleeve_id, actual in actual_by_sleeve.items():
             limit = self.policy.sleeve(sleeve_id)
-            if sleeve_used.get(sleeve_id, Decimal(0)) + desired > (
+            if sleeve_used.get(sleeve_id, Decimal(0)) + actual > (
                 account.equity * limit.maximum_open_risk_fraction
             ):
                 return True
         loss_limits = account.loss_limit_state
-        worst_case_equity = account.equity - used_total - desired_total
+        worst_case_equity = account.equity - used_total - actual_total
         return loss_limits is not None and any(
             floor is not None and worst_case_equity < floor
             for floor in (
@@ -301,9 +317,19 @@ class RiskKernel:
                 zero,
             )
         desired = account.equity * limit.risk_fraction_per_trade
+        quantity = conservative_quantity(desired, context)
+        if quantity is None:
+            return (
+                RiskDecisionState.REJECT,
+                "desired risk has no executable quantity",
+                zero,
+                zero,
+                zero,
+            )
+        actual = quantity * context.loss_per_quantity
         loss_limits = account.loss_limit_state
         if loss_limits is not None:
-            worst_case_equity = account.equity - used_total - desired
+            worst_case_equity = account.equity - used_total - actual
             if (
                 loss_limits.total_equity_floor is not None
                 and worst_case_equity < loss_limits.total_equity_floor
@@ -327,7 +353,7 @@ class RiskKernel:
                     zero,
                 )
         sleeve_cap = account.equity * limit.maximum_open_risk_fraction
-        if used_total + desired > aggregate_cap:
+        if used_total + actual > aggregate_cap:
             return (
                 RiskDecisionState.REJECT,
                 "aggregate open-risk limit exceeded",
@@ -335,7 +361,7 @@ class RiskKernel:
                 zero,
                 zero,
             )
-        if sleeve_used.get(request.sleeve_id, zero) + desired > sleeve_cap:
+        if sleeve_used.get(request.sleeve_id, zero) + actual > sleeve_cap:
             return (
                 RiskDecisionState.REJECT,
                 "sleeve open-risk limit exceeded",
@@ -343,16 +369,6 @@ class RiskKernel:
                 zero,
                 zero,
             )
-        quantity = conservative_quantity(desired, context)
-        if quantity is None:
-            return (
-                RiskDecisionState.REJECT,
-                "desired risk has no executable quantity",
-                zero,
-                zero,
-                zero,
-            )
-        actual = quantity * context.loss_per_quantity
         return (
             RiskDecisionState.ACCEPT,
             "accepted within configured risk limits",

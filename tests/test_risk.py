@@ -254,6 +254,19 @@ def test_equal_priority_group_accepts_all_when_capacity_fits():
     assert all(item.decision is RiskDecisionState.ACCEPT for item in decisions)
 
 
+def test_equal_priority_capacity_uses_step_rounded_executable_risk():
+    first = request(proposal(suffix="rounded-first"))
+    second = request(proposal(instrument="GBPUSD", suffix="rounded-second"))
+    decisions = RiskKernel(policy(aggregate="0.0198")).evaluate(
+        (first, second),
+        account(),
+        (context(first, loss="0.03"), context(second, loss="0.03")),
+    )
+    assert all(item.decision is RiskDecisionState.ACCEPT for item in decisions)
+    assert sum(item.approved_monetary_risk for item in decisions) == D("198.00")
+    assert D("200") > D("10000") * D("0.0198")
+
+
 def test_same_instrument_requests_use_independent_request_specific_contexts():
     mr = request(proposal(direction="SHORT", suffix="mr"), protective="1.1050")
     trend = request(proposal("trend", "EURUSD", "SHORT", "trend"), protective="1.1120")
@@ -341,6 +354,81 @@ def test_resolved_loss_budget_includes_open_and_cumulative_batch_risk():
         (context(req), context(trend, protective="1.1100")),
     )
     assert [item.decision for item in constrained].count(RiskDecisionState.ACCEPT) == 1
+
+
+def test_account_exposure_order_is_not_part_of_economic_identity():
+    req = request()
+    first_exposure = OpenExposure(
+        "position-1", "USDJPY", "LONG", D("1"), D("150"), D("151"), D("25"), "trend"
+    )
+    second_exposure = OpenExposure(
+        "position-2", "AUDUSD", "SHORT", D("2"), D("0.66"), D("0.65"), D("30"), "macro"
+    )
+    forward_account = account(first_exposure, second_exposure)
+    reverse_account = account(second_exposure, first_exposure)
+    kernel = RiskKernel(policy())
+    forward = kernel.evaluate((req,), forward_account, (context(req),))[0]
+    reverse = kernel.evaluate((req,), reverse_account, (context(req),))[0]
+    assert forward == reverse
+    assert build_execution_intent(req, forward) == build_execution_intent(req, reverse)
+
+    changed = replace(first_exposure, current_price=D("152"))
+    changed_decision = kernel.evaluate(
+        (req,), account(changed, second_exposure), (context(req),)
+    )[0]
+    assert changed_decision.risk_decision_id != forward.risk_decision_id
+
+
+def test_factor_tags_are_canonical_set_like_identity_inputs():
+    forward = request(tags=("USD", "rates"))
+    reverse = request(tags=("rates", "USD"))
+    assert forward == reverse
+    exposure = OpenExposure(
+        "position",
+        "EURUSD",
+        "LONG",
+        D("1"),
+        D("1.1"),
+        D("1.2"),
+        D("10"),
+        "trend",
+        factor_tags=("USD", "rates"),
+    )
+    assert exposure == replace(exposure, factor_tags=("rates", "USD"))
+
+
+def test_remaining_loss_uses_current_marked_equity_not_initial_risk():
+    initial_risk = D("100")
+    profitable = OpenExposure(
+        exposure_id="profitable",
+        instrument="EURUSD",
+        direction="LONG",
+        quantity=D("1"),
+        entry_price=D("1.10"),
+        current_price=D("1.15"),
+        remaining_loss_to_protective_boundary=D("150"),
+        sleeve_id="trend",
+        protective_price=D("1.00"),
+        unrealized_pnl=D("50"),
+    )
+    adverse = replace(
+        profitable,
+        exposure_id="adverse",
+        current_price=D("1.05"),
+        remaining_loss_to_protective_boundary=D("50"),
+        unrealized_pnl=D("-50"),
+    )
+    assert profitable.remaining_loss_to_protective_boundary > initial_risk
+    assert adverse.remaining_loss_to_protective_boundary < initial_risk
+
+    req = request()
+    floor = LossLimitState("resolved", "1", total_equity_floor=D("9801"))
+    result = RiskKernel(policy()).evaluate(
+        (req,),
+        account(profitable, equity="10050", loss_limits=floor),
+        (context(req),),
+    )[0]
+    assert result.reason == "new risk could breach resolved total equity floor"
 
 
 def test_loss_limit_state_is_required_and_part_of_decision_identity():
