@@ -468,6 +468,22 @@ def policy_summaries(rows):
     return result
 
 
+def matrix_filters(args):
+    """Resolve optional diagnostic filters without filtering strategy policies."""
+    scenarios = (
+        tuple(item for item in COST_SCENARIOS if item[0] == args.cost_scenario)
+        if args.cost_scenario
+        else COST_SCENARIOS
+    )
+    risks = (args.risk_per_trade,) if args.risk_per_trade is not None else RISK_LEVELS
+    caps = (
+        (args.max_portfolio_risk,)
+        if args.max_portfolio_risk is not None
+        else PORTFOLIO_CAPS
+    )
+    return scenarios, risks, caps
+
+
 def run(args):
     all_paths = [
         value
@@ -475,14 +491,25 @@ def run(args):
         if key.endswith(("_trades", "_candidate_events", "_audit", "_stage4c"))
         and value
     ]
-    all_paths += [args.cost_profile, args.output_dir]
+    all_paths += [
+        value
+        for key, value in vars(args).items()
+        if key.endswith("_cost_profile") and value
+    ]
+    all_paths.append(args.output_dir)
     safe = [reject_sealed_path(value) for value in all_paths]
     del safe
     instruments = UNIVERSES[args.universe]
-    profile = CostProfile.load(reject_sealed_path(args.cost_profile))
     artifacts = {}
     for instrument in instruments:
         prefix = instrument.lower()
+        profile_path_value = getattr(args, f"{prefix}_cost_profile")
+        if profile_path_value is None:
+            raise MonteCarloInputError(
+                f"explicit {instrument} cost-profile path is required"
+            )
+        profile_path = reject_sealed_path(profile_path_value)
+        profile = CostProfile.load(profile_path)
         values = tuple(
             getattr(args, f"{prefix}_{suffix}")
             for suffix in ("trades", "candidate_events", "audit", "stage4c")
@@ -504,6 +531,8 @@ def run(args):
                 paths[1],
                 profile.sha256,
             ),
+            profile,
+            profile_path,
         )
     out = reject_sealed_path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -512,13 +541,14 @@ def run(args):
     samples = bootstrap_samples(
         args.paths, args.seed, args.block_days, args.horizon_days
     )
-    for scenario, statistic, slippage in COST_SCENARIOS:
+    scenarios, risks, caps = matrix_filters(args)
+    for scenario, statistic, slippage in scenarios:
         loaded = {
             i: load_trades(
                 i,
                 artifacts[i][0],
                 artifacts[i][2],
-                profile,
+                artifacts[i][3],
                 statistic,
                 slippage,
                 artifacts[i][1],
@@ -551,8 +581,8 @@ def run(args):
                 events,
                 samples=samples,
                 horizon=args.horizon_days,
-                risks=RISK_LEVELS,
-                caps=PORTFOLIO_CAPS,
+                risks=risks,
+                caps=caps,
                 rules=rules,
             )
             for (risk, cap), result in matrix.items():
@@ -633,8 +663,11 @@ def run(args):
         "paths": args.paths,
         "block_days": args.block_days,
         "input_sha256": {
-            i: hashlib.sha256(path.read_bytes()).hexdigest()
-            for i, (path, _, _) in artifacts.items()
+            i: {
+                "trades": hashlib.sha256(values[0].read_bytes()).hexdigest(),
+                "cost_profile": values[3].sha256,
+            }
+            for i, values in artifacts.items()
         },
         "method": "chronological circular trading-day block bootstrap",
     }
@@ -652,7 +685,7 @@ def parser():
     for instrument in ("eurusd", "gbpusd", "audusd"):
         for suffix in ("trades", "candidate-events", "audit", "stage4c"):
             p.add_argument(f"--{instrument}-{suffix}")
-    p.add_argument("--cost-profile", required=True)
+        p.add_argument(f"--{instrument}-cost-profile")
     p.add_argument("--output-dir", required=True)
     p.add_argument(
         "--paths",
@@ -662,6 +695,9 @@ def parser():
     )
     p.add_argument("--seed", type=int, default=20240930)
     p.add_argument("--block-days", type=int, choices=(1, 5), default=5)
+    p.add_argument("--cost-scenario", choices=tuple(item[0] for item in COST_SCENARIOS))
+    p.add_argument("--risk-per-trade", type=float, choices=RISK_LEVELS)
+    p.add_argument("--max-portfolio-risk", type=float, choices=PORTFOLIO_CAPS)
     p.add_argument("--horizon-days", type=int, default=252)
     p.add_argument("--starting-balance", type=float, default=100000)
     p.add_argument("--profit-target", type=float, choices=(0.05, 0.10), default=0.10)

@@ -1,7 +1,8 @@
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, timedelta
-from itertools import pairwise
+from itertools import pairwise, product
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,9 +20,15 @@ from mr_lab.ou_monte_carlo import (
     replay_events,
     research_calendar_2024,
 )
-from mr_lab.ou_monte_carlo_runner import _audit, _policy, load_trades, metrics
+from mr_lab.ou_monte_carlo_runner import (
+    _audit,
+    _policy,
+    load_trades,
+    matrix_filters,
+    metrics,
+)
 from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
-from mr_lab.stage4c import net_pips
+from mr_lab.stage4c import CostProfile, net_pips
 
 NOW = datetime(2024, 1, 2, 10, tzinfo=UTC)
 
@@ -275,3 +282,117 @@ def test_provenance_mismatch_fails_closed(tmp_path):
     )
     with pytest.raises(MonteCarloInputError, match="invalid OU provenance"):
         _audit("EURUSD", audit, overlay, trades, candidates, "cost")
+
+
+def _minimal_cost_profile(marker):
+    return {
+        "schema_version": "stage4c-ftmo-cost-profile-v1",
+        "cost_scenarios": {
+            "spread_statistic": ["mean", "p75", "p90", "p95"],
+            "slippage_round_turn_pips": [0.0, 0.1, 0.25, 0.5],
+        },
+        "marker": marker,
+    }
+
+
+def _authenticated_audits(tmp_path, instrument, profile):
+    spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    trades = tmp_path / f"{instrument}-trades.jsonl"
+    candidates = tmp_path / f"{instrument}-candidates.jsonl"
+    trades.write_text("{}\n")
+    candidates.write_text("{}\n")
+    import hashlib
+
+    trade_sha = hashlib.sha256(trades.read_bytes()).hexdigest()
+    candidate_sha = hashlib.sha256(candidates.read_bytes()).hexdigest()
+    provenance = {
+        "instrument": instrument,
+        "filter_family": "ornstein-uhlenbeck",
+        "filter_spec_id": spec.filter_spec_id,
+        "process_spec_id": spec.process_spec.process_spec_id,
+        "stage4b_methodology_id": STAGE4B_METHODOLOGY_ID,
+    }
+    audit = tmp_path / f"{instrument}-audit.json"
+    audit.write_text(
+        json.dumps(
+            provenance
+            | {
+                "eligibility_filter_spec": json.loads(json.dumps(asdict(spec))),
+                "output_sha256": {
+                    "trades.jsonl": trade_sha,
+                    "candidate-events.jsonl": candidate_sha,
+                },
+            }
+        )
+    )
+    overlay = tmp_path / f"{instrument}-stage4c.json"
+    overlay.write_text(
+        json.dumps(
+            provenance
+            | {
+                "source_trade_sha256": {"source": trade_sha},
+                "cost_profile_sha256": profile.sha256,
+            }
+        )
+    )
+    return audit, overlay, trades, candidates
+
+
+def test_instruments_authenticate_different_cost_profile_shas(tmp_path):
+    profiles = []
+    for instrument in ("EURUSD", "GBPUSD"):
+        path = tmp_path / f"{instrument}-cost.json"
+        path.write_text(json.dumps(_minimal_cost_profile(instrument)))
+        profile = CostProfile.load(path)
+        profiles.append(profile)
+        audit, overlay, trades, candidates = _authenticated_audits(
+            tmp_path, instrument, profile
+        )
+        _audit(
+            instrument,
+            audit,
+            overlay,
+            trades,
+            candidates,
+            profile.sha256,
+        )
+    assert profiles[0].sha256 != profiles[1].sha256
+
+
+def test_filtered_diagnostic_retains_all_32_strategy_policies():
+    args = SimpleNamespace(
+        cost_scenario="p90+0.25",
+        risk_per_trade=0.0035,
+        max_portfolio_risk=0.015,
+    )
+    scenarios, risks, caps = matrix_filters(args)
+    policies = {
+        _policy(
+            dict(
+                zip(
+                    (
+                        "benchmark_family",
+                        "lookback",
+                        "entry_mode",
+                        "tp_target_fraction",
+                        "sl_extension_fraction",
+                        "time_stop_minutes",
+                    ),
+                    values,
+                    strict=True,
+                )
+            )
+        )
+        for values in product(
+            ("vwap", "vwap-canonical-m1"),
+            (20, 40),
+            ("immediate",),
+            (0.75, 1.0),
+            (0.25, 0.5),
+            (60, 120),
+        )
+    }
+    assert scenarios == (("p90+0.25", "p90", 0.25),)
+    assert risks == (0.0035,)
+    assert caps == (0.015,)
+    assert len(policies) == 32
