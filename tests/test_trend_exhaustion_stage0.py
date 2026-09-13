@@ -37,6 +37,21 @@ def test_plateau_and_deterministic_classification() -> None:
     assert classify(_rows(count=99)) == "INCONCLUSIVE"
 
 
+def test_session_diagnostics_cannot_change_classification() -> None:
+    baseline = _rows()
+    annotated = tuple(
+        row
+        | {
+            "session_label": "london",
+            "minutes_from_session_open": 120,
+            "minutes_to_session_close": 420,
+        }
+        for row in baseline
+    )
+
+    assert classify(annotated) == classify(baseline) == "PASS"
+
+
 class _Event:
     displacement_threshold = 1.5
     direction = None

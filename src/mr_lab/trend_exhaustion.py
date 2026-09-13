@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from itertools import pairwise
 
 from mr_lab.data import Bar, Timeframe
 from mr_lab.research import Direction
+from mr_lab.sessions import DEFAULT_SESSION_SPEC, SessionSpec, classify_timestamp
 
 FAMILY = "trend-exhaustion"
 SPEC_VERSION = "trend-exhaustion-m15-v1"
@@ -68,6 +69,7 @@ class TrendExhaustionEvent:
     session_label: str | None = None
     minutes_from_session_open: int | None = None
     minutes_to_session_close: int | None = None
+    session_spec_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         row = asdict(self)
@@ -84,8 +86,32 @@ def _true_range(bar: Bar, previous_close: float) -> float:
     )
 
 
+def _session_diagnostics(
+    timestamp: datetime, session_spec: SessionSpec
+) -> tuple[str | None, int | None, int | None, str]:
+    """Return unambiguous major-session diagnostics at a causal UTC instant."""
+    classification = classify_timestamp(timestamp, session_spec)
+    if len(classification.active_sessions) != 1:
+        return None, None, None, classification.session_spec_id
+    name = classification.active_sessions[0]
+    window = next(item for item in session_spec.major_sessions if item.name == name)
+    local = classification.local_times[name]
+    crosses_midnight = window.start > window.end
+    start_date = local.date()
+    if crosses_midnight and local.timetz().replace(tzinfo=None) < window.end:
+        start_date -= timedelta(days=1)
+    end_date = start_date + timedelta(days=crosses_midnight)
+    start = datetime.combine(start_date, window.start, local.tzinfo).astimezone(UTC)
+    end = datetime.combine(end_date, window.end, local.tzinfo).astimezone(UTC)
+    from_open = int((timestamp - start).total_seconds() // 60)
+    to_close = int((end - timestamp).total_seconds() // 60)
+    return name, from_open, to_close, classification.session_spec_id
+
+
 def _candidate(
-    window: tuple[Bar, ...], spec: TrendExhaustionSpec
+    window: tuple[Bar, ...],
+    spec: TrendExhaustionSpec,
+    session_spec: SessionSpec,
 ) -> TrendExhaustionEvent | None:
     phase_a = window[-(TREND_BARS + EXHAUSTION_BARS) : -EXHAUSTION_BARS]
     phase_b = window[-EXHAUSTION_BARS:]
@@ -134,6 +160,7 @@ def _candidate(
         else last.volume - prior_volume
     )
     payload = f"{last.instrument}|{last.available_at.isoformat()}|{spec.spec_id}"
+    session = _session_diagnostics(last.available_at, session_spec)
     return TrendExhaustionEvent(
         "trend-exhaustion-" + sha256(payload.encode()).hexdigest()[:24],
         FAMILY,
@@ -156,11 +183,14 @@ def _candidate(
         last.high - last.low,
         last.volume,
         volume_change,
+        *session,
     )
 
 
 def detect_trend_exhaustion(
-    m15_bars: tuple[Bar, ...] | list[Bar], spec: TrendExhaustionSpec
+    m15_bars: tuple[Bar, ...] | list[Bar],
+    spec: TrendExhaustionSpec,
+    session_spec: SessionSpec = DEFAULT_SESSION_SPEC,
 ) -> tuple[TrendExhaustionEvent, ...]:
     """Emit once per episode; a false candidate window structurally re-arms."""
     bars = tuple(m15_bars)
@@ -183,7 +213,7 @@ def detect_trend_exhaustion(
             armed = True
         if end - segment_start < needed:
             continue
-        event = _candidate(bars[segment_start:end], spec)
+        event = _candidate(bars[segment_start:end], spec, session_spec)
         if event is None:
             armed = True
         elif armed:

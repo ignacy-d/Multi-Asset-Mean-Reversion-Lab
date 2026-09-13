@@ -1,10 +1,11 @@
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
 from mr_lab.data import Bar, PriceBasis, Timeframe, VolumeSemantics
 from mr_lab.research import Direction
+from mr_lab.sessions import SessionSpec, TimeWindow
 from mr_lab.trend_exhaustion import (
     DISPLACEMENT_THRESHOLDS,
     TrendExhaustionError,
@@ -15,7 +16,7 @@ from mr_lab.trend_exhaustion import (
 START = datetime(2024, 1, 2, tzinfo=UTC)
 
 
-def _bars(mirror: bool = False) -> tuple[Bar, ...]:
+def _bars(mirror: bool = False, start: datetime = START) -> tuple[Bar, ...]:
     closes = [100.0] * 13 + [100 + 0.3 * index for index in range(8)]
     closes += [102.22, 102.25, 102.10, 102.0]
     if mirror:
@@ -28,9 +29,9 @@ def _bars(mirror: bool = False) -> tuple[Bar, ...]:
             Bar(
                 "EURUSD",
                 Timeframe("15m"),
-                START + timedelta(minutes=15 * index),
-                START + timedelta(minutes=15 * (index + 1)),
-                START + timedelta(minutes=15 * (index + 1)),
+                start + timedelta(minutes=15 * index),
+                start + timedelta(minutes=15 * (index + 1)),
+                start + timedelta(minutes=15 * (index + 1)),
                 opened,
                 max(opened, close) + 0.02,
                 min(opened, close) - 0.02,
@@ -89,6 +90,46 @@ def test_threshold_grid_is_exact_and_episode_is_unique() -> None:
     # The first eligible window emits only once; later history cannot duplicate it.
     source = _bars()
     assert len(detect_trend_exhaustion(source, TrendExhaustionSpec(1.25))) == 1
+
+
+@pytest.mark.parametrize(
+    ("day", "minutes_from_open", "minutes_to_close"),
+    [
+        (datetime(2024, 1, 15, 3, 45, tzinfo=UTC), 120, 420),
+        (datetime(2024, 7, 15, 3, 45, tzinfo=UTC), 180, 360),
+    ],
+)
+def test_session_diagnostics_use_historical_dst_boundaries(
+    day: datetime, minutes_from_open: int, minutes_to_close: int
+) -> None:
+    event = detect_trend_exhaustion(_bars(start=day), TrendExhaustionSpec(1.5))[0]
+
+    assert event.signal_timestamp == day + timedelta(hours=6, minutes=15)
+    assert event.session_label == "london"
+    assert event.minutes_from_session_open == minutes_from_open
+    assert event.minutes_to_session_close == minutes_to_close
+    assert event.session_spec_id is not None
+
+
+def test_session_diagnostics_never_change_eligibility() -> None:
+    source = _bars(start=datetime(2024, 1, 15, 3, 45, tzinfo=UTC))
+    london = SessionSpec(
+        "diagnostic-only-v1",
+        (TimeWindow("custom", "Europe/London", time(8), time(17)),),
+    )
+    no_sessions = SessionSpec("diagnostic-only-empty-v1", ())
+    with_session = detect_trend_exhaustion(source, TrendExhaustionSpec(1.5), london)[0]
+    without_session = detect_trend_exhaustion(
+        source, TrendExhaustionSpec(1.5), no_sessions
+    )[0]
+
+    assert with_session.event_id == without_session.event_id
+    assert with_session.direction is without_session.direction
+    assert (
+        with_session.normalized_displacement == without_session.normalized_displacement
+    )
+    assert with_session.session_label == "custom"
+    assert without_session.session_label is None
 
 
 def test_detector_rejects_non_m15() -> None:

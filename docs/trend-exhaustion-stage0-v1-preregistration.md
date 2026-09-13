@@ -48,8 +48,13 @@ and quarter concentration.
 Recorded but never filtering features are terminal upper/lower wick, body,
 wick/body ratio, M15 range, canonical volume and prior-bar volume change,
 session label and causal session distances when available, trend displacement,
-efficiency, extension, retained progress, and ATR. Unavailable optional session
-diagnostics remain null. Same-instrument overlap with frozen Module A is
+efficiency, extension, retained progress, and ATR. At the completed signal-bar
+close, the frozen versioned major-session specification and historical IANA
+timezone rules populate the label and whole minutes since open/to close when
+exactly one major session is active. Outside-session and overlapping-session
+clocks are ambiguous and keep all three values null; the session-spec identity
+is still recorded. These values never affect qualification. Same-instrument
+overlap with frozen Module A is
 reported at exact, ±15, ±30, and ±60 minutes and never filters the family.
 
 ## Classification frozen before execution
