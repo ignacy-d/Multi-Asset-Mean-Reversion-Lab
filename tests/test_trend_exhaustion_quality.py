@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import mr_lab.trend_exhaustion_quality as quality
+from mr_lab.data import Timeframe
 from mr_lab.research import Direction
 from mr_lab.stage4a import DirectionalPathDiagnostic, ForwardOutcome
 from mr_lab.trend_exhaustion import PRIMARY_THRESHOLD, TrendExhaustionEvent
@@ -208,6 +210,52 @@ def test_registry_requires_exact_schema_instruments_and_verified_entries() -> No
     registry["registry_schema_version"] = "other"
     with pytest.raises(QualityLabError, match="development schema"):
         validate_development_registry(registry)
+
+
+def synthetic_bar(
+    open_time: datetime,
+    *,
+    close_time: datetime | None = None,
+    available_at: datetime | None = None,
+) -> SimpleNamespace:
+    close = close_time or open_time + timedelta(minutes=1)
+    return SimpleNamespace(
+        open_time=open_time,
+        close_time=close,
+        available_at=available_at or close,
+        timeframe=Timeframe("1m"),
+    )
+
+
+def test_loaded_bar_guard_allows_natural_new_year_completion_boundary() -> None:
+    opened = datetime(2024, 12, 31, 23, 59, tzinfo=UTC)
+    boundary = datetime(2025, 1, 1, tzinfo=UTC)
+    quality._validate_loaded_bars(
+        (synthetic_bar(opened, close_time=boundary, available_at=boundary),)
+    )
+
+
+def test_loaded_bar_guard_rejects_sealed_year_open() -> None:
+    with pytest.raises(QualityLabError, match="open outside development 2024"):
+        quality._validate_loaded_bars(
+            (synthetic_bar(datetime(2025, 1, 1, tzinfo=UTC)),)
+        )
+
+
+def test_loaded_bar_guard_rejects_arbitrary_future_close() -> None:
+    opened = datetime(2024, 12, 31, 23, 58, tzinfo=UTC)
+    with pytest.raises(QualityLabError, match="close does not match"):
+        quality._validate_loaded_bars(
+            (synthetic_bar(opened, close_time=opened + timedelta(minutes=2)),)
+        )
+
+
+def test_loaded_bar_guard_rejects_non_utc_timestamp() -> None:
+    non_utc = timezone(timedelta(hours=1))
+    with pytest.raises(QualityLabError, match="timestamps must be UTC"):
+        quality._validate_loaded_bars(
+            (synthetic_bar(datetime(2024, 6, 1, tzinfo=non_utc)),)
+        )
 
 
 def test_only_primary_threshold_and_matching_unique_identity_are_accepted() -> None:

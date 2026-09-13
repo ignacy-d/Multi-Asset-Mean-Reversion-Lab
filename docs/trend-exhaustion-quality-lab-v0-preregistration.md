@@ -22,6 +22,11 @@ literal development root `/mnt/e/mr-lab/frozen-2024`, the canonical
 instruments, verified status, and the exact 2024 date range on every entry. It
 does not discover or fall back to another root. Loaded bar timestamps and event
 timestamps are checked again for UTC 2024 as defense in depth.
+For loaded bars, 2024 applies to the opening period: every timestamp must be
+UTC, each open must be in 2024, close must equal open plus the canonical
+timeframe duration, and availability cannot precede close. Consequently, the
+natural `2025-01-01T00:00:00Z` completion/availability of the M1 bar opened at
+`2024-12-31T23:59:00Z` is valid; a bar opened in 2025 remains forbidden.
 
 ## Frozen feature and outcome contract
 

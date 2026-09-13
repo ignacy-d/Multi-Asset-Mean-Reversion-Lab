@@ -181,14 +181,18 @@ def _validate_loaded_bars(bars: Sequence[Any]) -> None:
     """Defense in depth after an authenticated corpus has been loaded."""
     for bar in bars:
         for timestamp in (bar.open_time, bar.close_time, bar.available_at):
-            if (
-                timestamp.tzinfo is None
-                or timestamp.utcoffset() != timedelta(0)
-                or timestamp.year != DEVELOPMENT_YEAR
-            ):
-                raise QualityLabError(
-                    "loaded corpus contains a timestamp outside UTC development 2024"
-                )
+            if timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
+                raise QualityLabError("loaded corpus timestamps must be UTC")
+        if bar.open_time.year != DEVELOPMENT_YEAR:
+            raise QualityLabError(
+                "loaded corpus contains an open outside development 2024"
+            )
+        if bar.close_time != bar.open_time + bar.timeframe.duration:
+            raise QualityLabError(
+                "loaded corpus bar close does not match its timeframe"
+            )
+        if bar.available_at < bar.close_time:
+            raise QualityLabError("loaded corpus bar is available before completion")
 
 
 def validate_primary_event_counts(counts: Mapping[str, int]) -> dict[str, Any]:
