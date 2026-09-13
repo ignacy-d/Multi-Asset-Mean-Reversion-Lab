@@ -39,7 +39,13 @@ def _fingerprint(value: object) -> str:
 
 
 class ExecutionEngine:
-    """Stateless FSM: callers persist state and dispatch returned commands."""
+    """Stateless FSM: callers persist state and dispatch returned commands.
+
+    ``SUBMITTING`` and ``PROTECTION_PENDING`` deliberately do not auto-resend on
+    intent replay.  A future runtime reconciliation boundary must establish
+    whether the adapter received their persisted deterministic command IDs
+    before deciding whether a resend is safe.
+    """
 
     def create_state(self, intent: SizedExecutionIntent) -> ExecutionState:
         return ExecutionState(
@@ -145,18 +151,11 @@ class ExecutionEngine:
             raise ExecutionInvariantError("cancel request time moved backwards")
         if state.lifecycle is ExecutionLifecycle.CANCEL_PENDING:
             return state, ()
-        if state.lifecycle not in {
-            ExecutionLifecycle.ACKNOWLEDGED,
-            ExecutionLifecycle.PARTIALLY_FILLED,
-        }:
+        if state.lifecycle is not ExecutionLifecycle.ACKNOWLEDGED:
             raise ExecutionInvariantError("entry cannot be cancelled in this lifecycle")
         if state.broker_order_ref is None or state.remaining_quantity <= 0:
             raise ExecutionInvariantError(
                 "cannot cancel an entry without remaining quantity"
-            )
-        if state.filled_quantity != 0:
-            raise ExecutionInvariantError(
-                "cancelling a partially filled entry requires a later exposure policy"
             )
         command_id = stable_id(
             "execution-command", state.execution_intent_id, "cancel-entry"
@@ -193,7 +192,7 @@ class ExecutionEngine:
         if isinstance(event, CancelAcknowledged):
             return self._cancelled(state, event), ()
         if isinstance(event, ProtectionAcknowledged):
-            return self._protection_acknowledged(state, event), ()
+            return self._protection_acknowledged(state, event)
         if isinstance(event, ProtectionRejected):
             return self._protection_rejected(state, event), ()
         if isinstance(event, ExecutionClosed):
@@ -241,6 +240,7 @@ class ExecutionEngine:
             ExecutionLifecycle.ACKNOWLEDGED,
             ExecutionLifecycle.PARTIALLY_FILLED,
             ExecutionLifecycle.PROTECTION_PENDING,
+            ExecutionLifecycle.UNSAFE,
         }:
             raise ExecutionInvariantError("entry fill is out of order")
         if state.broker_order_ref != event.broker_order_ref:
@@ -253,6 +253,20 @@ class ExecutionEngine:
         ) * state.filled_quantity
         average = (previous_value + event.price * event.quantity) / cumulative
         fully_filled = cumulative == state.requested_quantity
+
+        if state.lifecycle is ExecutionLifecycle.UNSAFE:
+            return replace(
+                state,
+                filled_quantity=cumulative,
+                average_fill_price=average,
+            ), ()
+
+        if state.pending_protection_quantity is not None:
+            return replace(
+                state,
+                filled_quantity=cumulative,
+                average_fill_price=average,
+            ), ()
 
         if (
             state.protection_status is ProtectionStatus.ACTIVE
@@ -270,29 +284,45 @@ class ExecutionEngine:
                 average_fill_price=average,
             ), ()
 
+        return self._request_protection(
+            replace(
+                state,
+                filled_quantity=cumulative,
+                average_fill_price=average,
+            ),
+            cumulative,
+            event.event_time,
+        )
+
+    @staticmethod
+    def _request_protection(
+        state: ExecutionState, target: Decimal, created_at: datetime
+    ) -> tuple[ExecutionState, tuple[EnsureProtectionCommand, ...]]:
+        if state.protection_command_id is not None:
+            raise ExecutionInvariantError("protection command is already in flight")
         command_id = stable_id(
             "execution-command",
             state.execution_intent_id,
             "ensure-protection",
-            cumulative,
+            target,
         )
-        assert state.broker_order_ref is not None
+        if state.broker_order_ref is None:
+            raise ExecutionInvariantError("protection requires an acknowledged order")
         command = EnsureProtectionCommand(
             command_id,
             state.execution_intent_id,
             state.broker_order_ref,
-            cumulative,
+            target,
             state.protective_plan,
             state.protective_boundary,
-            event.event_time,
+            created_at,
         )
         return replace(
             state,
             lifecycle=ExecutionLifecycle.PROTECTION_PENDING,
-            filled_quantity=cumulative,
-            average_fill_price=average,
             protection_status=ProtectionStatus.PENDING,
             protection_command_id=command_id,
+            pending_protection_quantity=target,
         ), (command,)
 
     @staticmethod
@@ -311,10 +341,9 @@ class ExecutionEngine:
             )
         return replace(state, lifecycle=ExecutionLifecycle.CANCELLED)
 
-    @staticmethod
     def _protection_acknowledged(
-        state: ExecutionState, event: ProtectionAcknowledged
-    ) -> ExecutionState:
+        self, state: ExecutionState, event: ProtectionAcknowledged
+    ) -> tuple[ExecutionState, tuple[ExecutionCommand, ...]]:
         if state.lifecycle is not ExecutionLifecycle.PROTECTION_PENDING:
             raise ExecutionInvariantError("protection acknowledgement is out of order")
         if state.protection_command_id != event.command_id:
@@ -323,18 +352,30 @@ class ExecutionEngine:
             )
         if state.broker_order_ref != event.broker_order_ref:
             raise ExecutionInvariantError("protection event references unrelated order")
+        target = state.pending_protection_quantity
+        if target is None:
+            raise ExecutionInvariantError("protection target is missing")
+        acknowledged = replace(
+            state,
+            protection_status=ProtectionStatus.ACTIVE,
+            protection_ref=event.protection_ref,
+            protected_quantity=target,
+            protection_command_id=None,
+            pending_protection_quantity=None,
+        )
+        if state.filled_quantity > target:
+            return self._request_protection(
+                acknowledged, state.filled_quantity, event.event_time
+            )
         lifecycle = (
             ExecutionLifecycle.PROTECTED
             if state.remaining_quantity == 0
             else ExecutionLifecycle.PARTIALLY_FILLED
         )
         return replace(
-            state,
+            acknowledged,
             lifecycle=lifecycle,
-            protection_status=ProtectionStatus.ACTIVE,
-            protection_ref=event.protection_ref,
-            protected_quantity=state.filled_quantity,
-        )
+        ), ()
 
     @staticmethod
     def _protection_rejected(
@@ -350,8 +391,10 @@ class ExecutionEngine:
             raise ExecutionInvariantError("protection event references unrelated order")
         return replace(
             state,
-            lifecycle=ExecutionLifecycle.ERROR,
+            lifecycle=ExecutionLifecycle.UNSAFE,
             protection_status=ProtectionStatus.FAILED,
+            protection_command_id=None,
+            pending_protection_quantity=None,
             last_failure_reason=event.reason,
         )
 
@@ -360,6 +403,10 @@ class ExecutionEngine:
         if state.filled_quantity <= 0:
             raise ExecutionInvariantError(
                 "an execution without exposure cannot be closed"
+            )
+        if state.remaining_quantity != 0:
+            raise ExecutionInvariantError(
+                "execution cannot close while entry quantity remains live"
             )
         if state.broker_order_ref != event.broker_order_ref:
             raise ExecutionInvariantError("close event references unrelated order")

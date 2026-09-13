@@ -6,6 +6,7 @@ import pytest
 
 from mr_lab.execution import (
     CancelAcknowledged,
+    CancelEntryCommand,
     EnsureProtectionCommand,
     EntryAccepted,
     EntryFill,
@@ -17,6 +18,7 @@ from mr_lab.execution import (
     FakeBroker,
     FakeBrokerScenario,
     FakeFill,
+    ProcessedEvent,
     ProtectionAcknowledged,
     ProtectionRejected,
     ProtectionStatus,
@@ -225,7 +227,7 @@ def test_atomic_protection_reaches_protected_without_ensure_command():
     assert commands == ()
 
 
-def test_protection_rejection_is_explicit_unsafe_terminal_error():
+def test_protection_rejection_is_non_terminal_unsafe_and_can_close():
     item, state, _ = acknowledged()
     state, commands = apply(
         state,
@@ -233,20 +235,68 @@ def test_protection_rejection_is_explicit_unsafe_terminal_error():
             "fill", item.execution_intent_id, "order-1", D("10000"), D("1.1"), NOW
         ),
     )
+    rejection = ProtectionRejected(
+        "protect-reject",
+        item.execution_intent_id,
+        commands[0].command_id,
+        "order-1",
+        "invalid stop",
+        NOW,
+    )
+    state, _ = apply(
+        state,
+        rejection,
+    )
+    assert state.lifecycle is ExecutionLifecycle.UNSAFE
+    assert not state.is_terminal
+    assert state.protection_status is ProtectionStatus.FAILED
+    assert state.last_failure_reason == "invalid stop"
+    assert state.filled_quantity == D("10000")
+    assert ExecutionEngine().handle_intent(item, state) == (state, ())
+    assert apply(state, rejection) == (state, ())
+
+    state, _ = apply(
+        state,
+        ExecutionClosed("closed", item.execution_intent_id, "order-1", NOW, "manual"),
+    )
+    assert state.lifecycle is ExecutionLifecycle.CLOSED
+
+
+def test_fills_remain_truthful_after_partial_exposure_becomes_unsafe():
+    item, state, _ = acknowledged()
+    state, commands = apply(
+        state,
+        EntryFill(
+            "fill-1", item.execution_intent_id, "order-1", D("4000"), D("1.1"), NOW
+        ),
+    )
     state, _ = apply(
         state,
         ProtectionRejected(
-            "protect-reject",
+            "rejected-protection",
             item.execution_intent_id,
             commands[0].command_id,
             "order-1",
-            "invalid stop",
+            "rejected",
             NOW,
         ),
     )
-    assert state.lifecycle is ExecutionLifecycle.ERROR
-    assert state.protection_status is ProtectionStatus.FAILED
-    assert state.last_failure_reason == "invalid stop"
+    state, commands = apply(
+        state,
+        EntryFill(
+            "fill-2",
+            item.execution_intent_id,
+            "order-1",
+            D("6000"),
+            D("1.2"),
+            NOW + timedelta(microseconds=1),
+        ),
+    )
+    assert commands == ()
+    assert state.lifecycle is ExecutionLifecycle.UNSAFE
+    assert state.filled_quantity == D("10000")
+    assert state.average_fill_price == D("1.16")
+    assert state.protected_quantity == 0
 
 
 def test_overfill_wrong_link_and_out_of_order_fill_fail_closed():
@@ -333,6 +383,19 @@ def test_close_is_only_valid_after_exposure_and_terminal_events_do_not_reopen():
             state,
             ExecutionClosed("close", item.execution_intent_id, "order-1", NOW, "done"),
         )
+    partial, _ = apply(
+        state,
+        EntryFill(
+            "partial", item.execution_intent_id, "order-1", D("4000"), D("1"), NOW
+        ),
+    )
+    with pytest.raises(ExecutionInvariantError, match="quantity remains live"):
+        apply(
+            partial,
+            ExecutionClosed(
+                "partial-close", item.execution_intent_id, "order-1", NOW, "manual"
+            ),
+        )
     state, _ = apply(
         state,
         EntryFill("fill", item.execution_intent_id, "order-1", D("10000"), D("1"), NOW),
@@ -363,6 +426,151 @@ def test_reconstructed_progress_does_not_submit_duplicate_entry():
     )
     for persisted in (replace(filled_state),):
         assert ExecutionEngine().handle_intent(item, persisted) == (persisted, ())
+
+
+def test_protection_commands_are_serialized_across_fill_ack_race():
+    item, state, _ = acknowledged()
+    state, commands = apply(
+        state,
+        EntryFill(
+            "fill-1", item.execution_intent_id, "order-1", D("4000"), D("1.1"), NOW
+        ),
+    )
+    first_command = commands[0]
+    assert first_command.protected_quantity == D("4000")
+    assert state.pending_protection_quantity == D("4000")
+
+    state, commands = apply(
+        state,
+        EntryFill(
+            "fill-2",
+            item.execution_intent_id,
+            "order-1",
+            D("6000"),
+            D("1.2"),
+            NOW + timedelta(microseconds=1),
+        ),
+    )
+    assert commands == ()
+    assert state.protection_command_id == first_command.command_id
+    assert state.pending_protection_quantity == D("4000")
+
+    first_ack = ProtectionAcknowledged(
+        "protection-1",
+        item.execution_intent_id,
+        first_command.command_id,
+        "order-1",
+        "protection-ref-1",
+        NOW + timedelta(microseconds=2),
+    )
+    state, commands = apply(state, first_ack)
+    assert state.protected_quantity == D("4000")
+    assert state.pending_protection_quantity == D("10000")
+    assert len(commands) == 1
+    followup = commands[0]
+    assert followup.protected_quantity == D("10000")
+    assert followup.command_id != first_command.command_id
+    assert apply(state, first_ack) == (state, ())
+
+    with pytest.raises(ExecutionInvariantError, match="unrelated command"):
+        apply(
+            state,
+            ProtectionAcknowledged(
+                "wrong-ack",
+                item.execution_intent_id,
+                "wrong-command",
+                "order-1",
+                "wrong-ref",
+                NOW + timedelta(microseconds=2),
+            ),
+        )
+    state, _ = apply(
+        state,
+        ProtectionAcknowledged(
+            "protection-2",
+            item.execution_intent_id,
+            followup.command_id,
+            "order-1",
+            "protection-ref-2",
+            NOW + timedelta(microseconds=3),
+        ),
+    )
+    assert state.lifecycle is ExecutionLifecycle.PROTECTED
+    assert state.protected_quantity == D("10000")
+
+
+def test_multiple_fills_wait_for_one_in_flight_protection_command():
+    item, state, _ = acknowledged()
+    quantities = (D("1000"), D("2000"), D("3000"))
+    first_command = None
+    for index, quantity in enumerate(quantities, start=1):
+        state, commands = apply(
+            state,
+            EntryFill(
+                f"fill-{index}",
+                item.execution_intent_id,
+                "order-1",
+                quantity,
+                D("1.1"),
+                NOW + timedelta(microseconds=index),
+            ),
+        )
+        if index == 1:
+            first_command = commands[0]
+        else:
+            assert commands == ()
+            assert state.protection_command_id == first_command.command_id
+    assert state.filled_quantity == D("6000")
+    assert state.pending_protection_quantity == D("1000")
+    state, commands = apply(
+        state,
+        ProtectionAcknowledged(
+            "first-protection",
+            item.execution_intent_id,
+            first_command.command_id,
+            "order-1",
+            "protection-ref",
+            NOW + timedelta(microseconds=4),
+        ),
+    )
+    assert state.protected_quantity == D("1000")
+    assert commands[0].protected_quantity == D("6000")
+    assert state.pending_protection_quantity == D("6000")
+
+
+def test_command_contracts_fail_closed_on_invalid_values():
+    _, _, submit = submitted()
+    naive = NOW.replace(tzinfo=None)
+    with pytest.raises(ValueError, match="non-empty"):
+        replace(submit, command_id="")
+    with pytest.raises(ValueError, match="positive"):
+        replace(submit, quantity=D("0"))
+    with pytest.raises(ValueError, match="UTC"):
+        replace(submit, created_at=naive)
+
+    ensure = EnsureProtectionCommand(
+        "ensure",
+        "execution",
+        "order",
+        D("1"),
+        submit.protective_plan,
+        submit.protective_boundary,
+        NOW,
+    )
+    with pytest.raises(ValueError, match="positive"):
+        replace(ensure, protected_quantity=D("0"))
+    with pytest.raises(ValueError, match="non-empty"):
+        replace(ensure, broker_order_ref="")
+    with pytest.raises(ValueError, match="UTC"):
+        replace(ensure, created_at=naive)
+
+    cancel = CancelEntryCommand("cancel", "execution", "order", NOW)
+    with pytest.raises(ValueError, match="non-empty"):
+        replace(cancel, execution_intent_id="")
+    with pytest.raises(ValueError, match="UTC"):
+        replace(cancel, created_at=naive)
+    with pytest.raises(ValueError, match="non-empty"):
+        ProcessedEvent("event", "")
 
 
 def test_same_instrument_multi_alpha_is_independent_and_order_invariant():

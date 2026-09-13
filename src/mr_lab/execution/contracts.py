@@ -24,6 +24,7 @@ class ExecutionLifecycle(StrEnum):
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
     CLOSED = "CLOSED"
+    UNSAFE = "UNSAFE"
     ERROR = "ERROR"
 
     @property
@@ -47,6 +48,10 @@ class ProtectionStatus(StrEnum):
 class ProcessedEvent:
     event_id: str
     fingerprint: str
+
+    def __post_init__(self) -> None:
+        require_text("event_id", self.event_id)
+        require_text("fingerprint", self.fingerprint)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +81,7 @@ class ExecutionState:
     protection_ref: str | None = None
     protected_quantity: Decimal = Decimal(0)
     protection_command_id: str | None = None
+    pending_protection_quantity: Decimal | None = None
     cancel_command_id: str | None = None
     processed_events: tuple[ProcessedEvent, ...] = ()
     last_failure_reason: str | None = None
@@ -109,6 +115,20 @@ class ExecutionState:
             raise ValueError("average_fill_price must correspond to filled quantity")
         if self.average_fill_price is not None:
             require_finite("average_fill_price", self.average_fill_price, positive=True)
+        if self.pending_protection_quantity is not None:
+            require_finite(
+                "pending_protection_quantity",
+                self.pending_protection_quantity,
+                positive=True,
+            )
+            if self.pending_protection_quantity > self.filled_quantity:
+                raise ValueError("pending protection cannot exceed filled quantity")
+        if (self.protection_command_id is None) != (
+            self.pending_protection_quantity is None
+        ):
+            raise ValueError(
+                "pending protection command identity and quantity must coexist"
+            )
         require_utc("created_at", self.created_at)
         require_utc("updated_at", self.updated_at)
         if self.updated_at < self.created_at:
@@ -146,6 +166,23 @@ class SubmitEntryCommand:
     approved_at: datetime
     created_at: datetime
 
+    def __post_init__(self) -> None:
+        for name in (
+            "command_id",
+            "client_idempotency_key",
+            "execution_intent_id",
+            "instrument",
+            "strategy_policy_id",
+            "risk_decision_id",
+            "proposal_id",
+        ):
+            require_text(name, getattr(self, name))
+        require_direction(self.direction)
+        require_finite("quantity", self.quantity, positive=True)
+        self.protective_boundary.validate_for(self.direction)
+        for name in ("proposal_timestamp", "approved_at", "created_at"):
+            require_utc(name, getattr(self, name))
+
 
 @dataclass(frozen=True, slots=True)
 class EnsureProtectionCommand:
@@ -157,6 +194,12 @@ class EnsureProtectionCommand:
     protective_boundary: ProtectiveBoundary
     created_at: datetime
 
+    def __post_init__(self) -> None:
+        for name in ("command_id", "execution_intent_id", "broker_order_ref"):
+            require_text(name, getattr(self, name))
+        require_finite("protected_quantity", self.protected_quantity, positive=True)
+        require_utc("created_at", self.created_at)
+
 
 @dataclass(frozen=True, slots=True)
 class CancelEntryCommand:
@@ -164,6 +207,11 @@ class CancelEntryCommand:
     execution_intent_id: str
     broker_order_ref: str
     created_at: datetime
+
+    def __post_init__(self) -> None:
+        for name in ("command_id", "execution_intent_id", "broker_order_ref"):
+            require_text(name, getattr(self, name))
+        require_utc("created_at", self.created_at)
 
 
 type ExecutionCommand = (
