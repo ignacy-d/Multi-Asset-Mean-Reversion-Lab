@@ -76,6 +76,7 @@ class RuntimeState:
     last_live_at: datetime | None = None
     reason: RuntimeReason | None = None
     halt_latched: bool = False
+    halt_reason: RuntimeReason | None = None
     checkpoint_sequence: int = 0
     broker_snapshot_time: datetime | None = None
     watermarks: tuple[DataWatermark, ...] = ()
@@ -87,6 +88,8 @@ class RuntimeState:
         require_utc("updated_at", self.updated_at)
         if self.checkpoint_sequence < 0:
             raise ValueError("checkpoint sequence cannot be negative")
+        if self.halt_latched != (self.halt_reason is not None):
+            raise ValueError("halt latch and halt reason must coexist")
         for name in ("last_synced_at", "last_live_at", "broker_snapshot_time"):
             value = getattr(self, name)
             if value is not None:
@@ -163,6 +166,19 @@ class BrokerExecutionRecord:
             raise ValueError("active protection requires quantity and identity")
         if self.exposure_exists and self.cumulative_filled_quantity == 0:
             raise ValueError("live exposure requires a positive cumulative fill")
+        if (
+            self.protection_active
+            and self.entry_status
+            in {
+                BrokerEntryStatus.CANCELLED,
+                BrokerEntryStatus.FILLED,
+                BrokerEntryStatus.REJECTED,
+            }
+            and self.protected_quantity > self.cumulative_filled_quantity
+        ):
+            raise ValueError(
+                "terminal entry protection cannot exceed cumulative exposure"
+            )
 
     @property
     def is_live(self) -> bool:
@@ -194,6 +210,8 @@ class RuntimeStatus:
     last_synced_at: datetime | None
     broker_snapshot_age: timedelta | None
     reason: RuntimeReason | None
+    halt_latched: bool
+    halt_reason: RuntimeReason | None
     active_execution_count: int
     unsafe_execution_count: int
     in_flight_command_count: int

@@ -171,7 +171,7 @@ def test_corrupt_and_future_checkpoint_fail_closed():
         make_checkpoint(RuntimeState("key", RuntimeLifecycle.SYNCED, NOW, NOW), NOW)
     )
     with pytest.raises(UnsupportedCheckpointSchema):
-        loads_checkpoint(good.replace('"schema_version":2', '"schema_version":3'))
+        loads_checkpoint(good.replace('"schema_version":3', '"schema_version":4'))
 
 
 def test_orphan_missing_terminal_and_conflicts_fail_closed():
@@ -489,14 +489,40 @@ def test_manual_halt_is_a_persisted_operator_latch():
     assert restarted.state.lifecycle is RuntimeLifecycle.BOOTSTRAP
     assert restarted.state.halt_latched
     assert restarted.state.reason.detail == "operator investigation"
-    restarted.reconcile_startup(BrokerRuntimeSnapshot(NOW), (), NOW)
-    assert restarted.state.lifecycle is RuntimeLifecycle.BOOTSTRAP
+    assert restarted.state.halt_reason.detail == "operator investigation"
+    restarted.reconcile_startup(
+        BrokerRuntimeSnapshot(NOW), (), NOW + timedelta(minutes=2)
+    )
+    assert restarted.state.lifecycle is RuntimeLifecycle.STALE
+    assert restarted.state.reason.code is RuntimeReasonCode.STALE_BROKER_SNAPSHOT
+    assert restarted.state.halt_reason.detail == "operator investigation"
+    orphan_time = NOW + timedelta(minutes=2)
+    restarted.reconcile_startup(
+        BrokerRuntimeSnapshot(
+            orphan_time,
+            (
+                BrokerExecutionRecord(
+                    "orphan", orphan_time, entry_status=BrokerEntryStatus.OPEN
+                ),
+            ),
+        ),
+        (),
+        orphan_time,
+    )
+    assert restarted.state.lifecycle is RuntimeLifecycle.HALTED
+    assert restarted.state.halt_reason.detail == "operator investigation"
+    restarted.reconcile_startup(BrokerRuntimeSnapshot(orphan_time), (), orphan_time)
+    assert restarted.state.lifecycle is RuntimeLifecycle.HALTED
+    status = restarted.status(orphan_time)
+    assert status.halt_latched
+    assert status.halt_reason.detail == "operator investigation"
     with pytest.raises(RuntimeError, match="not eligible"):
-        restarted.enable_live(NOW)
-    restarted.clear_halt(NOW)
+        restarted.enable_live(orphan_time)
+    restarted.clear_halt(orphan_time)
     assert restarted.state.lifecycle is RuntimeLifecycle.SYNCED
+    assert restarted.state.halt_reason is None
     assert not restarted.can_open_new_entries
-    restarted.enable_live(NOW)
+    restarted.enable_live(orphan_time)
     assert restarted.can_open_new_entries
 
 
@@ -557,3 +583,103 @@ def test_protection_and_cancel_commands_are_persisted_before_dispatch():
     )
     assert cancelled.cancel_command_id == cancel.command_id
     assert cancelled.lifecycle is ExecutionLifecycle.CANCEL_PENDING
+
+
+def _live_runtime(
+    *, required=(), source_age=timedelta(minutes=1), broker_age=timedelta(minutes=1)
+):
+    runtime = RuntimeController(
+        "admission/runtime",
+        InMemoryDurableStore(),
+        FreshnessPolicy(tuple(required), source_age, broker_age),
+        NOW,
+    )
+    watermarks = tuple(DataWatermark(source, NOW) for source in required)
+    runtime.restore()
+    runtime.reconcile_startup(BrokerRuntimeSnapshot(NOW), watermarks, NOW)
+    runtime.enable_live(NOW)
+    return runtime
+
+
+def test_submit_rechecks_broker_freshness_without_heartbeat():
+    runtime = _live_runtime()
+    with pytest.raises(RuntimeError, match="stale"):
+        runtime.submit_intent(
+            ExecutionEngine(), intent("late-broker"), NOW + timedelta(minutes=2)
+        )
+    assert runtime.state.executions == ()
+    assert runtime.state.lifecycle is RuntimeLifecycle.STALE
+    assert runtime.state.reason.code is RuntimeReasonCode.STALE_BROKER_SNAPSHOT
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_submit_rechecks_required_source_freshness_without_heartbeat(missing):
+    runtime = _live_runtime(
+        required=("feed",),
+        source_age=timedelta(minutes=1),
+        broker_age=timedelta(minutes=5),
+    )
+    if missing:
+        runtime.state = replace(runtime.state, watermarks=())
+    with pytest.raises(RuntimeError, match="stale"):
+        runtime.submit_intent(
+            ExecutionEngine(),
+            intent(f"late-source-{missing}"),
+            NOW + timedelta(minutes=2),
+        )
+    assert runtime.state.executions == ()
+    assert runtime.state.lifecycle is RuntimeLifecycle.STALE
+    assert runtime.state.reason.code is RuntimeReasonCode.STALE_REQUIRED_SOURCE
+
+
+def test_submit_rejects_future_freshness_and_fresh_submission_still_commits():
+    future = NOW + timedelta(seconds=1)
+    runtime = _live_runtime(required=("feed",))
+    runtime.state = replace(
+        runtime.state,
+        broker_snapshot_time=future,
+        watermarks=(DataWatermark("feed", future),),
+    )
+    with pytest.raises(RuntimeError, match="stale"):
+        runtime.submit_intent(ExecutionEngine(), intent("future"), NOW)
+    assert runtime.state.executions == ()
+    assert runtime.state.reason.code is RuntimeReasonCode.STALE_BROKER_SNAPSHOT
+
+    fresh = _live_runtime()
+    commands = fresh.submit_intent(ExecutionEngine(), intent("fresh"), NOW)
+    checkpoint = loads_checkpoint(fresh.store.read_text(fresh.checkpoint_key))
+    assert checkpoint.executions[0].entry_command_id == commands[0].command_id
+
+
+def test_runtime_status_reports_effective_freshness_without_mutating():
+    runtime = _live_runtime()
+    status = runtime.status(NOW + timedelta(minutes=2))
+    assert runtime.state.lifecycle is RuntimeLifecycle.LIVE
+    assert not status.can_open_new_entries
+
+
+def test_terminal_entry_protection_cannot_exceed_actual_exposure():
+    with pytest.raises(ValueError, match="cannot exceed cumulative exposure"):
+        BrokerExecutionRecord(
+            "cancelled-fill",
+            NOW,
+            entry_status=BrokerEntryStatus.CANCELLED,
+            cumulative_filled_quantity=D("4000"),
+            average_fill_price=D("1.1"),
+            exposure_exists=True,
+            protection_active=True,
+            protected_quantity=D("10000"),
+            protection_ref="protection",
+        )
+    open_record = BrokerExecutionRecord(
+        "open-atomic",
+        NOW,
+        entry_status=BrokerEntryStatus.OPEN,
+        cumulative_filled_quantity=D("4000"),
+        average_fill_price=D("1.1"),
+        exposure_exists=True,
+        protection_active=True,
+        protected_quantity=D("10000"),
+        protection_ref="atomic-protection",
+    )
+    assert open_record.protected_quantity == D("10000")

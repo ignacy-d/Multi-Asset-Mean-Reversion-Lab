@@ -69,6 +69,7 @@ class RuntimeController:
                     checkpoint_sequence=checkpoint.checkpoint_sequence,
                     reason=checkpoint.runtime_reason,
                     halt_latched=checkpoint.halt_latched,
+                    halt_reason=checkpoint.halt_reason,
                     executions=checkpoint.executions,
                     watermarks=checkpoint.watermarks,
                 )
@@ -107,11 +108,13 @@ class RuntimeController:
         )
         if not result.healthy:
             first = next(item for item in result.items if item.reason_code is not None)
+            diagnostic = RuntimeReason(first.reason_code, first.detail)
             self._transition(
                 RuntimeLifecycle.HALTED,
                 now,
-                RuntimeReason(first.reason_code, first.detail),
+                diagnostic,
                 halt_latched=True,
+                halt_reason=self.state.halt_reason or diagnostic,
             )
         else:
             reason = self._freshness_reason(now)
@@ -123,7 +126,7 @@ class RuntimeController:
                     if self.state.lifecycle is RuntimeLifecycle.HALTED
                     else RuntimeLifecycle.BOOTSTRAP
                 )
-                self._transition(lifecycle, now, self.state.reason)
+                self._transition(lifecycle, now, None)
             else:
                 lifecycle = (
                     RuntimeLifecycle.LIVE if preserve_live else RuntimeLifecycle.SYNCED
@@ -183,6 +186,7 @@ class RuntimeController:
             now,
             RuntimeReason(RuntimeReasonCode.MANUAL_HALT, reason),
             halt_latched=True,
+            halt_reason=RuntimeReason(RuntimeReasonCode.MANUAL_HALT, reason),
         )
 
     def clear_halt(self, now: datetime) -> None:
@@ -199,6 +203,7 @@ class RuntimeController:
             now,
             None,
             halt_latched=False,
+            halt_reason=None,
             last_synced_at=now,
         )
 
@@ -221,6 +226,11 @@ class RuntimeController:
                     "execution transition changed identity",
                 ),
                 halt_latched=True,
+                halt_reason=self.state.halt_reason
+                or RuntimeReason(
+                    RuntimeReasonCode.EXECUTION_CONFLICT,
+                    "execution transition changed identity",
+                ),
             )
             return ()
         executions = {item.execution_intent_id: item for item in self.state.executions}
@@ -235,7 +245,11 @@ class RuntimeController:
     def submit_intent(
         self, engine: ExecutionEngine, intent: SizedExecutionIntent, now: datetime
     ) -> tuple[ExecutionCommand, ...]:
-        if not self.can_open_new_entries:
+        freshness = self._freshness_reason(now)
+        if self.state.lifecycle is RuntimeLifecycle.LIVE and freshness is not None:
+            self._transition(RuntimeLifecycle.STALE, now, freshness)
+            raise RuntimeError("new entries are disabled by stale runtime data")
+        if not self._entry_eligible(now):
             raise RuntimeError("new entries are disabled")
         existing = next(
             (
@@ -272,6 +286,11 @@ class RuntimeController:
                     "broker event has no owned execution",
                 ),
                 halt_latched=True,
+                halt_reason=self.state.halt_reason
+                or RuntimeReason(
+                    RuntimeReasonCode.EXECUTION_CONFLICT,
+                    "broker event has no owned execution",
+                ),
             )
             return ()
         return self._commit_execution_transition(
@@ -314,14 +333,26 @@ class RuntimeController:
         )
         return RuntimeStatus(
             self.state.lifecycle,
-            self.can_open_new_entries,
+            self._entry_eligible(now),
             self.state.last_synced_at,
             age,
             self.state.reason,
+            self.state.halt_latched,
+            self.state.halt_reason,
             active,
             unsafe,
             inflight,
             source_freshness,
+        )
+
+    def _entry_eligible(self, now: datetime) -> bool:
+        return (
+            self.state.lifecycle is RuntimeLifecycle.LIVE
+            and not self.state.halt_latched
+            and self.persistence_healthy
+            and self.reconciliation is not None
+            and self.reconciliation.healthy
+            and self._freshness_reason(now) is None
         )
 
     def _freshness_reason(self, now: datetime) -> RuntimeReason | None:
@@ -392,4 +423,5 @@ class RuntimeController:
             lifecycle=RuntimeLifecycle.HALTED,
             reason=RuntimeReason(code, detail),
             halt_latched=True,
+            halt_reason=basis.halt_reason or RuntimeReason(code, detail),
         )
