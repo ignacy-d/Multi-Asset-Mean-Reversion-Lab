@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from mr_lab.integrations.ctrader import (
+    BarOpenedRouter,
     BrokerOwnershipError,
     CTraderLocalStorageStore,
     CTraderObservationHost,
     LiveAccountRefused,
+    NativeConfigurationError,
     ObservationLifecycle,
     WouldExecuteObservation,
     encode_storage_key,
@@ -21,7 +26,10 @@ from mr_lab.integrations.ctrader import (
     normalize_closed_bar,
     normalize_quote,
     observe_broker,
+    quote_provider,
+    resolve_symbols,
     runtime_identity,
+    to_python_utc,
 )
 
 NOW = datetime(2026, 1, 2, 12, tzinfo=UTC)
@@ -51,7 +59,7 @@ def account(*, live: bool = False, number: int = 101) -> SimpleNamespace:
         BrokerName="FTMO",
         Number=number,
         AccountType="Hedged",
-        Asset="EUR",
+        Asset=SimpleNamespace(Name="EUR"),
         Balance=100_000,
         Equity=99_900,
         FreeMargin=90_000,
@@ -64,6 +72,7 @@ def test_live_account_is_refused_and_demo_is_normalized() -> None:
     result = normalize_account(account(), NOW)
     assert not result.is_live
     assert result.broker_name == "FTMO"
+    assert result.currency == "EUR"
     assert not hasattr(result, "Number")
 
 
@@ -102,6 +111,19 @@ def test_market_values_are_copied_to_frozen_utc_contracts() -> None:
         quote.bid = quote.ask
     with pytest.raises(ValueError, match="timezone-aware"):
         normalize_quote(native, NOW.replace(tzinfo=None))
+
+
+def test_dotnet_datetime_is_copied_to_python_utc() -> None:
+    native = SimpleNamespace(
+        Year=2026,
+        Month=2,
+        Day=3,
+        Hour=4,
+        Minute=5,
+        Second=6,
+        Millisecond=789,
+    )
+    assert to_python_utc(native) == datetime(2026, 2, 3, 4, 5, 6, 789000, tzinfo=UTC)
 
 
 def test_closed_bar_and_multi_symbol_source_identity() -> None:
@@ -147,7 +169,14 @@ class FakePipeline:
         )
 
 
-def make_host(storage: FakeStorage, logs: list[str], pipeline=None):
+def make_host(storage: FakeStorage, logs: list[str], pipeline=None, observer=None):
+    if observer is None:
+        observer = quote_provider(
+            {
+                "EURUSD": SimpleNamespace(Name="EURUSD", Bid="1.1", Ask="1.2"),
+                "GBPUSD": SimpleNamespace(Name="GBPUSD", Bid="1.2", Ask="1.3"),
+            }
+        )
     return CTraderObservationHost(
         account=account(),
         positions=[],
@@ -157,6 +186,7 @@ def make_host(storage: FakeStorage, logs: list[str], pipeline=None):
         logger=logs.append,
         started_at=NOW,
         pipeline=pipeline,
+        quote_observer=observer,
     )
 
 
@@ -173,6 +203,80 @@ def test_clean_start_syncs_and_restart_restores_without_execution_mutation() -> 
     assert second.lifecycle is ObservationLifecycle.SYNCED
     assert second.controller.state.checkpoint_sequence > sequence
     assert second.controller.state.executions == ()
+
+
+def test_required_multi_symbol_quote_freshness_recovers_from_stale() -> None:
+    active = {"EURUSD"}
+
+    def observe(now):
+        symbols = {
+            name: SimpleNamespace(Name=name, Bid="1.1", Ask="1.2") for name in active
+        }
+        return quote_provider(symbols)(now)
+
+    host = make_host(FakeStorage(), [], observer=observe)
+    host.start(NOW)
+    assert host.lifecycle is ObservationLifecycle.STALE
+    active.add("GBPUSD")
+    host.heartbeat(NOW + timedelta(seconds=1))
+    assert host.lifecycle is ObservationLifecycle.SYNCED
+    assert not host.controller.can_open_new_entries(NOW + timedelta(seconds=1))
+
+
+def test_future_quote_timestamp_fails_freshness_closed() -> None:
+    def future(_now):
+        return quote_provider(
+            {
+                "EURUSD": SimpleNamespace(Name="EURUSD", Bid=1, Ask=2),
+                "GBPUSD": SimpleNamespace(Name="GBPUSD", Bid=1, Ask=2),
+            }
+        )(NOW + timedelta(seconds=1))
+
+    host = make_host(FakeStorage(), [], observer=future)
+    host.start(NOW)
+    assert host.lifecycle is ObservationLifecycle.STALE
+
+
+def test_multi_symbol_resolution_bar_boundaries_and_deduplication() -> None:
+    eur = SimpleNamespace(Name="EURUSD")
+    gbp = SimpleNamespace(Name="GBPUSD")
+    symbols_api = SimpleNamespace(
+        GetSymbol=lambda name: {"EURUSD": eur, "GBPUSD": gbp}.get(name)
+    )
+    resolved = resolve_symbols(symbols_api, ("EURUSD", "GBPUSD"))
+    assert resolved == {"EURUSD": eur, "GBPUSD": gbp}
+    with pytest.raises(NativeConfigurationError, match="unknown configured symbol"):
+        resolve_symbols(symbols_api, ("UNKNOWN",))
+
+    class Sink:
+        def __init__(self):
+            self.bars = []
+
+        def on_bar_closed(self, bar):
+            self.bars.append(bar)
+
+    def stream(open_value):
+        new = SimpleNamespace(OpenTime=NOW)
+        closed = SimpleNamespace(
+            OpenTime=NOW - timedelta(minutes=15),
+            Open=open_value,
+            High="1.3",
+            Low="1.0",
+            Close="1.2",
+        )
+        return SimpleNamespace(Last=lambda index: (new, closed)[index])
+
+    sink = Sink()
+    router = BarOpenedRouter(sink, "M15")
+    eur_bar = router.on_bar_opened(eur, stream("1.1"))
+    gbp_bar = router.on_bar_opened(gbp, stream("1.15"))
+    assert eur_bar.open_time == NOW - timedelta(minutes=15)
+    assert eur_bar.close_time == NOW
+    assert eur_bar.open == Decimal("1.1")
+    assert eur_bar.source_id != gbp_bar.source_id
+    assert [bar.instrument for bar in sink.bars] == ["EURUSD", "GBPUSD"]
+    assert router.on_bar_opened(gbp, stream("1.15")) is None
+    assert len(sink.bars) == 2
 
 
 def test_signal_only_pipeline_emits_telemetry_before_m3(monkeypatch) -> None:
@@ -224,8 +328,22 @@ def test_export_is_deterministic_allowlisted_and_complete(tmp_path: Path) -> Non
     assert "MR Lab Controller_main.py" in first
     assert "python/mr_lab/runtime/controller.py" in first
     assert "python/mr_lab/integrations/ctrader/host.py" in first
-    forbidden_parts = {"tests", "data", "sealed", ".git", "notebooks", "__pycache__"}
+    forbidden_parts = {"tests", "sealed", ".git", "notebooks", "__pycache__"}
     assert not any(forbidden_parts.intersection(Path(name).parts) for name in first)
+    assert all(
+        Path(name).suffix == ".py" for name in first if "python/mr_lab/data/" in name
+    )
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        (
+            "import sys; "
+            f"sys.path.insert(0, {str(destination / 'python')!r}); "
+            "import mr_lab.runtime, mr_lab.execution, mr_lab.integrations.ctrader"
+        ),
+    ]
+    subprocess.run(command, cwd=tmp_path, check=True)
 
 
 def test_observation_deployment_has_no_known_broker_write_api() -> None:
@@ -244,6 +362,55 @@ def test_observation_deployment_has_no_known_broker_write_api() -> None:
     ]
     source = "\n".join(path.read_text(encoding="utf-8") for path in paths)
     assert all(name not in source for name in forbidden)
+
+
+def test_native_entrypoint_uses_api_wrapper_and_robot_has_no_access_rights() -> None:
+    native = (ROOT / "ctrader/MRLabController/MR Lab Controller_main.py").read_text()
+    for required in (
+        "api.Account",
+        "api.Server.TimeInUtc",
+        "api.LocalStorage",
+        "api.Timer",
+        "api.Print",
+        "api.Symbols",
+        "api.MarketData",
+    ):
+        assert required in native
+    for forbidden in ("self.Account", "self.Server", "self.LocalStorage", "self.Timer"):
+        assert forbidden not in native
+    companion = (ROOT / "ctrader/MRLabController/MRLabController.cs").read_text()
+    assert "[Robot(" in companion
+    assert "AccessRights = AccessRights.None" in companion
+    assert "TimeZone = TimeZones.UTC" in companion
+
+
+def test_native_live_start_stops_before_timer_or_host(monkeypatch) -> None:
+    calls: list[str] = []
+    api = SimpleNamespace(
+        Account=SimpleNamespace(IsLive=True),
+        Print=lambda message: calls.append(message),
+        Stop=lambda: calls.append("STOP"),
+        Timer=SimpleNamespace(Start=lambda _seconds: calls.append("TIMER")),
+    )
+    clr = SimpleNamespace(AddReference=lambda _name: None)
+    wrapper = type(sys)("robot_wrapper")
+    wrapper.api = api
+    wrapper.__all__ = ["api"]
+    calgo = type(sys)("cAlgo")
+    calgo_api = type(sys)("cAlgo.API")
+    monkeypatch.setitem(sys.modules, "clr", clr)
+    monkeypatch.setitem(sys.modules, "robot_wrapper", wrapper)
+    monkeypatch.setitem(sys.modules, "cAlgo", calgo)
+    monkeypatch.setitem(sys.modules, "cAlgo.API", calgo_api)
+    path = ROOT / "ctrader/MRLabController/MR Lab Controller_main.py"
+    spec = importlib.util.spec_from_file_location("mrlab_native_live_test", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    instance = module.MRLabController()
+    instance.on_start()
+    assert calls == ["MR LAB M5A REFUSES LIVE ACCOUNT", "STOP"]
+    assert not hasattr(instance, "_host")
 
 
 def test_core_packages_have_no_ctrader_imports() -> None:

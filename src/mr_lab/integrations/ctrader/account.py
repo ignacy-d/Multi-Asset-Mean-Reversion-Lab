@@ -31,13 +31,15 @@ def normalize_account(account: object, observed_at: datetime) -> AccountObservat
     broker = _text(account.BrokerName)
     number = account.Number
     free_margin = getattr(account, "FreeMargin", None)
+    asset = getattr(account, "Asset", None)
+    currency = getattr(asset, "Name", None)
+    if currency is None:
+        currency = getattr(account, "Currency", asset or "UNKNOWN")
     return AccountObservation(
         observed_at=observed_at,
         broker_name=broker,
         account_type=_text(account.AccountType),
-        currency=_text(
-            getattr(account, "Asset", getattr(account, "Currency", "UNKNOWN"))
-        ),
+        currency=_text(currency),
         is_live=False,
         balance=Decimal(str(account.Balance)),
         equity=Decimal(str(account.Equity)),

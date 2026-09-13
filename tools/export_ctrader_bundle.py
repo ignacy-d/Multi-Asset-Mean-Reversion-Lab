@@ -10,6 +10,14 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "ctrader" / "MRLabController"
 PACKAGE_FILES = (
     "__init__.py",
+    "config/__init__.py",
+    "config/models.py",
+    "config/parser.py",
+    "config/timeframes.py",
+    "data/__init__.py",
+    "data/dataset.py",
+    "data/models.py",
+    "data/resampling.py",
     "signals/__init__.py",
     "signals/contracts.py",
     "portfolio/__init__.py",
@@ -26,6 +34,7 @@ PACKAGE_FILES = (
     "risk/sizing.py",
     "execution/__init__.py",
     "execution/contracts.py",
+    "execution/fake_broker.py",
     "execution/fsm.py",
     "runtime/__init__.py",
     "runtime/checkpoint.py",
@@ -40,8 +49,10 @@ PACKAGE_FILES = (
     "integrations/ctrader/contracts.py",
     "integrations/ctrader/host.py",
     "integrations/ctrader/market.py",
+    "integrations/ctrader/native.py",
     "integrations/ctrader/storage.py",
     "integrations/ctrader/telemetry.py",
+    "integrations/ctrader/time.py",
 )
 TEMPLATE_FILES = ("MR Lab Controller_main.py", "MRLabController.cs", "README.md")
 

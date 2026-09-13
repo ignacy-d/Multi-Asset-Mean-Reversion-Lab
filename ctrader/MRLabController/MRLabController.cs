@@ -4,6 +4,10 @@ using cAlgo.API;
 
 namespace cAlgo.Robots;
 
+[Robot(
+    AccessRights = AccessRights.None,
+    TimeZone = TimeZones.UTC
+)]
 public partial class MRLabController : Robot
 {
     [Parameter("Mode", DefaultValue = "OBSERVATION_ONLY")]

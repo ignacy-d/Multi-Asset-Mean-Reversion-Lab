@@ -1,23 +1,28 @@
 """Native cTrader Python entrypoint for M5A observation mode only."""
+# ruff: noqa: E402, F403, F405
 
 import sys
-from datetime import UTC
+from datetime import timedelta
 from pathlib import Path
 
 import clr
 
 clr.AddReference("cAlgo.API")
 
-from cAlgo.API import *  # noqa: E402,F403
-from robot_wrapper import *  # noqa: E402,F403
+from cAlgo.API import *
+from robot_wrapper import *
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "python"))
 
-from mr_lab.integrations.ctrader import (  # noqa: E402
+from mr_lab.integrations.ctrader import (
+    BarOpenedRouter,
     CTraderLocalStorageStore,
     CTraderObservationHost,
-    LiveAccountRefused,
-    normalize_closed_bar,
+    NativeConfigurationError,
+    configured_symbol_names,
+    quote_provider,
+    resolve_symbols,
+    to_python_utc,
 )
 
 
@@ -25,52 +30,60 @@ class MRLabController:
     """Callback facade; the generated wrapper supplies cTrader properties."""
 
     def on_start(self):
+        if api.Account.IsLive:
+            api.Print("MR LAB M5A REFUSES LIVE ACCOUNT")
+            api.Stop()
+            return
+        if str(api.Mode).upper() != "OBSERVATION_ONLY":
+            api.Print(f"MRLAB REFUSES UNSUPPORTED MODE mode={api.Mode}")
+            api.Stop()
+            return
         try:
-            now = self.Server.Time.astimezone(UTC)
-            symbols = tuple(
-                item.strip() for item in self.SymbolsCsv.split(",") if item.strip()
-            )
+            now = to_python_utc(api.Server.TimeInUtc)
+            names = configured_symbol_names(str(api.SymbolsCsv))
+            self._symbols = resolve_symbols(api.Symbols, names)
             store = CTraderLocalStorageStore(
-                self.LocalStorage,
-                LocalStorageScope.Device,  # noqa: F405
+                api.LocalStorage,
+                LocalStorageScope.Device,
             )
             self._host = CTraderObservationHost(
-                account=self.Account,
-                positions=self.Positions,
-                pending_orders=self.PendingOrders,
+                account=api.Account,
+                positions=api.Positions,
+                pending_orders=api.PendingOrders,
                 store=store,
-                symbols=symbols,
-                logger=self.Print,
+                symbols=names,
+                logger=api.Print,
                 started_at=now,
+                maximum_broker_age=timedelta(
+                    seconds=max(3 * int(api.HeartbeatSeconds), 5)
+                ),
+                maximum_source_age=timedelta(
+                    seconds=max(3 * int(api.HeartbeatSeconds), 5)
+                ),
+                quote_observer=quote_provider(self._symbols),
             )
             self._host.start(now)
-            self.Timer.Start(self.HeartbeatSeconds)
-        except LiveAccountRefused as exception:
-            self.Print(str(exception))
-            raise
+            self._bar_router = BarOpenedRouter(self._host, str(api.TimeFrame))
+            self._bar_router.subscribe(api.MarketData, self._symbols)
+            api.Timer.Start(api.HeartbeatSeconds)
+        except NativeConfigurationError as exception:
+            api.Print(f"MRLAB HALT configuration={exception}")
+            api.Stop()
+            return
 
     def on_bar_closed(self):
-        symbol_name = str(self.SymbolName)
-        if symbol_name.upper() not in self._host.symbols:
-            return
-        bars = self.Bars
-        bar = normalize_closed_bar(
-            symbol_name,
-            str(self.TimeFrame),
-            bars.Last(1),
-            bars.Last(0).OpenTime,
-        )
-        self._host.on_bar_closed(bar)
+        # Multi-symbol close boundaries arrive through each Bars.BarOpened event.
+        pass
 
     def on_timer(self):
-        self._host.heartbeat(self.Server.Time.astimezone(UTC))
+        self._host.heartbeat(to_python_utc(api.Server.TimeInUtc))
 
     def on_stop(self):
-        self.Print("MRLAB STOP mode=OBSERVATION")
+        api.Print("MRLAB STOP mode=OBSERVATION")
 
     def on_exception(self, exception):
-        now = self.Server.Time.astimezone(UTC)
+        now = to_python_utc(api.Server.TimeInUtc)
         diagnostic = type(exception).__name__
-        self.Print(f"MRLAB EXCEPTION type={diagnostic}")
+        api.Print(f"MRLAB EXCEPTION type={diagnostic}")
         if hasattr(self, "_host"):
             self._host.halt(diagnostic, now)
