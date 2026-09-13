@@ -255,6 +255,14 @@ def test_multi_symbol_resolution_bar_boundaries_and_deduplication() -> None:
         def on_bar_closed(self, bar):
             self.bars.append(bar)
 
+    class FakeEvent:
+        def __init__(self):
+            self.handlers = []
+
+        def __iadd__(self, handler):
+            self.handlers.append(handler)
+            return self
+
     def stream(open_value):
         new = SimpleNamespace(OpenTime=NOW)
         closed = SimpleNamespace(
@@ -264,18 +272,36 @@ def test_multi_symbol_resolution_bar_boundaries_and_deduplication() -> None:
             Low="1.0",
             Close="1.2",
         )
-        return SimpleNamespace(Last=lambda index: (new, closed)[index])
+        return SimpleNamespace(
+            Last=lambda index: (new, closed)[index], BarOpened=FakeEvent()
+        )
 
     sink = Sink()
-    router = BarOpenedRouter(sink, "M15")
-    eur_bar = router.on_bar_opened(eur, stream("1.1"))
-    gbp_bar = router.on_bar_opened(gbp, stream("1.15"))
+    native_timeframe = object()
+    streams = {"EURUSD": stream("1.1"), "GBPUSD": stream("1.15")}
+    calls = []
+
+    def get_bars(received_timeframe, symbol_name):
+        assert received_timeframe is native_timeframe
+        calls.append((received_timeframe, symbol_name))
+        return streams[symbol_name]
+
+    router = BarOpenedRouter(
+        sink, native_timeframe=native_timeframe, timeframe_id="M15"
+    )
+    router.subscribe(SimpleNamespace(GetBars=get_bars), resolved)
+    streams["EURUSD"].BarOpened.handlers[0]()
+    streams["GBPUSD"].BarOpened.handlers[0]()
+    eur_bar, gbp_bar = sink.bars
+    assert calls == [(native_timeframe, "EURUSD"), (native_timeframe, "GBPUSD")]
     assert eur_bar.open_time == NOW - timedelta(minutes=15)
     assert eur_bar.close_time == NOW
     assert eur_bar.open == Decimal("1.1")
+    assert eur_bar.timeframe == "M15"
+    assert isinstance(eur_bar.source_id, str)
     assert eur_bar.source_id != gbp_bar.source_id
     assert [bar.instrument for bar in sink.bars] == ["EURUSD", "GBPUSD"]
-    assert router.on_bar_opened(gbp, stream("1.15")) is None
+    assert router.on_bar_opened(gbp, streams["GBPUSD"]) is None
     assert len(sink.bars) == 2
 
 
@@ -378,6 +404,9 @@ def test_native_entrypoint_uses_api_wrapper_and_robot_has_no_access_rights() -> 
         assert required in native
     for forbidden in ("self.Account", "self.Server", "self.LocalStorage", "self.Timer"):
         assert forbidden not in native
+    assert "native_timeframe=api.TimeFrame" in native
+    assert "timeframe_id=str(api.TimeFrame)" in native
+    assert "BarOpenedRouter(self._host, str(api.TimeFrame))" not in native
     companion = (ROOT / "ctrader/MRLabController/MRLabController.cs").read_text()
     assert "[Robot(" in companion
     assert "AccessRights = AccessRights.None" in companion

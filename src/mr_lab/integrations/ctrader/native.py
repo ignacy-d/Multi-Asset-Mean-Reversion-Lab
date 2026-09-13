@@ -60,15 +60,18 @@ def quote_provider(
 class BarOpenedRouter:
     """Route exact multi-symbol boundaries from native ``Bars.BarOpened`` events."""
 
-    def __init__(self, host: object, timeframe: str) -> None:
+    def __init__(
+        self, host: object, *, native_timeframe: object, timeframe_id: str
+    ) -> None:
         self._host = host
-        self._timeframe = timeframe
+        self._native_timeframe = native_timeframe
+        self._timeframe_id = timeframe_id
         self._seen: set[tuple[str, datetime, datetime]] = set()
         self._handlers: list[Callable[..., None]] = []
 
     def subscribe(self, market_data: object, symbols: dict[str, object]) -> None:
         for symbol in symbols.values():
-            bars = market_data.GetBars(self._timeframe, symbol.Name)
+            bars = market_data.GetBars(self._native_timeframe, symbol.Name)
             if bars is None:
                 raise NativeConfigurationError(f"bars unavailable: {symbol.Name}")
 
@@ -83,7 +86,7 @@ class BarOpenedRouter:
         new_bar = bars.Last(0)
         closed_bar = bars.Last(1)
         normalized = normalize_closed_bar(
-            str(symbol.Name), self._timeframe, closed_bar, new_bar.OpenTime
+            str(symbol.Name), self._timeframe_id, closed_bar, new_bar.OpenTime
         )
         identity = (
             normalized.source_id,

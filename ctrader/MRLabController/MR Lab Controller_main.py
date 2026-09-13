@@ -63,7 +63,11 @@ class MRLabController:
                 quote_observer=quote_provider(self._symbols),
             )
             self._host.start(now)
-            self._bar_router = BarOpenedRouter(self._host, str(api.TimeFrame))
+            self._bar_router = BarOpenedRouter(
+                self._host,
+                native_timeframe=api.TimeFrame,
+                timeframe_id=str(api.TimeFrame),
+            )
             self._bar_router.subscribe(api.MarketData, self._symbols)
             api.Timer.Start(api.HeartbeatSeconds)
         except NativeConfigurationError as exception:

@@ -36,6 +36,9 @@ repo → tests → export → cTrader build
    `api.MarketData.GetBars`, and its `BarOpened` event is subscribed to by the
    central host. An unavailable symbol fails closed. The attached chart is only
    host context, not a separate portfolio runtime.
+   `GetBars` receives the native `api.TimeFrame` object required by cTrader;
+   only the normalized MR Lab bar contract and source ID receive its textual
+   identifier (for example, `M15`).
 9. Confirm once more that the selected account says DEMO.
 10. Start the instance.
 11. Inspect the cBot log.
