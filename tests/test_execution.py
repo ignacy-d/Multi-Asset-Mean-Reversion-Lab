@@ -10,6 +10,7 @@ from mr_lab.execution import (
     EnsureProtectionCommand,
     EntryAccepted,
     EntryFill,
+    EntryOrderStatus,
     EntryRejected,
     ExecutionClosed,
     ExecutionEngine,
@@ -413,11 +414,161 @@ def test_fully_filled_entry_cannot_be_cancelled_or_have_exposure_erased():
     )
     with pytest.raises(ExecutionInvariantError, match="cannot be cancelled"):
         ExecutionEngine().request_cancel(state, NOW)
-    with pytest.raises(ExecutionInvariantError, match="out of order"):
+    with pytest.raises(ExecutionInvariantError, match="unrelated command"):
         apply(
             state,
             CancelAcknowledged("cancel", item.execution_intent_id, "x", "order-1", NOW),
         )
+
+
+def test_partial_fill_racing_cancel_preserves_both_in_flight_operations():
+    item, state, _ = acknowledged()
+    state, cancel_commands = ExecutionEngine().request_cancel(state, NOW)
+    cancel = cancel_commands[0]
+
+    state, protection_commands = apply(
+        state,
+        EntryFill(
+            "cancel-race-fill-1",
+            item.execution_intent_id,
+            "order-1",
+            D("1000"),
+            D("1.1000"),
+            NOW + timedelta(microseconds=1),
+        ),
+    )
+    protection = protection_commands[0]
+    state, commands = apply(
+        state,
+        EntryFill(
+            "cancel-race-fill-2",
+            item.execution_intent_id,
+            "order-1",
+            D("3000"),
+            D("1.1020"),
+            NOW + timedelta(microseconds=2),
+        ),
+    )
+    assert commands == ()
+    assert state.filled_quantity == D("4000")
+    assert state.average_fill_price == D("1.1015")
+    assert state.cancel_command_id == cancel.command_id
+    assert state.protection_command_id == protection.command_id
+    assert state.pending_protection_quantity == D("1000")
+    assert state.entry_order_status is EntryOrderStatus.CANCEL_PENDING
+    assert state.live_entry_quantity == D("6000")
+
+    reconstructed = replace(state)
+    assert reconstructed == state
+    assert reconstructed.cancel_command_id == cancel.command_id
+    assert reconstructed.protection_command_id == protection.command_id
+    assert reconstructed.entry_order_status is EntryOrderStatus.CANCEL_PENDING
+
+    cancel_ack = CancelAcknowledged(
+        "cancel-race-ack",
+        item.execution_intent_id,
+        cancel.command_id,
+        "order-1",
+        NOW + timedelta(microseconds=3),
+    )
+    state, commands = apply(state, cancel_ack)
+    assert commands == ()
+    assert state.entry_order_status is EntryOrderStatus.CANCELLED
+    assert state.live_entry_quantity == 0
+    assert state.remaining_quantity == D("6000")
+    assert state.filled_quantity == D("4000")
+    assert state.lifecycle is ExecutionLifecycle.PROTECTION_PENDING
+    assert state.lifecycle is not ExecutionLifecycle.CANCELLED
+    assert state.cancel_command_id == cancel.command_id
+    assert state.protection_command_id == protection.command_id
+    assert apply(state, cancel_ack) == (state, ())
+
+    with pytest.raises(ExecutionInvariantError, match="no longer live"):
+        apply(
+            state,
+            EntryFill(
+                "fill-after-cancel",
+                item.execution_intent_id,
+                "order-1",
+                D("1"),
+                D("1.1"),
+                NOW + timedelta(microseconds=4),
+            ),
+        )
+
+    state, commands = apply(
+        state,
+        ProtectionAcknowledged(
+            "cancel-race-protection-1",
+            item.execution_intent_id,
+            protection.command_id,
+            "order-1",
+            "protection-1",
+            NOW + timedelta(microseconds=4),
+        ),
+    )
+    assert state.protected_quantity == D("1000")
+    followup = commands[0]
+    assert followup.protected_quantity == D("4000")
+    state, _ = apply(
+        state,
+        ProtectionAcknowledged(
+            "cancel-race-protection-2",
+            item.execution_intent_id,
+            followup.command_id,
+            "order-1",
+            "protection-2",
+            NOW + timedelta(microseconds=5),
+        ),
+    )
+    assert state.lifecycle is ExecutionLifecycle.PROTECTED
+    state, _ = apply(
+        state,
+        ExecutionClosed(
+            "cancel-race-close",
+            item.execution_intent_id,
+            "order-1",
+            NOW + timedelta(microseconds=6),
+            "closed",
+        ),
+    )
+    assert state.lifecycle is ExecutionLifecycle.CLOSED
+
+
+def test_full_fill_racing_cancel_ack_preserves_exposure_and_protection():
+    item, state, _ = acknowledged()
+    state, cancel_commands = ExecutionEngine().request_cancel(state, NOW)
+    cancel = cancel_commands[0]
+    state, protection_commands = apply(
+        state,
+        EntryFill(
+            "full-cancel-race-fill",
+            item.execution_intent_id,
+            "order-1",
+            item.quantity,
+            D("1.1"),
+            NOW + timedelta(microseconds=1),
+        ),
+    )
+    assert state.entry_order_status is EntryOrderStatus.FILLED
+    assert state.filled_quantity == item.quantity
+    assert state.live_entry_quantity == 0
+    assert state.lifecycle is ExecutionLifecycle.PROTECTION_PENDING
+
+    cancel_ack = CancelAcknowledged(
+        "full-cancel-race-ack",
+        item.execution_intent_id,
+        cancel.command_id,
+        "order-1",
+        NOW + timedelta(microseconds=2),
+    )
+    state, commands = apply(state, cancel_ack)
+    assert commands == ()
+    assert state.entry_order_status is EntryOrderStatus.FILLED
+    assert state.filled_quantity == item.quantity
+    assert state.lifecycle is ExecutionLifecycle.PROTECTION_PENDING
+    assert state.protection_command_id == protection_commands[0].command_id
+    assert apply(state, cancel_ack) == (state, ())
 
 
 def test_close_is_only_valid_after_exposure_and_terminal_events_do_not_reopen():

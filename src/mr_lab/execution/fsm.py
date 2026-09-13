@@ -17,6 +17,7 @@ from .contracts import (
     EnsureProtectionCommand,
     EntryAccepted,
     EntryFill,
+    EntryOrderStatus,
     EntryRejected,
     ExecutionClosed,
     ExecutionCommand,
@@ -58,6 +59,7 @@ class ExecutionEngine:
             filled_quantity=Decimal(0),
             average_fill_price=None,
             lifecycle=ExecutionLifecycle.NEW,
+            entry_order_status=EntryOrderStatus.NOT_SUBMITTED,
             entry_plan=intent.entry_plan,
             protective_plan=intent.protective_plan,
             protective_boundary=intent.protective_boundary,
@@ -109,6 +111,7 @@ class ExecutionEngine:
             replace(
                 state,
                 lifecycle=ExecutionLifecycle.SUBMITTING,
+                entry_order_status=EntryOrderStatus.SUBMITTING,
                 entry_command_id=command_id,
             ),
             (command,),
@@ -149,9 +152,12 @@ class ExecutionEngine:
         require_utc("requested_at", requested_at)
         if requested_at < state.updated_at:
             raise ExecutionInvariantError("cancel request time moved backwards")
-        if state.lifecycle is ExecutionLifecycle.CANCEL_PENDING:
+        if state.entry_order_status is EntryOrderStatus.CANCEL_PENDING:
             return state, ()
-        if state.lifecycle is not ExecutionLifecycle.ACKNOWLEDGED:
+        if (
+            state.lifecycle is not ExecutionLifecycle.ACKNOWLEDGED
+            or state.entry_order_status is not EntryOrderStatus.OPEN
+        ):
             raise ExecutionInvariantError("entry cannot be cancelled in this lifecycle")
         if state.broker_order_ref is None or state.remaining_quantity <= 0:
             raise ExecutionInvariantError(
@@ -170,6 +176,7 @@ class ExecutionEngine:
             replace(
                 state,
                 lifecycle=ExecutionLifecycle.CANCEL_PENDING,
+                entry_order_status=EntryOrderStatus.CANCEL_PENDING,
                 cancel_command_id=command_id,
                 updated_at=requested_at,
             ),
@@ -211,6 +218,7 @@ class ExecutionEngine:
         return replace(
             state,
             lifecycle=ExecutionLifecycle.ACKNOWLEDGED,
+            entry_order_status=EntryOrderStatus.OPEN,
             broker_order_ref=event.broker_order_ref,
             protection_status=(
                 ProtectionStatus.ACTIVE
@@ -230,6 +238,7 @@ class ExecutionEngine:
         return replace(
             state,
             lifecycle=ExecutionLifecycle.REJECTED,
+            entry_order_status=EntryOrderStatus.REJECTED,
             last_failure_reason=event.reason,
         )
 
@@ -240,11 +249,17 @@ class ExecutionEngine:
             ExecutionLifecycle.ACKNOWLEDGED,
             ExecutionLifecycle.PARTIALLY_FILLED,
             ExecutionLifecycle.PROTECTION_PENDING,
+            ExecutionLifecycle.CANCEL_PENDING,
             ExecutionLifecycle.UNSAFE,
         }:
             raise ExecutionInvariantError("entry fill is out of order")
         if state.broker_order_ref != event.broker_order_ref:
             raise ExecutionInvariantError("fill references an unrelated broker order")
+        if state.entry_order_status not in {
+            EntryOrderStatus.OPEN,
+            EntryOrderStatus.CANCEL_PENDING,
+        }:
+            raise ExecutionInvariantError("entry order is no longer live")
         cumulative = state.filled_quantity + event.quantity
         if cumulative > state.requested_quantity:
             raise ExecutionInvariantError("fill would exceed requested quantity")
@@ -253,12 +268,16 @@ class ExecutionEngine:
         ) * state.filled_quantity
         average = (previous_value + event.price * event.quantity) / cumulative
         fully_filled = cumulative == state.requested_quantity
+        entry_order_status = (
+            EntryOrderStatus.FILLED if fully_filled else state.entry_order_status
+        )
 
         if state.lifecycle is ExecutionLifecycle.UNSAFE:
             return replace(
                 state,
                 filled_quantity=cumulative,
                 average_fill_price=average,
+                entry_order_status=entry_order_status,
             ), ()
 
         if state.pending_protection_quantity is not None:
@@ -266,6 +285,7 @@ class ExecutionEngine:
                 state,
                 filled_quantity=cumulative,
                 average_fill_price=average,
+                entry_order_status=entry_order_status,
             ), ()
 
         if (
@@ -282,6 +302,7 @@ class ExecutionEngine:
                 lifecycle=lifecycle,
                 filled_quantity=cumulative,
                 average_fill_price=average,
+                entry_order_status=entry_order_status,
             ), ()
 
         return self._request_protection(
@@ -289,6 +310,7 @@ class ExecutionEngine:
                 state,
                 filled_quantity=cumulative,
                 average_fill_price=average,
+                entry_order_status=entry_order_status,
             ),
             cumulative,
             event.event_time,
@@ -327,7 +349,10 @@ class ExecutionEngine:
 
     @staticmethod
     def _cancelled(state: ExecutionState, event: CancelAcknowledged) -> ExecutionState:
-        if state.lifecycle is not ExecutionLifecycle.CANCEL_PENDING:
+        if state.entry_order_status not in {
+            EntryOrderStatus.CANCEL_PENDING,
+            EntryOrderStatus.FILLED,
+        }:
             raise ExecutionInvariantError("cancel acknowledgement is out of order")
         if state.cancel_command_id != event.command_id:
             raise ExecutionInvariantError(
@@ -335,13 +360,29 @@ class ExecutionEngine:
             )
         if state.broker_order_ref != event.broker_order_ref:
             raise ExecutionInvariantError("cancel event references an unrelated order")
-        if state.filled_quantity != 0:
-            raise ExecutionInvariantError(
-                "partially filled cancellation needs an explicit exposure lifecycle"
+        if state.entry_order_status is EntryOrderStatus.FILLED:
+            return state
+        if state.filled_quantity > 0:
+            if state.protection_status is ProtectionStatus.FAILED:
+                lifecycle = ExecutionLifecycle.UNSAFE
+            elif state.protection_status is ProtectionStatus.PENDING:
+                lifecycle = ExecutionLifecycle.PROTECTION_PENDING
+            elif (
+                state.protection_status is ProtectionStatus.ACTIVE
+                and state.protected_quantity >= state.filled_quantity
+            ):
+                lifecycle = ExecutionLifecycle.PROTECTED
+            else:
+                lifecycle = ExecutionLifecycle.PARTIALLY_FILLED
+            return replace(
+                state,
+                lifecycle=lifecycle,
+                entry_order_status=EntryOrderStatus.CANCELLED,
             )
         return replace(
             state,
             lifecycle=ExecutionLifecycle.CANCELLED,
+            entry_order_status=EntryOrderStatus.CANCELLED,
             protection_status=ProtectionStatus.NOT_REQUESTED,
             protection_ref=None,
             protected_quantity=Decimal(0),
@@ -377,7 +418,7 @@ class ExecutionEngine:
             )
         lifecycle = (
             ExecutionLifecycle.PROTECTED
-            if state.remaining_quantity == 0
+            if state.live_entry_quantity == 0
             else ExecutionLifecycle.PARTIALLY_FILLED
         )
         return replace(
@@ -412,7 +453,7 @@ class ExecutionEngine:
             raise ExecutionInvariantError(
                 "an execution without exposure cannot be closed"
             )
-        if state.remaining_quantity != 0:
+        if state.live_entry_quantity != 0:
             raise ExecutionInvariantError(
                 "execution cannot close while entry quantity remains live"
             )

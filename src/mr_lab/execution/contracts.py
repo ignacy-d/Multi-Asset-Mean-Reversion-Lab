@@ -44,6 +44,18 @@ class ProtectionStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class EntryOrderStatus(StrEnum):
+    """Broker-neutral liveness of the entry order, separate from exposure state."""
+
+    NOT_SUBMITTED = "NOT_SUBMITTED"
+    SUBMITTING = "SUBMITTING"
+    OPEN = "OPEN"
+    CANCEL_PENDING = "CANCEL_PENDING"
+    CANCELLED = "CANCELLED"
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+
+
 @dataclass(frozen=True, slots=True)
 class ProcessedEvent:
     event_id: str
@@ -67,6 +79,7 @@ class ExecutionState:
     filled_quantity: Decimal
     average_fill_price: Decimal | None
     lifecycle: ExecutionLifecycle
+    entry_order_status: EntryOrderStatus
     entry_plan: PlanReference
     protective_plan: PlanReference
     protective_boundary: ProtectiveBoundary
@@ -141,6 +154,17 @@ class ExecutionState:
     @property
     def remaining_quantity(self) -> Decimal:
         return self.requested_quantity - self.filled_quantity
+
+    @property
+    def live_entry_quantity(self) -> Decimal:
+        """Quantity that may still execute, independent of economic remainder."""
+        if self.entry_order_status in {
+            EntryOrderStatus.SUBMITTING,
+            EntryOrderStatus.OPEN,
+            EntryOrderStatus.CANCEL_PENDING,
+        }:
+            return self.remaining_quantity
+        return Decimal(0)
 
     @property
     def is_terminal(self) -> bool:
