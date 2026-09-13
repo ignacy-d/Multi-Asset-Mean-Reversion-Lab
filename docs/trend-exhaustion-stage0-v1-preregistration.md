@@ -2,11 +2,12 @@
 
 ## Status and scope
 
-This document freezes the method **before empirical execution**. Discovery is
+This document froze the method **before empirical execution**. Discovery was
 restricted to the authenticated, registry-pinned 2024 M1 BID corpora for
 EURUSD, GBPUSD, USDJPY, AUDUSD, and AUDJPY. The 2025 OOS is sealed and is not
-used by this work. Execution status is **pending**; no substitute corpus is
-permitted. This family is independent of VWAP, OU, and Failed Breakout.
+used by this work. The authenticated operator run is now **complete**; no
+substitute corpus was used. This family is independent of VWAP, OU, and Failed
+Breakout.
 
 Hypothesis: after a sufficiently large and efficient directional intraday
 trend, failure to retain additional directional progress has positive gross
@@ -76,7 +77,7 @@ Stage-0 contains no costs, TP/SL, trailing stop, sizing, spread/slippage or
 execution optimization, portfolio weighting, ML, or LLM decision. It asks only
 whether gross directional mean-reversion expectancy exists.
 
-## Pending authenticated run
+## Authenticated run command
 
 ```bash
 uv run mr-lab-trend-exhaustion-stage0 \
@@ -84,3 +85,78 @@ uv run mr-lab-trend-exhaustion-stage0 \
   --registry configs/stage4a-2024-corpus-registry.json \
   --output-dir results/trend-exhaustion-stage0-v1
 ```
+
+## Observed Stage-0 result
+
+The frozen five-instrument 2024 discovery run completed with the preregistered
+classification **KILL**. Trend Exhaustion v1 is **NOT promoted to Stage 1**.
+This is a completed falsification experiment and not evidence of deployable
+alpha.
+
+At the primary 1.50 ATR threshold, all 4,808 events had an exact 60-minute
+outcome. The gross direction-signed results were:
+
+| Metric | Result |
+|---|---:|
+| Event count / H60 count | 4,808 / 4,808 |
+| Mean H15 | +0.0037853577370946644 pips |
+| Mean H30 | +0.09319883527453801 pips |
+| Mean H60 | +0.12495840266221844 pips |
+| Median H60 | **-0.1999999999990898 pips** |
+| H60 forward-return profit factor | 1.0297884366524672 |
+| H60 win rate | 0.48211314475873546 |
+| Mean H120 | -0.08221713810315644 pips |
+| Mean MFE | 12.152142262895177 pips |
+| Mean MAE | 12.103119800332783 pips |
+
+The sole decisive failed PASS condition was the frozen requirement that the
+primary aggregate H60 median be non-negative. Its observed value was about
+-0.20 pips. The positive mean, adequate count, and other passing safeguards do
+not override that condition, and it was not weakened after observation.
+
+### Cross-asset and quarterly diagnostics
+
+Primary H60 instrument expectancy was:
+
+| Instrument | Mean H60 (pips) |
+|---|---:|
+| AUDJPY | +0.46221294363257054 |
+| AUDUSD | -0.2221871713984985 |
+| EURUSD | -0.18772678762006872 |
+| GBPUSD | +0.1673257023932904 |
+| USDJPY | +0.3840159840159522 |
+
+Quarterly H60 expectancy was Q1 +0.3417667238421841, Q2
++0.1306799336650394, Q3 +0.6426788685524039, and Q4
+-0.5897893030794711 pips. Maximum instrument concentration was
+0.2081946755407654 and maximum quarter concentration was
+0.2566555740432612.
+
+### Preregistered threshold plateau
+
+| Displacement | N | Mean H60 (pips) | H60 profit factor |
+|---|---:|---:|---:|
+| 1.25 ATR | 5,101 | +0.09776514408938551 | 1.023481937695406 |
+| 1.50 ATR primary | 4,808 | +0.12495840266221844 | 1.0297884366524672 |
+| 1.75 ATR | 4,388 | +0.12645852324520784 | 1.0300530762564977 |
+
+The preregistered plateau **passed**: both neighboring means were positive and
+at least half the positive primary mean. Plateau acceptance does not rescue the
+failed primary-median condition.
+
+### Module A overlap
+
+At the primary threshold, same-instrument overlap was 11/4,808 exact,
+28/4,808 within ±15 minutes, 51/4,808 within ±30 minutes, and 102/4,808 within
+±60 minutes. Trend Exhaustion timing was therefore highly orthogonal to Module
+A, but orthogonality was diagnostic only and cannot rescue insufficient
+standalone evidence.
+
+### Post-hoc observations — not v1 evidence
+
+After the frozen classification, Asia-session Trend Exhaustion appeared
+materially stronger than the broad family, descriptively concentrated in
+USDJPY and AUDJPY. These observations did not filter, reclassify, or rescue v1.
+They are recorded only as possible future, separately preregistered hypotheses
+`TE-ASIA-1` and `TE-ASIA-JPY-1`. Neither was promoted, validated, optimized, or
+tested in this PR, and no pair/session filter was added to Trend Exhaustion v1.
