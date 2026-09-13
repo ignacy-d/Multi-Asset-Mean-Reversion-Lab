@@ -1,25 +1,37 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import mr_lab.trend_exhaustion_quality as quality
 from mr_lab.research import Direction
 from mr_lab.stage4a import DirectionalPathDiagnostic, ForwardOutcome
 from mr_lab.trend_exhaustion import PRIMARY_THRESHOLD, TrendExhaustionEvent
 from mr_lab.trend_exhaustion_quality import (
+    CANONICAL_CORPUS_ROOT,
+    CANONICAL_REGISTRY_PATH,
     CATEGORICAL_PREDICTORS,
     CONTINUOUS_PREDICTORS,
+    EXPECTED_PRIMARY_EVENT_COUNTS,
     FOLDS,
     MODEL_ORDER,
     PREDICTORS,
+    Prediction,
     QualityLabError,
+    QualityRow,
     classify,
+    evaluate_family,
+    family_passes,
+    preflight_development_inputs,
     quality_row,
     select_model,
+    validate_development_registry,
+    validate_primary_event_counts,
 )
 
 CANONICAL = {  # Canonical PR #76 byte identities.
@@ -135,6 +147,69 @@ def test_development_year_and_utc_guard_fails_closed(bad: datetime) -> None:
         quality_row(event(bad), path(bad))
 
 
+def test_actual_canonical_2024_registry_passes_preflight_without_corpus_access(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        quality,
+        "load_offline_corpus",
+        lambda _: pytest.fail("preflight must not load corpus bytes"),
+    )
+    registry = preflight_development_inputs(
+        CANONICAL_CORPUS_ROOT, CANONICAL_REGISTRY_PATH
+    )
+    instruments = registry["instruments"]
+    assert isinstance(instruments, dict)
+    assert set(instruments) == set(quality.FROZEN_INSTRUMENTS)
+
+
+def test_wrong_root_fails_before_manifest_or_corpus_access(monkeypatch) -> None:
+    monkeypatch.setattr(
+        quality,
+        "read_and_validate_manifest",
+        lambda *_: pytest.fail("wrong root must fail before manifest access"),
+    )
+    monkeypatch.setattr(
+        quality,
+        "load_offline_corpus",
+        lambda *_: pytest.fail("wrong root must fail before corpus access"),
+    )
+    with pytest.raises(QualityLabError, match="explicit development root"):
+        quality.build_development_dataset(
+            Path("/mnt/e/mr-lab/frozen-2025"), CANONICAL_REGISTRY_PATH
+        )
+
+
+def test_wrong_registry_date_fails_before_manifest_or_corpus_access(
+    monkeypatch,
+) -> None:
+    registry = quality.load_corpus_registry(CANONICAL_REGISTRY_PATH)
+    registry["instruments"]["AUDJPY"]["requested_end_date"] = "2025-01-01"
+    monkeypatch.setattr(quality, "load_corpus_registry", lambda _: registry)
+    monkeypatch.setattr(
+        quality,
+        "read_and_validate_manifest",
+        lambda *_: pytest.fail("bad registry must fail before manifest access"),
+    )
+    monkeypatch.setattr(
+        quality,
+        "load_offline_corpus",
+        lambda *_: pytest.fail("bad registry must fail before corpus access"),
+    )
+    with pytest.raises(QualityLabError, match="exact 2024 date range"):
+        quality.build_development_dataset(
+            CANONICAL_CORPUS_ROOT, CANONICAL_REGISTRY_PATH
+        )
+
+
+def test_registry_requires_exact_schema_instruments_and_verified_entries() -> None:
+    registry = quality.load_corpus_registry(CANONICAL_REGISTRY_PATH)
+    validate_development_registry(registry)
+    registry["registry_schema_version"] = "other"
+    with pytest.raises(QualityLabError, match="development schema"):
+        validate_development_registry(registry)
+
+
 def test_only_primary_threshold_and_matching_unique_identity_are_accepted() -> None:
     with pytest.raises(QualityLabError, match="primary threshold"):
         quality_row(replace(event(), displacement_threshold=1.25), path())
@@ -159,6 +234,7 @@ def report(*, n=1000, lift=0.05, rho=0.05, passes=True):
         },
         "top_20_lift": lift,
         "spearman": rho,
+        "ranking_diagnostics_finite": True,
         "ordered_adjacent_quintile_pairs": 3,
         "top_20_by_instrument": {str(i): {"mean_h60_pips": 1} for i in range(3)},
         "stability": {
@@ -188,3 +264,53 @@ def test_selection_prefers_simplest_within_both_tolerances() -> None:
         "additive_splines": report(lift=0.11, rho=0.105),
     }
     assert select_model(reports) == "huber"
+
+
+def model_row(index: int) -> QualityRow:
+    return QualityRow(
+        f"event-{index}",
+        f"2024-05-{index + 1:02d}T00:00:00+00:00",
+        "EURUSD",
+        "short",
+        "london",
+        2.0,
+        0.8,
+        0.5,
+        0.05,
+        0.1,
+        0.1,
+        0.2,
+        0.3,
+        1.0,
+        60,
+        120,
+        None,
+        float(index),
+        float(index),
+        1.0,
+        1.0,
+    )
+
+
+def test_constant_predictions_make_spearman_null_and_fail_closed() -> None:
+    predictions = tuple(
+        Prediction(row.event_id, "huber", 5, 1.0, row)
+        for row in map(model_row, range(10))
+    )
+    result = evaluate_family(predictions)
+    assert result["spearman"] is None
+    assert result["ranking_diagnostics_finite"] is False
+    result["top_20_by_instrument"] = {"EURUSD": result["top_20"]}
+    assert family_passes(result) is False
+    serialized = json.dumps(result, allow_nan=False)
+    assert "NaN" not in serialized and "Infinity" not in serialized
+
+
+def test_primary_event_count_diagnostic_matches_frozen_v1_and_mismatch_fails() -> None:
+    diagnostic = validate_primary_event_counts(EXPECTED_PRIMARY_EVENT_COUNTS)
+    assert diagnostic == {
+        "total": 4808,
+        "per_instrument": EXPECTED_PRIMARY_EVENT_COUNTS,
+    }
+    with pytest.raises(QualityLabError, match="reproducibility failure"):
+        validate_primary_event_counts(EXPECTED_PRIMARY_EVENT_COUNTS | {"AUDJPY": 957})

@@ -67,6 +67,19 @@ FOLDS = tuple((tuple(range(1, month)), month) for month in range(5, 13))
 MODEL_ORDER = ("huber", "quantile", "additive_splines")
 BOOTSTRAP_SEED = 20240913
 BOOTSTRAP_REPLICATES = 2_000
+CANONICAL_CORPUS_ROOT = Path("/mnt/e/mr-lab/frozen-2024")
+CANONICAL_REGISTRY_PATH = Path("configs/stage4a-2024-corpus-registry.json")
+REGISTRY_SCHEMA = "stage-4a-2024-corpus-registry-v1"
+DEVELOPMENT_START = "2024-01-01"
+DEVELOPMENT_END = "2024-12-31"
+EXPECTED_PRIMARY_EVENT_COUNTS = {
+    "AUDJPY": 958,
+    "AUDUSD": 951,
+    "EURUSD": 937,
+    "GBPUSD": 961,
+    "USDJPY": 1001,
+}
+EXPECTED_PRIMARY_EVENT_TOTAL = 4808
 
 
 class QualityLabError(ValueError):
@@ -115,6 +128,88 @@ class Prediction:
     row: QualityRow
 
 
+@dataclass(frozen=True, slots=True)
+class DevelopmentDataset:
+    rows: tuple[QualityRow, ...]
+    primary_event_counts: dict[str, int]
+    primary_event_total: int
+
+
+def _same_explicit_path(given: Path, expected: Path) -> bool:
+    """Compare path labels without resolving symlinks or inspecting the filesystem."""
+    return given.expanduser().absolute() == expected.expanduser().absolute()
+
+
+def validate_development_registry(registry: Mapping[str, object]) -> None:
+    """Fail closed unless all registry metadata is the explicit 2024 contract."""
+    if registry.get("registry_schema_version") != REGISTRY_SCHEMA:
+        raise QualityLabError("registry is not the explicit 2024 development schema")
+    entries = registry.get("instruments")
+    if not isinstance(entries, dict) or set(entries) != set(FROZEN_INSTRUMENTS):
+        raise QualityLabError(
+            "registry does not contain the exact development universe"
+        )
+    for instrument in FROZEN_INSTRUMENTS:
+        entry = entries[instrument]
+        if not isinstance(entry, dict) or (
+            entry.get("requested_start_date"),
+            entry.get("requested_end_date"),
+        ) != (DEVELOPMENT_START, DEVELOPMENT_END):
+            raise QualityLabError("registry entry is outside the exact 2024 date range")
+        validate_registry_entry(instrument, entry, require_verified=True)
+
+
+def preflight_development_inputs(
+    corpus_root: Path, registry_path: Path
+) -> dict[str, object]:
+    """Validate root label and complete registry before any corpus-path access."""
+    if not _same_explicit_path(corpus_root, CANONICAL_CORPUS_ROOT):
+        raise QualityLabError(
+            f"corpus root must be the explicit development root {CANONICAL_CORPUS_ROOT}"
+        )
+    if not _same_explicit_path(registry_path, CANONICAL_REGISTRY_PATH):
+        raise QualityLabError(
+            "registry must be the canonical development registry "
+            f"{CANONICAL_REGISTRY_PATH}"
+        )
+    registry = load_corpus_registry(registry_path)
+    validate_development_registry(registry)
+    return registry
+
+
+def _validate_loaded_bars(bars: Sequence[Any]) -> None:
+    """Defense in depth after an authenticated corpus has been loaded."""
+    for bar in bars:
+        for timestamp in (bar.open_time, bar.close_time, bar.available_at):
+            if (
+                timestamp.tzinfo is None
+                or timestamp.utcoffset() != timedelta(0)
+                or timestamp.year != DEVELOPMENT_YEAR
+            ):
+                raise QualityLabError(
+                    "loaded corpus contains a timestamp outside UTC development 2024"
+                )
+
+
+def validate_primary_event_counts(counts: Mapping[str, int]) -> dict[str, Any]:
+    """Require exact v1 event-universe reproduction; this is not a promotion gate."""
+    observed = {
+        instrument: counts.get(instrument, 0) for instrument in FROZEN_INSTRUMENTS
+    }
+    total = sum(observed.values())
+    if (
+        observed != EXPECTED_PRIMARY_EVENT_COUNTS
+        or total != EXPECTED_PRIMARY_EVENT_TOTAL
+    ):
+        raise QualityLabError(
+            "primary-event reproducibility failure: "
+            f"expected total={EXPECTED_PRIMARY_EVENT_TOTAL} "
+            f"per_instrument={EXPECTED_PRIMARY_EVENT_COUNTS}; "
+            f"observed total={total} per_instrument={observed}"
+        )
+    return {"total": total, "per_instrument": observed}
+
+
 def _utc_2024(event: TrendExhaustionEvent) -> None:
     timestamp = event.signal_timestamp
     if timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
@@ -136,6 +231,11 @@ def quality_row(
     h60 = next((item for item in path.horizons if item.horizon_minutes == 60), None)
     if h60 is None:
         raise QualityLabError("a machine-readable H60 outcome is required")
+    if not all(
+        math.isfinite(value)
+        for value in (h60.signed_price_movement, h60.signed_return_pips)
+    ):
+        raise QualityLabError("H60 outcomes must be finite")
     atr = event.frozen_atr20
     if not math.isfinite(atr) or atr <= 0:
         raise QualityLabError("frozen ATR must be finite and positive")
@@ -164,15 +264,16 @@ def quality_row(
     )
 
 
-def build_development_rows(
+def build_development_dataset(
     corpus_root: Path, registry_path: Path
-) -> tuple[QualityRow, ...]:
+) -> DevelopmentDataset:
     """Load only explicit authenticated 2024 corpus paths and regenerate TE-Q1 rows."""
-    registry = load_corpus_registry(registry_path)
+    registry = preflight_development_inputs(corpus_root, registry_path)
     entries = registry["instruments"]
     assert isinstance(entries, dict)
     rows: list[QualityRow] = []
     seen: set[str] = set()
+    counts: dict[str, int] = {}
     for instrument in FROZEN_INSTRUMENTS:
         entry = validate_registry_entry(
             instrument, entries[instrument], require_verified=True
@@ -186,9 +287,11 @@ def build_development_rows(
         dataset = load_offline_corpus(corpus_dir)
         if dataset.metadata.dataset_id != manifest["assembled_dataset_id"]:
             raise QualityLabError("loaded dataset identity disagrees with manifest")
+        _validate_loaded_bars(dataset.bars)
         m15 = resample_bars(dataset.bars, Timeframe("15m")).bars
         by_time = {bar.available_at: bar for bar in m15}
         events = detect_trend_exhaustion(m15, TrendExhaustionSpec(PRIMARY_THRESHOLD))
+        counts[instrument] = len(events)
         if any(event.event_id in seen for event in events):
             raise QualityLabError("duplicate primary opportunity")
         seen.update(event.event_id for event in events)
@@ -205,7 +308,19 @@ def build_development_rows(
         for event, path in zip(events, paths, strict=True):
             if any(item.horizon_minutes == 60 for item in path.horizons):
                 rows.append(quality_row(event, path))
-    return tuple(sorted(rows, key=lambda row: (row.signal_timestamp, row.event_id)))
+    diagnostics = validate_primary_event_counts(counts)
+    return DevelopmentDataset(
+        tuple(sorted(rows, key=lambda row: (row.signal_timestamp, row.event_id))),
+        dict(diagnostics["per_instrument"]),
+        int(diagnostics["total"]),
+    )
+
+
+def build_development_rows(
+    corpus_root: Path, registry_path: Path
+) -> tuple[QualityRow, ...]:
+    """Compatibility facade returning rows from the authenticated dataset build."""
+    return build_development_dataset(corpus_root, registry_path).rows
 
 
 def _records(rows: Sequence[QualityRow]) -> list[dict[str, object]]:
@@ -398,16 +513,29 @@ def evaluate_family(predictions: Sequence[Prediction]) -> dict[str, Any]:
     """Evaluate one family's pooled OOS-only scores using deterministic rank buckets."""
     if not predictions or len({item.family for item in predictions}) != 1:
         raise QualityLabError("evaluation requires one non-empty OOS model family")
-    ranked = sorted(predictions, key=lambda item: (item.score, item.event_id))
+    scores_finite = all(math.isfinite(item.score) for item in predictions)
+    ranked = sorted(
+        predictions,
+        key=lambda item: (
+            item.score if math.isfinite(item.score) else -math.inf,
+            item.event_id,
+        ),
+    )
     chunks = np.array_split(np.asarray(ranked, dtype=object), 5)
     quintiles = [_summary(list(chunk)) for chunk in chunks]
     count = len(ranked)
     top20 = ranked[count - math.ceil(count * 0.20) :]
     top10 = ranked[count - math.ceil(count * 0.10) :]
     baseline = fmean(item.row.y60_atr for item in ranked)
-    rho = float(
-        spearmanr([x.score for x in ranked], [x.row.y60_atr for x in ranked]).statistic
+    scores = [x.score for x in ranked]
+    outcomes = [x.row.y60_atr for x in ranked]
+    ranking_varies = len(set(scores)) > 1 and len(set(outcomes)) > 1
+    raw_rho = (
+        float(spearmanr(scores, outcomes).statistic)
+        if scores_finite and ranking_varies
+        else math.nan
     )
+    rho = raw_rho if math.isfinite(raw_rho) else None
     stability = {}
     for key, getter in (
         ("instrument", lambda x: x.row.instrument),
@@ -428,6 +556,7 @@ def evaluate_family(predictions: Sequence[Prediction]) -> dict[str, Any]:
         "top_20": _summary(top20),
         "top_10": _summary(top10),
         "spearman": rho,
+        "ranking_diagnostics_finite": scores_finite and rho is not None,
         "top_minus_bottom": means[-1] - means[0],
         "top_20_lift": _summary(top20)["mean_y60_atr"] - baseline,
         "top_10_lift": _summary(top10)["mean_y60_atr"] - baseline,
@@ -474,14 +603,18 @@ def family_passes(report: Mapping[str, Any]) -> bool:
     top = report["top_20"]
     stability = report["stability"]
     positive_instruments = sum(
-        v["mean_h60_pips"] > 0 for v in report["top_20_by_instrument"].values()
+        isinstance(v["mean_h60_pips"], int | float) and v["mean_h60_pips"] > 0
+        for v in report["top_20_by_instrument"].values()
     )
 
     def maximum(key: str) -> float:
         return max((v["share"] for v in stability[key].values()), default=1.0)
 
     return bool(
-        report["oos_baseline"]["n"] >= 1000
+        report.get("ranking_diagnostics_finite") is True
+        and isinstance(report.get("spearman"), int | float)
+        and math.isfinite(report["spearman"])
+        and report["oos_baseline"]["n"] >= 1000
         and top["n"] >= 200
         and top["mean_h60_pips"] > 0
         and top["median_h60_pips"] >= 0
@@ -511,21 +644,36 @@ def classify(reports: Mapping[str, Mapping[str, Any]]) -> str:
 
 
 def select_model(reports: Mapping[str, Mapping[str, Any]]) -> str:
+    def finite_metric(report: Mapping[str, Any], name: str) -> float:
+        value = report.get(name)
+        return (
+            float(value)
+            if isinstance(value, int | float) and math.isfinite(value)
+            else -math.inf
+        )
+
     leader = max(
         MODEL_ORDER,
-        key=lambda name: (reports[name]["top_20_lift"], reports[name]["spearman"]),
+        key=lambda name: (
+            finite_metric(reports[name], "top_20_lift"),
+            finite_metric(reports[name], "spearman"),
+            -MODEL_ORDER.index(name),
+        ),
     )
+    leader_lift = finite_metric(reports[leader], "top_20_lift")
+    leader_spearman = finite_metric(reports[leader], "spearman")
     for name in MODEL_ORDER:
         if (
-            reports[name]["top_20_lift"] >= reports[leader]["top_20_lift"] - 0.02
-            and reports[name]["spearman"] >= reports[leader]["spearman"] - 0.01
+            finite_metric(reports[name], "top_20_lift") >= leader_lift - 0.02
+            and finite_metric(reports[name], "spearman") >= leader_spearman - 0.01
         ):
             return name
     return leader
 
 
 def run(corpus_root: Path, registry_path: Path, output_dir: Path) -> Path:
-    rows = build_development_rows(corpus_root, registry_path)
+    development = build_development_dataset(corpus_root, registry_path)
+    rows = development.rows
     predictions = walk_forward(rows)
     reports = {}
     for family in MODEL_ORDER:
@@ -558,11 +706,17 @@ def run(corpus_root: Path, registry_path: Path, output_dir: Path) -> Path:
         "classification": classify(reports),
         "selected_model": select_model(reports),
         "row_count": len(rows),
+        "primary_event_reproducibility": {
+            "total": development.primary_event_total,
+            "per_instrument": development.primary_event_counts,
+            "matches_frozen_v1": True,
+        },
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "trend-exhaustion-quality-report.json"
     path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
     )
     return path
 
@@ -573,7 +727,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--registry",
         type=Path,
-        default=Path("configs/stage4a-2024-corpus-registry.json"),
+        default=CANONICAL_REGISTRY_PATH,
     )
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args(argv)

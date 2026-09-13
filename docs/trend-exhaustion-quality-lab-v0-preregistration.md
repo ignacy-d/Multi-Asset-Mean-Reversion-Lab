@@ -16,6 +16,13 @@ only `displacement_threshold = 1.50`, creates typed `DirectionalPathRequest`s,
 uses machine-readable `diagnose_directional_paths`, and joins each unique event
 to one causal feature row. No event-export interchange format is an input.
 
+Before any per-instrument manifest or corpus access, the runner requires the
+literal development root `/mnt/e/mr-lab/frozen-2024`, the canonical
+`configs/stage4a-2024-corpus-registry.json`, its exact schema, the exact five
+instruments, verified status, and the exact 2024 date range on every entry. It
+does not discover or fall back to another root. Loaded bar timestamps and event
+timestamps are checked again for UTC 2024 as defense in depth.
+
 ## Frozen feature and outcome contract
 
 Continuous predictors are `normalized_displacement`, `efficiency_ratio`,
@@ -57,6 +64,13 @@ session. Uncertainty uses 2,000 deterministic whole-month block-bootstrap
 replicates with seed `20240913` for top-20% raw and normalized means and the
 top-minus-bottom normalized spread.
 
+Regeneration must reproduce the frozen v1 primary event universe: 4,808 total,
+with AUDJPY 958, AUDUSD 951, EURUSD 937, GBPUSD 961, and USDJPY 1,001. These
+counts are reported as a provenance/reproducibility diagnostic and are not an
+alpha-selection criterion. A mismatch fails closed without changing the
+detector. Nonfinite required ranking diagnostics are represented as JSON null,
+cannot pass promotion, and are handled deterministically during model selection.
+
 POST-HOC EDA reports missingness, quantiles and expectancy buckets for each
 causal predictor, plus descriptive instrument, direction, and session summaries.
 It cannot directly create an optimized filter.
@@ -81,7 +95,7 @@ quantile, then additive splines. No isolated best bucket determines selection.
 With authenticated corpora already present, run:
 
 ```console
-uv run mr-lab-trend-exhaustion-quality --corpus-root /path/to/authenticated-2024-corpora --registry configs/stage4a-2024-corpus-registry.json --output-dir results/trend-exhaustion-quality-v0
+uv run mr-lab-trend-exhaustion-quality --corpus-root /mnt/e/mr-lab/frozen-2024 --registry configs/stage4a-2024-corpus-registry.json --output-dir results/trend-exhaustion-quality-v0
 ```
 
 Do not download substitutes or execute against any other year.
