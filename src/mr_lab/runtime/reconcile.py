@@ -356,20 +356,26 @@ def _compare(
         return _recover_cancel(state, broker)
     if state.lifecycle is ExecutionLifecycle.PROTECTION_PENDING:
         return _recover_protection(state, broker)
-    if (
-        state.lifecycle is ExecutionLifecycle.UNSAFE
-        and broker.protection_active
-        and broker.protected_quantity >= broker.cumulative_filled_quantity
-        and broker.cumulative_filled_quantity == state.filled_quantity
-    ):
-        if state.protection_ref and broker.protection_ref != state.protection_ref:
-            return _conflict(state, "protection identity conflicts")
-        return _item(
-            state,
-            ReconciliationCategory.BROKER_AHEAD,
-            "previously unsafe exposure is now fully protected",
-        ), _fully_protected(state, broker)
     if state.lifecycle is ExecutionLifecycle.UNSAFE:
+        if _entry_status(broker.entry_status) is not state.entry_order_status:
+            return _conflict(state, "unsafe recovery entry order status differs")
+        if broker.average_fill_price != state.average_fill_price:
+            return _conflict(state, "unsafe recovery average fill price differs")
+        if not broker.exposure_exists:
+            return _conflict(state, "unsafe recovery exposure is missing")
+        if broker.cumulative_filled_quantity != state.filled_quantity:
+            return _conflict(state, "unsafe recovery fill quantity differs")
+        if (
+            broker.protection_active
+            and broker.protected_quantity >= broker.cumulative_filled_quantity
+        ):
+            if state.protection_ref and broker.protection_ref != state.protection_ref:
+                return _conflict(state, "protection identity conflicts")
+            return _item(
+                state,
+                ReconciliationCategory.BROKER_AHEAD,
+                "previously unsafe exposure is now fully protected",
+            ), _fully_protected(state, broker)
         return _conflict(state, "exposure remains insufficiently protected")
     if broker.cumulative_filled_quantity > state.filled_quantity:
         if broker.average_fill_price is None:

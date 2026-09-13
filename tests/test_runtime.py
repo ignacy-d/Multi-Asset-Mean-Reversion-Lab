@@ -8,6 +8,7 @@ from mr_lab.execution import (
     EntryAccepted,
     EntryFill,
     ExecutionEngine,
+    ExecutionInvariantError,
     ExecutionLifecycle,
     ProtectionAcknowledged,
     ProtectionStatus,
@@ -737,6 +738,8 @@ def test_reconciliation_never_invents_protection_command_identity():
         recovered = result.recovered_executions[0]
         assert recovered.protection_command_id is None
         assert recovered.pending_protection_quantity is None
+        assert recovered.entry_command_id in {None, state.entry_command_id}
+        assert recovered.cancel_command_id in {None, state.cancel_command_id}
 
 
 def test_explicit_client_idempotency_conflict_fails_closed_for_owned_execution():
@@ -745,3 +748,137 @@ def test_explicit_client_idempotency_conflict_fails_closed_for_owned_execution()
     result = reconcile((state,), BrokerRuntimeSnapshot(NOW, (broker,)))
     assert not result.healthy
     assert result.items[0].reason_code is RuntimeReasonCode.EXECUTION_CONFLICT
+
+
+def test_intent_invariant_halts_before_exposing_or_corrupting_state():
+    runtime = _live_runtime()
+    commands = runtime.submit_intent(ExecutionEngine(), intent("duplicate"), NOW)
+    before = runtime.state.executions[0]
+    with pytest.raises(ExecutionInvariantError, match="different payload"):
+        runtime.submit_intent(
+            ExecutionEngine(),
+            replace(intent("duplicate"), quantity=D("9000")),
+            NOW,
+        )
+    assert commands[0].execution_intent_id == "execution-duplicate"
+    assert runtime.state.lifecycle is RuntimeLifecycle.HALTED
+    assert runtime.state.halt_latched
+    assert runtime.state.reason.code is RuntimeReasonCode.EXECUTION_CONFLICT
+    assert runtime.state.executions == (before,)
+
+
+def test_event_invariants_halt_without_corrupting_authoritative_execution():
+    runtime = _live_runtime()
+    submit = runtime.submit_intent(ExecutionEngine(), intent("event-conflict"), NOW)[0]
+    runtime.process_event(
+        ExecutionEngine(),
+        EntryAccepted(
+            "accepted",
+            "execution-event-conflict",
+            submit.command_id,
+            "order-event-conflict",
+            NOW,
+        ),
+        NOW,
+    )
+    fill = EntryFill(
+        "fill",
+        "execution-event-conflict",
+        "order-event-conflict",
+        D("4000"),
+        D("1.1"),
+        NOW,
+    )
+    runtime.process_event(ExecutionEngine(), fill, NOW)
+    before = runtime.state.executions[0]
+    with pytest.raises(ExecutionInvariantError, match="different payload"):
+        runtime.process_event(ExecutionEngine(), replace(fill, price=D("1.2")), NOW)
+    assert runtime.state.lifecycle is RuntimeLifecycle.HALTED
+    assert runtime.state.halt_latched
+    assert runtime.state.reason.code is RuntimeReasonCode.EXECUTION_CONFLICT
+    assert runtime.state.executions == (before,)
+
+
+def test_out_of_order_event_halts_and_preserves_execution():
+    runtime = _live_runtime()
+    submit = runtime.submit_intent(ExecutionEngine(), intent("out-of-order"), NOW)[0]
+    accepted_event = EntryAccepted(
+        "accepted-1",
+        "execution-out-of-order",
+        submit.command_id,
+        "order-out-of-order",
+        NOW,
+    )
+    runtime.process_event(ExecutionEngine(), accepted_event, NOW)
+    before = runtime.state.executions[0]
+    with pytest.raises(ExecutionInvariantError, match="out of order"):
+        runtime.process_event(
+            ExecutionEngine(), replace(accepted_event, event_id="accepted-2"), NOW
+        )
+    assert runtime.state.lifecycle is RuntimeLifecycle.HALTED
+    assert runtime.state.executions == (before,)
+
+
+def test_unsafe_recovery_requires_protection_to_be_only_economic_change():
+    _, state = accepted("unsafe-strict")
+    underprotected = record(
+        state,
+        entry_status=BrokerEntryStatus.FILLED,
+        cumulative_filled_quantity=D("10000"),
+        average_fill_price=D("1.1"),
+        exposure_exists=True,
+        protection_active=True,
+        protected_quantity=D("4000"),
+        protection_ref="protection",
+    )
+    unsafe = reconcile(
+        (state,), BrokerRuntimeSnapshot(NOW, (underprotected,))
+    ).recovered_executions[0]
+    assert unsafe.lifecycle is ExecutionLifecycle.UNSAFE
+    full = replace(underprotected, protected_quantity=D("10000"))
+    healthy = reconcile((unsafe,), BrokerRuntimeSnapshot(NOW, (full,)))
+    assert healthy.healthy
+    recovered = healthy.recovered_executions[0]
+    assert recovered.lifecycle is ExecutionLifecycle.PROTECTED
+    assert recovered.live_entry_quantity == 0
+    assert reconcile(
+        (recovered,), BrokerRuntimeSnapshot(NOW, (full,))
+    ).recovered_executions == (recovered,)
+
+    conflicts = (
+        replace(full, entry_status=BrokerEntryStatus.OPEN),
+        replace(full, average_fill_price=D("1.1005")),
+        replace(full, exposure_exists=False),
+    )
+    assert all(
+        not reconcile((unsafe,), BrokerRuntimeSnapshot(NOW, (broker,))).healthy
+        for broker in conflicts
+    )
+    replay = reconcile((unsafe,), BrokerRuntimeSnapshot(NOW, (underprotected,)))
+    assert not replay.healthy
+    assert replay.recovered_executions == (unsafe,)
+
+
+def test_unsafe_cancelled_entry_cannot_be_resurrected_by_protection():
+    _, state = accepted("unsafe-cancel")
+    state, _ = ExecutionEngine().request_cancel(state, NOW)
+    cancelled = record(
+        state,
+        entry_status=BrokerEntryStatus.CANCELLED,
+        cumulative_filled_quantity=D("4000"),
+        average_fill_price=D("1.1"),
+        exposure_exists=True,
+    )
+    unsafe = reconcile(
+        (state,), BrokerRuntimeSnapshot(NOW, (cancelled,))
+    ).recovered_executions[0]
+    full_but_open = replace(
+        cancelled,
+        entry_status=BrokerEntryStatus.OPEN,
+        protection_active=True,
+        protected_quantity=D("4000"),
+        protection_ref="protection",
+    )
+    result = reconcile((unsafe,), BrokerRuntimeSnapshot(NOW, (full_but_open,)))
+    assert not result.healthy
+    assert result.recovered_executions[0].live_entry_quantity == 0

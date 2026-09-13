@@ -9,6 +9,7 @@ from mr_lab.execution import (
     BrokerEvent,
     ExecutionCommand,
     ExecutionEngine,
+    ExecutionInvariantError,
     ExecutionState,
 )
 from mr_lab.risk import SizedExecutionIntent
@@ -259,9 +260,12 @@ class RuntimeController:
             ),
             None,
         )
-        return self._commit_execution_transition(
-            existing, engine.handle_intent(intent, existing), now
-        )
+        try:
+            transition = engine.handle_intent(intent, existing)
+        except ExecutionInvariantError as exc:
+            self._halt_execution_invariant(exc, now)
+            raise
+        return self._commit_execution_transition(existing, transition, now)
 
     def process_event(
         self,
@@ -293,9 +297,12 @@ class RuntimeController:
                 ),
             )
             return ()
-        return self._commit_execution_transition(
-            current, engine.handle_event(current, event), now
-        )
+        try:
+            transition = engine.handle_event(current, event)
+        except ExecutionInvariantError as exc:
+            self._halt_execution_invariant(exc, now)
+            raise
+        return self._commit_execution_transition(current, transition, now)
 
     def request_cancel(
         self, engine: ExecutionEngine, execution_intent_id: str, now: datetime
@@ -310,8 +317,23 @@ class RuntimeController:
         )
         if current is None:
             raise RuntimeError("execution is not owned by runtime")
-        return self._commit_execution_transition(
-            current, engine.request_cancel(current, now), now
+        try:
+            transition = engine.request_cancel(current, now)
+        except ExecutionInvariantError as exc:
+            self._halt_execution_invariant(exc, now)
+            raise
+        return self._commit_execution_transition(current, transition, now)
+
+    def _halt_execution_invariant(
+        self, error: ExecutionInvariantError, now: datetime
+    ) -> None:
+        reason = RuntimeReason(RuntimeReasonCode.EXECUTION_CONFLICT, str(error))
+        self._transition(
+            RuntimeLifecycle.HALTED,
+            now,
+            reason,
+            halt_latched=True,
+            halt_reason=self.state.halt_reason or reason,
         )
 
     def status(self, now: datetime) -> RuntimeStatus:
