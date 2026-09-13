@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 
@@ -68,6 +67,8 @@ class RuntimeController:
                 self.state = replace(
                     self.state,
                     checkpoint_sequence=checkpoint.checkpoint_sequence,
+                    reason=checkpoint.runtime_reason,
+                    halt_latched=checkpoint.halt_latched,
                     executions=checkpoint.executions,
                     watermarks=checkpoint.watermarks,
                 )
@@ -85,10 +86,16 @@ class RuntimeController:
         watermarks: tuple[DataWatermark, ...],
         now: datetime,
     ) -> ReconciliationResult:
-        if self.state.lifecycle is RuntimeLifecycle.HALTED:
-            return self.reconciliation or ReconciliationResult(
-                (), self.state.executions
-            )
+        return self._reconcile(snapshot, watermarks, now, preserve_live=False)
+
+    def _reconcile(
+        self,
+        snapshot: BrokerRuntimeSnapshot,
+        watermarks: tuple[DataWatermark, ...],
+        now: datetime,
+        *,
+        preserve_live: bool,
+    ) -> ReconciliationResult:
         result = reconcile(self.state.executions, snapshot)
         self.reconciliation = result
         self.state = replace(
@@ -104,13 +111,24 @@ class RuntimeController:
                 RuntimeLifecycle.HALTED,
                 now,
                 RuntimeReason(first.reason_code, first.detail),
+                halt_latched=True,
             )
         else:
             reason = self._freshness_reason(now)
             if reason:
                 self._transition(RuntimeLifecycle.STALE, now, reason)
+            elif self.state.halt_latched:
+                lifecycle = (
+                    RuntimeLifecycle.HALTED
+                    if self.state.lifecycle is RuntimeLifecycle.HALTED
+                    else RuntimeLifecycle.BOOTSTRAP
+                )
+                self._transition(lifecycle, now, self.state.reason)
             else:
-                self._transition(RuntimeLifecycle.SYNCED, now, None, last_synced_at=now)
+                lifecycle = (
+                    RuntimeLifecycle.LIVE if preserve_live else RuntimeLifecycle.SYNCED
+                )
+                self._transition(lifecycle, now, None, last_synced_at=now)
         return result
 
     def enable_live(self, now: datetime) -> None:
@@ -120,6 +138,7 @@ class RuntimeController:
             or not self.reconciliation.healthy
             or self._freshness_reason(now)
             or not self.persistence_healthy
+            or self.state.halt_latched
         ):
             raise RuntimeError("runtime is not eligible for LIVE")
         self._transition(RuntimeLifecycle.LIVE, now, None, last_live_at=now)
@@ -130,19 +149,24 @@ class RuntimeController:
         watermarks: tuple[DataWatermark, ...],
         now: datetime,
     ) -> None:
-        if self.state.lifecycle is RuntimeLifecycle.HALTED:
-            return
-        prior = self.state.lifecycle
-        self.reconcile_startup(snapshot, watermarks, now)
         if (
-            prior is RuntimeLifecycle.LIVE
-            and self.state.lifecycle is RuntimeLifecycle.SYNCED
+            self.state.lifecycle is RuntimeLifecycle.HALTED
+            and not self.state.halt_latched
         ):
-            self._transition(RuntimeLifecycle.LIVE, now, None)
+            return
+        self._reconcile(
+            snapshot,
+            watermarks,
+            now,
+            preserve_live=self.state.lifecycle is RuntimeLifecycle.LIVE,
+        )
 
     def check_freshness(self, now: datetime) -> None:
         reason = self._freshness_reason(now)
-        if reason and self.state.lifecycle is RuntimeLifecycle.LIVE:
+        if reason and self.state.lifecycle in {
+            RuntimeLifecycle.LIVE,
+            RuntimeLifecycle.SYNCED,
+        }:
             self._transition(RuntimeLifecycle.STALE, now, reason)
 
     def pause_new_entries(self, now: datetime) -> None:
@@ -158,14 +182,47 @@ class RuntimeController:
             RuntimeLifecycle.HALTED,
             now,
             RuntimeReason(RuntimeReasonCode.MANUAL_HALT, reason),
+            halt_latched=True,
         )
 
-    def apply_transition(
+    def clear_halt(self, now: datetime) -> None:
+        if (
+            not self.state.halt_latched
+            or not self.reconciliation
+            or not self.reconciliation.healthy
+            or self._freshness_reason(now)
+            or not self.persistence_healthy
+        ):
+            raise RuntimeError("halt cannot be cleared before healthy reconciliation")
+        self._transition(
+            RuntimeLifecycle.SYNCED,
+            now,
+            None,
+            halt_latched=False,
+            last_synced_at=now,
+        )
+
+    def _commit_execution_transition(
         self,
-        transition: Callable[[], tuple[ExecutionState, tuple[ExecutionCommand, ...]]],
+        current: ExecutionState | None,
+        transition: tuple[ExecutionState, tuple[ExecutionCommand, ...]],
         now: datetime,
     ) -> tuple[ExecutionCommand, ...]:
-        new_state, commands = transition()
+        new_state, commands = transition
+        if (
+            current is not None
+            and new_state.execution_intent_id != current.execution_intent_id
+        ):
+            self._transition(
+                RuntimeLifecycle.HALTED,
+                now,
+                RuntimeReason(
+                    RuntimeReasonCode.EXECUTION_CONFLICT,
+                    "execution transition changed identity",
+                ),
+                halt_latched=True,
+            )
+            return ()
         executions = {item.execution_intent_id: item for item in self.state.executions}
         executions[new_state.execution_intent_id] = new_state
         candidate = replace(
@@ -188,18 +245,55 @@ class RuntimeController:
             ),
             None,
         )
-        return self.apply_transition(
-            lambda: engine.handle_intent(intent, existing), now
+        return self._commit_execution_transition(
+            existing, engine.handle_intent(intent, existing), now
         )
 
     def process_event(
         self,
         engine: ExecutionEngine,
-        state: ExecutionState,
         event: BrokerEvent,
         now: datetime,
     ) -> tuple[ExecutionCommand, ...]:
-        return self.apply_transition(lambda: engine.handle_event(state, event), now)
+        current = next(
+            (
+                item
+                for item in self.state.executions
+                if item.execution_intent_id == event.execution_intent_id
+            ),
+            None,
+        )
+        if current is None:
+            self._transition(
+                RuntimeLifecycle.HALTED,
+                now,
+                RuntimeReason(
+                    RuntimeReasonCode.EXECUTION_CONFLICT,
+                    "broker event has no owned execution",
+                ),
+                halt_latched=True,
+            )
+            return ()
+        return self._commit_execution_transition(
+            current, engine.handle_event(current, event), now
+        )
+
+    def request_cancel(
+        self, engine: ExecutionEngine, execution_intent_id: str, now: datetime
+    ) -> tuple[ExecutionCommand, ...]:
+        current = next(
+            (
+                item
+                for item in self.state.executions
+                if item.execution_intent_id == execution_intent_id
+            ),
+            None,
+        )
+        if current is None:
+            raise RuntimeError("execution is not owned by runtime")
+        return self._commit_execution_transition(
+            current, engine.request_cancel(current, now), now
+        )
 
     def status(self, now: datetime) -> RuntimeStatus:
         active, unsafe, inflight = execution_counts(self.state.executions)
@@ -208,6 +302,7 @@ class RuntimeController:
             (
                 source,
                 source in marks
+                and marks[source] <= now
                 and now - marks[source] <= self.policy.maximum_source_age,
             )
             for source in self.policy.required_source_ids
@@ -232,6 +327,7 @@ class RuntimeController:
     def _freshness_reason(self, now: datetime) -> RuntimeReason | None:
         if (
             self.state.broker_snapshot_time is None
+            or self.state.broker_snapshot_time > now
             or now - self.state.broker_snapshot_time
             > self.policy.maximum_broker_snapshot_age
         ):
@@ -244,6 +340,7 @@ class RuntimeController:
             source
             for source in self.policy.required_source_ids
             if source not in marks
+            or marks[source] > now
             or now - marks[source] > self.policy.maximum_source_age
         ]
         return (
@@ -291,5 +388,8 @@ class RuntimeController:
     ) -> None:
         basis = candidate or self.state
         self.state = replace(
-            basis, lifecycle=RuntimeLifecycle.HALTED, reason=RuntimeReason(code, detail)
+            basis,
+            lifecycle=RuntimeLifecycle.HALTED,
+            reason=RuntimeReason(code, detail),
+            halt_latched=True,
         )

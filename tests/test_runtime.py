@@ -6,8 +6,11 @@ import pytest
 
 from mr_lab.execution import (
     EntryAccepted,
+    EntryFill,
     ExecutionEngine,
     ExecutionLifecycle,
+    ProtectionAcknowledged,
+    ProtectionStatus,
 )
 from mr_lab.portfolio import PlanReference, ProposalProvenance
 from mr_lab.portfolio.identity import stable_id
@@ -103,6 +106,8 @@ def record(state, **changes):
         exposure_exists=state.filled_quantity > 0,
     )
     values.update(changes)
+    if "cumulative_filled_quantity" in changes and "exposure_exists" not in changes:
+        values["exposure_exists"] = changes["cumulative_filled_quantity"] > 0
     return BrokerExecutionRecord(**values)
 
 
@@ -166,7 +171,7 @@ def test_corrupt_and_future_checkpoint_fail_closed():
         make_checkpoint(RuntimeState("key", RuntimeLifecycle.SYNCED, NOW, NOW), NOW)
     )
     with pytest.raises(UnsupportedCheckpointSchema):
-        loads_checkpoint(good.replace('"schema_version":1', '"schema_version":2'))
+        loads_checkpoint(good.replace('"schema_version":2', '"schema_version":3'))
 
 
 def test_orphan_missing_terminal_and_conflicts_fail_closed():
@@ -290,3 +295,265 @@ def test_state_with_command_identity_is_committed_before_dispatch():
     persisted = loads_checkpoint(store.read_text(runtime.checkpoint_key))
     assert persisted.executions[0].entry_command_id == commands[0].command_id
     assert persisted.executions[0].lifecycle is ExecutionLifecycle.SUBMITTING
+
+
+def test_cancel_pending_racing_fill_recovers_complete_truth_and_is_idempotent():
+    _, state = accepted()
+    state, _ = ExecutionEngine().request_cancel(state, NOW)
+    broker = record(
+        state,
+        entry_status=BrokerEntryStatus.CANCELLED,
+        cumulative_filled_quantity=D("4000"),
+        average_fill_price=D("1.1015"),
+        exposure_exists=True,
+    )
+    first = reconcile((state,), BrokerRuntimeSnapshot(NOW, (broker,)))
+    recovered = first.recovered_executions[0]
+    assert not first.healthy  # exposure still needs proven protection
+    assert recovered.filled_quantity == D("4000")
+    assert recovered.average_fill_price == D("1.1015")
+    assert recovered.entry_order_status.value == "CANCELLED"
+    assert recovered.live_entry_quantity == 0
+    assert recovered.lifecycle is ExecutionLifecycle.PROTECTION_PENDING
+    assert recovered.lifecycle is not ExecutionLifecycle.CANCELLED
+    replay = reconcile((recovered,), BrokerRuntimeSnapshot(NOW, (broker,)))
+    assert replay.recovered_executions == (recovered,)
+
+
+def test_protection_pending_broker_ahead_fill_requires_complete_protection():
+    item, state = accepted()
+    state, _ = ExecutionEngine().handle_event(
+        state,
+        EntryFill(
+            "fill-1", item.execution_intent_id, "order-mr", D("4000"), D("1.1"), NOW
+        ),
+    )
+    partial = record(
+        state,
+        entry_status=BrokerEntryStatus.FILLED,
+        cumulative_filled_quantity=D("10000"),
+        average_fill_price=D("1.12"),
+        exposure_exists=True,
+        protection_active=True,
+        protected_quantity=D("4000"),
+        protection_ref="protection-1",
+    )
+    result = reconcile((state,), BrokerRuntimeSnapshot(NOW, (partial,)))
+    assert not result.healthy
+    recovered = result.recovered_executions[0]
+    assert recovered.filled_quantity == D("10000")
+    assert recovered.protected_quantity == D("4000")
+    assert recovered.pending_protection_quantity == D("10000")
+    assert reconcile(
+        (recovered,), BrokerRuntimeSnapshot(NOW, (partial,))
+    ).recovered_executions == (recovered,)
+
+    complete = replace(partial, protected_quantity=D("10000"))
+    healthy = reconcile((state,), BrokerRuntimeSnapshot(NOW, (complete,)))
+    assert healthy.healthy
+    recovered = healthy.recovered_executions[0]
+    assert recovered.filled_quantity == recovered.protected_quantity == D("10000")
+    assert recovered.protection_status is ProtectionStatus.ACTIVE
+    assert recovered.lifecycle is ExecutionLifecycle.PROTECTED
+    assert reconcile(
+        (recovered,), BrokerRuntimeSnapshot(NOW, (complete,))
+    ).recovered_executions == (recovered,)
+
+    missing_price = replace(complete, average_fill_price=None)
+    assert not reconcile((state,), BrokerRuntimeSnapshot(NOW, (missing_price,))).healthy
+
+
+def test_matched_requires_order_exposure_price_and_protection_equality():
+    item, state = accepted()
+    state, commands = ExecutionEngine().handle_event(
+        state,
+        EntryFill(
+            "fill", item.execution_intent_id, "order-mr", D("10000"), D("1.1"), NOW
+        ),
+    )
+    state, _ = ExecutionEngine().handle_event(
+        state,
+        ProtectionAcknowledged(
+            "protected",
+            item.execution_intent_id,
+            commands[0].command_id,
+            "order-mr",
+            "protection",
+            NOW,
+        ),
+    )
+    matching = record(
+        state,
+        entry_status=BrokerEntryStatus.FILLED,
+        exposure_exists=True,
+        protection_active=True,
+        protected_quantity=D("10000"),
+        protection_ref="protection",
+    )
+    assert reconcile((state,), BrokerRuntimeSnapshot(NOW, (matching,))).healthy
+    mismatches = (
+        replace(matching, entry_status=BrokerEntryStatus.CANCELLED),
+        replace(matching, exposure_exists=False),
+        replace(matching, average_fill_price=D("1.1001")),
+        replace(matching, protected_quantity=D("4000")),
+        replace(matching, protection_ref="different"),
+    )
+    assert all(
+        not reconcile((state,), BrokerRuntimeSnapshot(NOW, (value,))).healthy
+        for value in mismatches
+    )
+
+    _, open_state = accepted("open")
+    cancelled = record(open_state, entry_status=BrokerEntryStatus.CANCELLED)
+    assert not reconcile(
+        (open_state,), BrokerRuntimeSnapshot(NOW, (cancelled,))
+    ).healthy
+    internally_cancelled = replace(
+        open_state, entry_order_status=open_state.entry_order_status.CANCELLED
+    )
+    assert not reconcile(
+        (internally_cancelled,), BrokerRuntimeSnapshot(NOW, (record(open_state),))
+    ).healthy
+
+
+def test_terminal_records_are_state_specific():
+    _, state, _ = submitting("rejected")
+    rejected = replace(
+        state,
+        lifecycle=ExecutionLifecycle.REJECTED,
+        entry_order_status=state.entry_order_status.REJECTED,
+    )
+    broker = record(rejected, entry_status=BrokerEntryStatus.REJECTED)
+    assert reconcile((rejected,), BrokerRuntimeSnapshot(NOW, (broker,))).healthy
+    filled_terminal = replace(
+        broker,
+        cumulative_filled_quantity=D("1"),
+        average_fill_price=D("1.1"),
+        exposure_exists=False,
+    )
+    assert not reconcile(
+        (rejected,), BrokerRuntimeSnapshot(NOW, (filled_terminal,))
+    ).healthy
+
+
+def test_controller_uses_authoritative_state_and_unknown_event_halts():
+    store = InMemoryDurableStore()
+    runtime = controller(store)
+    runtime.restore()
+    runtime.reconcile_startup(BrokerRuntimeSnapshot(NOW), (), NOW)
+    runtime.enable_live(NOW)
+    command = runtime.submit_intent(ExecutionEngine(), intent(), NOW)[0]
+    runtime.process_event(
+        ExecutionEngine(),
+        EntryAccepted("accept", "execution-mr", command.command_id, "order-mr", NOW),
+        NOW,
+    )
+    stale = runtime.state.executions[0]
+    runtime.process_event(
+        ExecutionEngine(),
+        EntryFill("fill-1", "execution-mr", "order-mr", D("4000"), D("1.1"), NOW),
+        NOW,
+    )
+    runtime.process_event(
+        ExecutionEngine(),
+        EntryFill("fill-2", "execution-mr", "order-mr", D("1000"), D("1.2"), NOW),
+        NOW,
+    )
+    current = runtime.state.executions[0]
+    assert stale.filled_quantity == 0
+    assert current.filled_quantity == D("5000")
+    assert tuple(event.event_id for event in current.processed_events) == (
+        "accept",
+        "fill-1",
+        "fill-2",
+    )
+
+    runtime.process_event(
+        ExecutionEngine(),
+        EntryAccepted("unknown", "not-owned", "command", "order", NOW),
+        NOW,
+    )
+    assert runtime.state.lifecycle is RuntimeLifecycle.HALTED
+    assert runtime.state.reason.code is RuntimeReasonCode.EXECUTION_CONFLICT
+
+
+def test_manual_halt_is_a_persisted_operator_latch():
+    store = InMemoryDurableStore()
+    runtime = controller(store)
+    runtime.restore()
+    runtime.reconcile_startup(BrokerRuntimeSnapshot(NOW), (), NOW)
+    runtime.halt("operator investigation", NOW)
+
+    restarted = controller(store)
+    restarted.restore()
+    assert restarted.state.lifecycle is RuntimeLifecycle.BOOTSTRAP
+    assert restarted.state.halt_latched
+    assert restarted.state.reason.detail == "operator investigation"
+    restarted.reconcile_startup(BrokerRuntimeSnapshot(NOW), (), NOW)
+    assert restarted.state.lifecycle is RuntimeLifecycle.BOOTSTRAP
+    with pytest.raises(RuntimeError, match="not eligible"):
+        restarted.enable_live(NOW)
+    restarted.clear_halt(NOW)
+    assert restarted.state.lifecycle is RuntimeLifecycle.SYNCED
+    assert not restarted.can_open_new_entries
+    restarted.enable_live(NOW)
+    assert restarted.can_open_new_entries
+
+
+def test_future_freshness_is_stale_and_synced_freshness_loss_is_reported():
+    runtime = controller(required=("feed",))
+    future = NOW + timedelta(seconds=1)
+    runtime.restore()
+    runtime.reconcile_startup(
+        BrokerRuntimeSnapshot(future), (DataWatermark("feed", future),), NOW
+    )
+    assert runtime.state.lifecycle is RuntimeLifecycle.STALE
+    runtime.refresh(BrokerRuntimeSnapshot(NOW), (DataWatermark("feed", NOW),), NOW)
+    assert runtime.state.lifecycle is RuntimeLifecycle.SYNCED
+    runtime.check_freshness(NOW + timedelta(minutes=2))
+    assert runtime.state.lifecycle is RuntimeLifecycle.STALE
+
+
+def test_protection_and_cancel_commands_are_persisted_before_dispatch():
+    store = InMemoryDurableStore()
+    runtime = controller(store)
+    runtime.restore()
+    runtime.reconcile_startup(BrokerRuntimeSnapshot(NOW), (), NOW)
+    runtime.enable_live(NOW)
+    submit = runtime.submit_intent(ExecutionEngine(), intent(), NOW)[0]
+    runtime.process_event(
+        ExecutionEngine(),
+        EntryAccepted("accepted", "execution-mr", submit.command_id, "order-mr", NOW),
+        NOW,
+    )
+    protection = runtime.process_event(
+        ExecutionEngine(),
+        EntryFill("fill", "execution-mr", "order-mr", D("4000"), D("1.1"), NOW),
+        NOW,
+    )[0]
+    persisted = loads_checkpoint(store.read_text(runtime.checkpoint_key)).executions[0]
+    assert persisted.protection_command_id == protection.command_id
+    assert persisted.pending_protection_quantity == D("4000")
+
+    other = intent("cancel")
+    submit = runtime.submit_intent(ExecutionEngine(), other, NOW)[0]
+    runtime.process_event(
+        ExecutionEngine(),
+        EntryAccepted(
+            "accepted-cancel",
+            "execution-cancel",
+            submit.command_id,
+            "order-cancel",
+            NOW,
+        ),
+        NOW,
+    )
+    cancel = runtime.request_cancel(ExecutionEngine(), "execution-cancel", NOW)[0]
+    persisted = loads_checkpoint(store.read_text(runtime.checkpoint_key))
+    cancelled = next(
+        item
+        for item in persisted.executions
+        if item.execution_intent_id == "execution-cancel"
+    )
+    assert cancelled.cancel_command_id == cancel.command_id
+    assert cancelled.lifecycle is ExecutionLifecycle.CANCEL_PENDING

@@ -14,9 +14,9 @@ from typing import Any
 from mr_lab.execution import ExecutionState
 from mr_lab.portfolio.contracts import require_text, require_utc
 
-from .contracts import DataWatermark, RuntimeLifecycle, RuntimeState
+from .contracts import DataWatermark, RuntimeLifecycle, RuntimeReason, RuntimeState
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class CheckpointError(ValueError):
@@ -100,6 +100,8 @@ class RuntimeCheckpoint:
     checkpoint_sequence: int
     saved_at: datetime
     previous_lifecycle: RuntimeLifecycle
+    runtime_reason: RuntimeReason | None
+    halt_latched: bool
     executions: tuple[ExecutionState, ...]
     watermarks: tuple[DataWatermark, ...]
     checkpoint_identity: str
@@ -145,6 +147,8 @@ def make_checkpoint(state: RuntimeState, saved_at: datetime) -> RuntimeCheckpoin
         state.checkpoint_sequence + 1,
         saved_at,
         state.lifecycle,
+        state.reason,
+        state.halt_latched,
         state.executions,
         state.watermarks,
         "pending",

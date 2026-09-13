@@ -9,6 +9,7 @@ from enum import StrEnum
 
 from mr_lab.execution import EntryOrderStatus, ExecutionLifecycle, ExecutionState
 from mr_lab.portfolio.contracts import require_text, require_utc
+from mr_lab.risk.contracts import require_direction, require_finite
 
 
 class RuntimeLifecycle(StrEnum):
@@ -74,6 +75,7 @@ class RuntimeState:
     last_synced_at: datetime | None = None
     last_live_at: datetime | None = None
     reason: RuntimeReason | None = None
+    halt_latched: bool = False
     checkpoint_sequence: int = 0
     broker_snapshot_time: datetime | None = None
     watermarks: tuple[DataWatermark, ...] = ()
@@ -132,8 +134,35 @@ class BrokerExecutionRecord:
     def __post_init__(self) -> None:
         require_text("execution_intent_id", self.execution_intent_id)
         require_utc("observed_at", self.observed_at)
+        for name in (
+            "client_idempotency_key",
+            "instrument",
+            "broker_order_ref",
+            "protection_ref",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                require_text(name, value)
+        if self.direction is not None:
+            require_direction(self.direction)
+        require_finite("cumulative_filled_quantity", self.cumulative_filled_quantity)
+        require_finite("protected_quantity", self.protected_quantity)
         if self.cumulative_filled_quantity < 0 or self.protected_quantity < 0:
             raise ValueError("broker quantities cannot be negative")
+        if self.average_fill_price is not None:
+            require_finite("average_fill_price", self.average_fill_price, positive=True)
+        if self.average_fill_price is not None and self.cumulative_filled_quantity == 0:
+            raise ValueError("average fill price requires a cumulative fill")
+        if not self.protection_active and (
+            self.protected_quantity != 0 or self.protection_ref is not None
+        ):
+            raise ValueError("inactive protection cannot claim quantity or identity")
+        if self.protection_active and (
+            self.protected_quantity <= 0 or self.protection_ref is None
+        ):
+            raise ValueError("active protection requires quantity and identity")
+        if self.exposure_exists and self.cumulative_filled_quantity == 0:
+            raise ValueError("live exposure requires a positive cumulative fill")
 
     @property
     def is_live(self) -> bool:
@@ -153,6 +182,8 @@ class BrokerRuntimeSnapshot:
         )
         if len({item.execution_intent_id for item in records}) != len(records):
             raise ValueError("broker execution IDs must be unique")
+        if any(item.observed_at > self.observed_at for item in records):
+            raise ValueError("broker record cannot be newer than its snapshot")
         object.__setattr__(self, "executions", records)
 
 
