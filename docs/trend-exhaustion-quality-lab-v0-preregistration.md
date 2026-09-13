@@ -104,3 +104,61 @@ uv run mr-lab-trend-exhaustion-quality --corpus-root /mnt/e/mr-lab/frozen-2024 -
 ```
 
 Do not download substitutes or execute against any other year.
+
+## Canonical development result
+
+Empirical execution against the authenticated local 2024 development corpus is
+**COMPLETE**. Primary-event regeneration exactly matched frozen Trend Exhaustion
+v1: 4,808 events in total, comprising AUDJPY 958, AUDUSD 951, EURUSD 937,
+GBPUSD 961, and USDJPY 1,001. The pooled expanding walk-forward OOS sample was
+N=3,237.
+
+The frozen development classification is **`PARK`**. Frozen Trend Exhaustion v1
+remains permanently **`KILL`**. TE-Q1 does not rescue or reclassify v1, and its
+model selection does not mean promotion. The preregistered requirement that at
+least two primary model families independently pass was not met. This result
+must not be reinterpreted as a near-pass.
+
+### Primary model outcomes
+
+| Primary family | Spearman | Top-20 raw H60 mean (pips) | Top-20 raw median (pips) | Top-20 PF | Top-20 normalized lift (ATR) | Ordered adjacent quintile pairs | Frozen outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Huber | 0.0017910110418523223 | +0.6983024691358163 | -0.1999999999991564 | 1.139945568132619 | 0.6637643380931977 | 3/4 | Does not independently pass |
+| Quantile family | -0.0024873046534666806 | -0.5302469135802249 | -0.5499999999997174 | 0.8583560062659794 | -0.005181084960279164 | 2/4 | Does not independently pass |
+| Additive splines | 0.013361783572481913 | +0.037037037037041864 | 0.0 | 1.0083168728558074 | 0.3925187665450436 | 2/4 | Does not independently pass |
+
+Huber's top-20 month-block-bootstrap 95% interval for raw H60 mean was
+approximately [-1.2803, +3.2562] pips. Huber fails promotion especially on its
+negative top-20 median, PF below 1.20, and Spearman below 0.05. The quantile
+family's top-20 selection was temporally concentrated in Q2 and failed the
+frozen concentration gates. Additive splines also did not independently pass.
+
+Huber is the selected model under the preregistered model-selection rule. That
+selection is only the required relative choice among the reported families; it
+does not override any promotion gate and does not change `classification = PARK`.
+
+## POST-HOC BACKLOG — not part of the frozen TE-Q1 conclusion
+
+### TE-Q2-SIMPLE
+
+The following are **POST-HOC development observations** and provenance for a
+possible future hypothesis only. They do not rescue TE-Q1, do not reclassify
+Trend Exhaustion v1, and must not be converted into a trading rule in this PR.
+Full-2024 descriptive EDA suggests that high `normalized_displacement` and high
+`efficiency_ratio` may contain nonlinear conditional information:
+
+- `normalized_displacement` highest quintile: N=961, H60 mean +1.42955 pips,
+  median +0.10 pips, PF 1.30756.
+- `normalized_displacement` highest decile: N=480, H60 mean +2.00458 pips,
+  median +0.50 pips, PF 1.48199.
+- `efficiency_ratio` highest quintile: N=961, H60 mean +0.78533 pips, median
+  +0.20 pips, PF 1.20252.
+- `efficiency_ratio` highest decile: N=480, H60 mean +1.30729 pips, median
+  +0.35 pips, PF 1.35704.
+
+### Future methodological note
+
+For future quality-ranking studies that pool predictions from expanding
+walk-forward folds, investigate preregistered fold-local percentile/rank
+calibration before pooling because raw model score levels may not be comparable
+across folds. This is a future design note only and does not alter TE-Q1.
