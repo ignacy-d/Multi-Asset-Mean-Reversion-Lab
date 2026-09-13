@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "A configuration-first foundation for multi-asset mean-reversion research"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "scikit-learn>=1.6,<2",
+    "scipy>=1.15,<2",
+]
 
 [project.scripts]
 mr-lab-bollinger-benchmark = "mr_lab.bollinger_benchmark:main"
@@ -23,6 +26,7 @@ mr-lab-stage4c-reduce = "mr_lab.stage4c_reducer:main"
 mr-lab-stage4-discovery-atlas = "mr_lab.stage4_discovery_atlas:main"
 mr-lab-failed-breakout-stage0 = "mr_lab.failed_breakout_stage0_runner:main"
 mr-lab-trend-exhaustion-stage0 = "mr_lab.trend_exhaustion_stage0_runner:main"
+mr-lab-trend-exhaustion-quality = "mr_lab.trend_exhaustion_quality:main"
 mr-lab-bollinger-incremental = "mr_lab.bollinger_incremental:main"
 mr-lab-ou-diagnostics = "mr_lab.ornstein_uhlenbeck_runner:main"
 mr-lab-ou-monte-carlo = "mr_lab.ou_monte_carlo_runner:main"
