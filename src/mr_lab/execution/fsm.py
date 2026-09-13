@@ -41,9 +41,9 @@ def _fingerprint(value: object) -> str:
 class ExecutionEngine:
     """Stateless FSM: callers persist state and dispatch returned commands.
 
-    ``SUBMITTING`` and ``PROTECTION_PENDING`` deliberately do not auto-resend on
-    intent replay.  A future runtime reconciliation boundary must establish
-    whether the adapter received their persisted deterministic command IDs
+    ``SUBMITTING``, ``PROTECTION_PENDING``, and ``CANCEL_PENDING`` deliberately
+    do not auto-resend.  A future runtime reconciliation boundary must establish
+    whether the adapter received or applied each persisted deterministic command
     before deciding whether a resend is safe.
     """
 
@@ -339,7 +339,15 @@ class ExecutionEngine:
             raise ExecutionInvariantError(
                 "partially filled cancellation needs an explicit exposure lifecycle"
             )
-        return replace(state, lifecycle=ExecutionLifecycle.CANCELLED)
+        return replace(
+            state,
+            lifecycle=ExecutionLifecycle.CANCELLED,
+            protection_status=ProtectionStatus.NOT_REQUESTED,
+            protection_ref=None,
+            protected_quantity=Decimal(0),
+            protection_command_id=None,
+            pending_protection_quantity=None,
+        )
 
     def _protection_acknowledged(
         self, state: ExecutionState, event: ProtectionAcknowledged

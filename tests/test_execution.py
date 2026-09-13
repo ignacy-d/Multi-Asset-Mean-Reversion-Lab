@@ -361,6 +361,50 @@ def test_unfilled_cancel_and_terminal_restart_do_not_resubmit():
     )
 
 
+def test_reconstructed_cancel_pending_waits_for_reconciliation_without_resend():
+    item, state, _ = acknowledged()
+    state, commands = ExecutionEngine().request_cancel(state, NOW)
+    command = commands[0]
+    reconstructed = replace(state)
+
+    replayed, replay_commands = ExecutionEngine().request_cancel(reconstructed, NOW)
+    assert replayed == reconstructed
+    assert replay_commands == ()
+    assert replayed.lifecycle is ExecutionLifecycle.CANCEL_PENDING
+    assert replayed.cancel_command_id == command.command_id
+    assert replayed.entry_command_id is not None
+    assert replayed.broker_order_ref == "order-1"
+
+
+def test_cancelling_unfilled_atomic_entry_clears_protection_reservation():
+    item, state, _ = acknowledged(atomic=True)
+    assert state.protection_status is ProtectionStatus.ACTIVE
+    assert state.protected_quantity == item.quantity
+    assert state.protection_ref == "protection-atomic"
+
+    state, commands = ExecutionEngine().request_cancel(state, NOW)
+    cancel_command_id = commands[0].command_id
+    state, _ = apply(
+        state,
+        CancelAcknowledged(
+            "atomic-cancelled",
+            item.execution_intent_id,
+            cancel_command_id,
+            "order-1",
+            NOW,
+        ),
+    )
+    assert state.lifecycle is ExecutionLifecycle.CANCELLED
+    assert state.filled_quantity == 0
+    assert state.average_fill_price is None
+    assert state.protection_status is ProtectionStatus.NOT_REQUESTED
+    assert state.protected_quantity == 0
+    assert state.protection_ref is None
+    assert state.protection_command_id is None
+    assert state.pending_protection_quantity is None
+    assert state.cancel_command_id == cancel_command_id
+
+
 def test_fully_filled_entry_cannot_be_cancelled_or_have_exposure_erased():
     item, state, _ = acknowledged(atomic=True)
     state, _ = apply(
@@ -426,6 +470,113 @@ def test_reconstructed_progress_does_not_submit_duplicate_entry():
     )
     for persisted in (replace(filled_state),):
         assert ExecutionEngine().handle_intent(item, persisted) == (persisted, ())
+
+
+def test_terminal_and_progressed_restart_states_never_resubmit_entry():
+    engine = ExecutionEngine()
+
+    rejected_item, rejected, command = submitted(intent(suffix="restart-rejected"))
+    rejected, _ = apply(
+        rejected,
+        EntryRejected(
+            "restart-rejected",
+            rejected_item.execution_intent_id,
+            command.command_id,
+            "rejected",
+            NOW,
+        ),
+    )
+
+    cancelled_item, cancelled, _ = acknowledged(intent(suffix="restart-cancelled"))
+    cancelled, commands = engine.request_cancel(cancelled, NOW)
+    cancelled, _ = apply(
+        cancelled,
+        CancelAcknowledged(
+            "restart-cancelled",
+            cancelled_item.execution_intent_id,
+            commands[0].command_id,
+            "order-1",
+            NOW,
+        ),
+    )
+
+    closed_item, closed, _ = acknowledged(intent(suffix="restart-closed"), atomic=True)
+    closed, _ = apply(
+        closed,
+        EntryFill(
+            "restart-closed-fill",
+            closed_item.execution_intent_id,
+            "order-1",
+            closed_item.quantity,
+            D("1.1"),
+            NOW,
+        ),
+    )
+    closed, _ = apply(
+        closed,
+        ExecutionClosed(
+            "restart-closed",
+            closed_item.execution_intent_id,
+            "order-1",
+            NOW,
+            "closed",
+        ),
+    )
+
+    acknowledged_item, acknowledged_state, _ = acknowledged(
+        intent(suffix="restart-acknowledged")
+    )
+
+    pending_item, pending, _ = acknowledged(intent(suffix="restart-pending"))
+    pending, commands = apply(
+        pending,
+        EntryFill(
+            "restart-pending-fill",
+            pending_item.execution_intent_id,
+            "order-1",
+            pending_item.quantity,
+            D("1.1"),
+            NOW,
+        ),
+    )
+    assert len(commands) == 1
+
+    unsafe_item, unsafe, _ = acknowledged(intent(suffix="restart-unsafe"))
+    unsafe, commands = apply(
+        unsafe,
+        EntryFill(
+            "restart-unsafe-fill",
+            unsafe_item.execution_intent_id,
+            "order-1",
+            unsafe_item.quantity,
+            D("1.1"),
+            NOW,
+        ),
+    )
+    unsafe, _ = apply(
+        unsafe,
+        ProtectionRejected(
+            "restart-unsafe",
+            unsafe_item.execution_intent_id,
+            commands[0].command_id,
+            "order-1",
+            "failed",
+            NOW,
+        ),
+    )
+
+    states = (
+        (rejected_item, rejected, ExecutionLifecycle.REJECTED),
+        (cancelled_item, cancelled, ExecutionLifecycle.CANCELLED),
+        (closed_item, closed, ExecutionLifecycle.CLOSED),
+        (acknowledged_item, acknowledged_state, ExecutionLifecycle.ACKNOWLEDGED),
+        (pending_item, pending, ExecutionLifecycle.PROTECTION_PENDING),
+        (unsafe_item, unsafe, ExecutionLifecycle.UNSAFE),
+    )
+    for item, state, lifecycle in states:
+        reconstructed = replace(state)
+        assert reconstructed.lifecycle is lifecycle
+        assert engine.handle_intent(item, reconstructed) == (reconstructed, ())
 
 
 def test_protection_commands_are_serialized_across_fill_ack_race():
