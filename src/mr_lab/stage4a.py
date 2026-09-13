@@ -120,6 +120,46 @@ class HorizonDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class ForwardOutcome:
+    """Direction-signed exact-clock outcome independent of an equilibrium."""
+
+    horizon_minutes: int
+    signed_price_movement: float
+    signed_arithmetic_return: float
+    signed_return_bps: float
+    signed_return_pips: float
+
+
+@dataclass(frozen=True, slots=True)
+class DirectionalPathDiagnostic:
+    """Common exact-clock discovery outcomes without equilibrium assumptions."""
+
+    instrument: str
+    signal_timestamp: datetime
+    direction: Direction
+    p0: float
+    future_path_complete: bool
+    missing_future_minutes: tuple[int, ...]
+    horizons: tuple[ForwardOutcome, ...]
+    mae_price: float | None
+    mae_pips: float | None
+    mae_bps: float | None
+    mfe_price: float | None
+    mfe_pips: float | None
+    mfe_bps: float | None
+    time_to_mae_minutes: int | None
+    time_to_mfe_minutes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class DirectionalPathRequest:
+    instrument: str
+    signal_timestamp: datetime
+    direction: Direction
+    p0: float
+
+
+@dataclass(frozen=True, slots=True)
 class FirstPassageDiagnostic:
     level: float
     hit: bool
@@ -297,6 +337,136 @@ def _prepare_m1_index(bars: Iterable[Bar], instrument: str) -> dict[datetime, Ba
     return {bar.available_at: bar for bar in items}
 
 
+def diagnose_directional_path(
+    *,
+    instrument: str,
+    signal_timestamp: datetime,
+    direction: Direction,
+    p0: float,
+    m1_bars: Iterable[Bar],
+    horizons: tuple[int, ...] = (15, 30, 60, 120),
+    path_minutes: int = 120,
+) -> DirectionalPathDiagnostic:
+    """Apply Stage 4A's exact-clock M1 close/extreme semantics generically."""
+    request = DirectionalPathRequest(instrument, signal_timestamp, direction, p0)
+    return diagnose_directional_paths((request,), m1_bars, horizons, path_minutes)[0]
+
+
+def diagnose_directional_paths(
+    requests: Iterable[DirectionalPathRequest],
+    m1_bars: Iterable[Bar],
+    horizons: tuple[int, ...] = (15, 30, 60, 120),
+    path_minutes: int = 120,
+) -> tuple[DirectionalPathDiagnostic, ...]:
+    """Diagnose a same-instrument batch while constructing the M1 index once."""
+    requests = tuple(requests)
+    if not requests:
+        return ()
+    instrument = requests[0].instrument
+    if any(request.instrument != instrument for request in requests):
+        raise EventPathError("directional path requests must share an instrument")
+    get_instrument_spec(instrument)
+    by_time = _prepare_m1_index(m1_bars, instrument)
+    return tuple(
+        _diagnose_directional_request(request, by_time, horizons, path_minutes)
+        for request in requests
+    )
+
+
+def _diagnose_directional_request(request, by_time, horizons, path_minutes):
+    instrument = request.instrument
+    signal_timestamp = request.signal_timestamp
+    direction = request.direction
+    p0 = request.p0
+    if signal_timestamp.tzinfo is None or signal_timestamp.utcoffset() != timedelta(0):
+        raise EventPathError("signal_timestamp must be timezone-aware UTC")
+    if (
+        not isinstance(direction, Direction)
+        or isinstance(p0, bool)
+        or not isinstance(p0, int | float)
+        or not math.isfinite(p0)
+        or p0 <= 0
+    ):
+        raise EventPathError("direction and p0 must be valid")
+    if (
+        type(path_minutes) is not int
+        or path_minutes < 1
+        or not horizons
+        or any(
+            type(value) is not int or not 1 <= value <= path_minutes
+            for value in horizons
+        )
+        or len(set(horizons)) != len(horizons)
+    ):
+        raise EventPathError("horizons must be unique positive minutes within the path")
+    future = tuple(
+        (minute, by_time.get(signal_timestamp + timedelta(minutes=minute)))
+        for minute in range(1, path_minutes + 1)
+    )
+    missing = tuple(minute for minute, bar in future if bar is None)
+    pip_size = 10 ** -(get_instrument_spec(instrument).price_precision - 1)
+    snapshots = []
+    for minute in horizons:
+        bar = by_time.get(signal_timestamp + timedelta(minutes=minute))
+        if bar is None:
+            continue
+        movement = int(direction) * (bar.close - p0)
+        arithmetic = int(direction) * (bar.close / p0 - 1.0)
+        snapshots.append(
+            ForwardOutcome(
+                minute, movement, arithmetic, arithmetic * 10_000, movement / pip_size
+            )
+        )
+    mae = mfe = None
+    mae_time = mfe_time = None
+    if not missing:
+        favorable = tuple(
+            (
+                minute,
+                max(
+                    0.0,
+                    int(direction) * (bar.high - p0),
+                    int(direction) * (bar.low - p0),
+                ),
+            )
+            for minute, bar in future
+            if bar is not None
+        )
+        adverse = tuple(
+            (
+                minute,
+                max(
+                    0.0,
+                    -int(direction) * (bar.high - p0),
+                    -int(direction) * (bar.low - p0),
+                ),
+            )
+            for minute, bar in future
+            if bar is not None
+        )
+        mfe = max(value for _, value in favorable)
+        mae = max(value for _, value in adverse)
+        mfe_time = next(minute for minute, value in favorable if value == mfe)
+        mae_time = next(minute for minute, value in adverse if value == mae)
+    return DirectionalPathDiagnostic(
+        instrument,
+        signal_timestamp,
+        direction,
+        p0,
+        not missing,
+        missing,
+        tuple(snapshots),
+        mae,
+        None if mae is None else mae / pip_size,
+        None if mae is None else mae / p0 * 10_000,
+        mfe,
+        None if mfe is None else mfe / pip_size,
+        None if mfe is None else mfe / p0 * 10_000,
+        mae_time,
+        mfe_time,
+    )
+
+
 def _diagnose_event_from_index(
     signal: FrozenSignal, by_time: dict[datetime, Bar]
 ) -> Stage4AEvent:
@@ -397,11 +567,11 @@ def _diagnose_event_from_index(
         max_reversion,
         mae,
         scale(mae, pip_size),
-        scale(mae, signal.p0) * 10_000 if mae is not None else None,
+        mae / signal.p0 * 10_000 if mae is not None else None,
         scale(mae, abs(signal.d0)),
         mfe,
         scale(mfe, pip_size),
-        scale(mfe, signal.p0) * 10_000 if mfe is not None else None,
+        mfe / signal.p0 * 10_000 if mfe is not None else None,
         scale(mfe, abs(signal.d0)),
         mae_time,
         mfe_time,
@@ -451,10 +621,15 @@ __all__ = [
     "FIXED_HORIZONS_MINUTES",
     "STAGE4A_METHODOLOGY_ID",
     "STAGE4A_SCHEMA_VERSION",
+    "DirectionalPathDiagnostic",
+    "DirectionalPathRequest",
+    "ForwardOutcome",
     "FrozenSignal",
     "HorizonDiagnostic",
     "PresignalDiagnostic",
     "Stage4AEvent",
+    "diagnose_directional_path",
+    "diagnose_directional_paths",
     "diagnose_event",
     "diagnose_events",
     "events_to_jsonl",
