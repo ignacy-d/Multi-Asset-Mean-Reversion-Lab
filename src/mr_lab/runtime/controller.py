@@ -53,9 +53,9 @@ class RuntimeController:
         self.reconciliation: ReconciliationResult | None = None
         self.persistence_healthy = True
 
-    @property
-    def can_open_new_entries(self) -> bool:
-        return self.state.can_open_new_entries
+    def can_open_new_entries(self, now: datetime) -> bool:
+        """Return the complete, time-aware entry admission decision."""
+        return self._entry_eligible(now)
 
     def restore(self) -> RuntimeState:
         try:

@@ -118,14 +118,14 @@ def test_clean_start_requires_explicit_live_and_persisted_live_is_not_trusted():
     runtime.restore()
     assert runtime.reconcile_startup(BrokerRuntimeSnapshot(NOW), (), NOW).healthy
     assert runtime.state.lifecycle is RuntimeLifecycle.SYNCED
-    assert not runtime.can_open_new_entries
+    assert not runtime.can_open_new_entries(NOW)
     runtime.enable_live(NOW)
-    assert runtime.can_open_new_entries
+    assert runtime.can_open_new_entries(NOW)
 
     restarted = controller(store)
     restarted.restore()
     assert restarted.state.lifecycle is RuntimeLifecycle.BOOTSTRAP
-    assert not restarted.can_open_new_entries
+    assert not restarted.can_open_new_entries(NOW)
 
 
 def test_checkpoint_round_trip_is_exact_canonical_and_economic():
@@ -256,7 +256,7 @@ def test_freshness_stale_recovery_pause_halt_and_status():
     runtime.enable_live(NOW)
     runtime.check_freshness(NOW + timedelta(minutes=2))
     assert runtime.state.lifecycle is RuntimeLifecycle.STALE
-    assert not runtime.can_open_new_entries
+    assert not runtime.can_open_new_entries(NOW + timedelta(minutes=2))
     runtime.refresh(
         BrokerRuntimeSnapshot(NOW + timedelta(minutes=2)),
         (DataWatermark("EURUSD:M1", NOW + timedelta(minutes=2)),),
@@ -314,9 +314,12 @@ def test_cancel_pending_racing_fill_recovers_complete_truth_and_is_idempotent():
     assert recovered.average_fill_price == D("1.1015")
     assert recovered.entry_order_status.value == "CANCELLED"
     assert recovered.live_entry_quantity == 0
-    assert recovered.lifecycle is ExecutionLifecycle.PROTECTION_PENDING
+    assert recovered.lifecycle is ExecutionLifecycle.UNSAFE
     assert recovered.lifecycle is not ExecutionLifecycle.CANCELLED
+    assert recovered.protection_command_id is None
+    assert recovered.pending_protection_quantity is None
     replay = reconcile((recovered,), BrokerRuntimeSnapshot(NOW, (broker,)))
+    assert not replay.healthy
     assert replay.recovered_executions == (recovered,)
 
 
@@ -343,10 +346,22 @@ def test_protection_pending_broker_ahead_fill_requires_complete_protection():
     recovered = result.recovered_executions[0]
     assert recovered.filled_quantity == D("10000")
     assert recovered.protected_quantity == D("4000")
-    assert recovered.pending_protection_quantity == D("10000")
+    assert recovered.lifecycle is ExecutionLifecycle.UNSAFE
+    assert recovered.protection_command_id is None
+    assert recovered.pending_protection_quantity is None
+    replay = reconcile((recovered,), BrokerRuntimeSnapshot(NOW, (partial,)))
+    assert not replay.healthy
+    assert replay.recovered_executions == (recovered,)
+
+    later_complete = replace(partial, protected_quantity=D("10000"))
+    later = reconcile((recovered,), BrokerRuntimeSnapshot(NOW, (later_complete,)))
+    assert later.healthy
+    later_recovered = later.recovered_executions[0]
+    assert later_recovered.lifecycle is ExecutionLifecycle.PROTECTED
+    assert later_recovered.protection_command_id is None
     assert reconcile(
-        (recovered,), BrokerRuntimeSnapshot(NOW, (partial,))
-    ).recovered_executions == (recovered,)
+        (later_recovered,), BrokerRuntimeSnapshot(NOW, (later_complete,))
+    ).recovered_executions == (later_recovered,)
 
     complete = replace(partial, protected_quantity=D("10000"))
     healthy = reconcile((state,), BrokerRuntimeSnapshot(NOW, (complete,)))
@@ -521,9 +536,9 @@ def test_manual_halt_is_a_persisted_operator_latch():
     restarted.clear_halt(orphan_time)
     assert restarted.state.lifecycle is RuntimeLifecycle.SYNCED
     assert restarted.state.halt_reason is None
-    assert not restarted.can_open_new_entries
+    assert not restarted.can_open_new_entries(orphan_time)
     restarted.enable_live(orphan_time)
-    assert restarted.can_open_new_entries
+    assert restarted.can_open_new_entries(orphan_time)
 
 
 def test_future_freshness_is_stale_and_synced_freshness_loss_is_reported():
@@ -655,7 +670,12 @@ def test_runtime_status_reports_effective_freshness_without_mutating():
     runtime = _live_runtime()
     status = runtime.status(NOW + timedelta(minutes=2))
     assert runtime.state.lifecycle is RuntimeLifecycle.LIVE
+    assert not runtime.can_open_new_entries(NOW + timedelta(minutes=2))
     assert not status.can_open_new_entries
+    with pytest.raises(RuntimeError, match="stale"):
+        runtime.submit_intent(
+            ExecutionEngine(), intent("status-stale"), NOW + timedelta(minutes=2)
+        )
 
 
 def test_terminal_entry_protection_cannot_exceed_actual_exposure():
@@ -683,3 +703,45 @@ def test_terminal_entry_protection_cannot_exceed_actual_exposure():
         protection_ref="atomic-protection",
     )
     assert open_record.protected_quantity == D("10000")
+
+
+def test_reconciliation_never_invents_protection_command_identity():
+    _, acknowledged_state = accepted("ahead-unprotected")
+    _, cancel_state = accepted("cancel-unprotected")
+    cancel_state, _ = ExecutionEngine().request_cancel(cancel_state, NOW)
+    cases = (
+        (
+            acknowledged_state,
+            record(
+                acknowledged_state,
+                cumulative_filled_quantity=D("4000"),
+                average_fill_price=D("1.1"),
+                exposure_exists=True,
+            ),
+        ),
+        (
+            cancel_state,
+            record(
+                cancel_state,
+                entry_status=BrokerEntryStatus.CANCELLED,
+                cumulative_filled_quantity=D("4000"),
+                average_fill_price=D("1.1"),
+                exposure_exists=True,
+            ),
+        ),
+    )
+    for state, broker in cases:
+        assert state.protection_command_id is None
+        result = reconcile((state,), BrokerRuntimeSnapshot(NOW, (broker,)))
+        assert not result.healthy
+        recovered = result.recovered_executions[0]
+        assert recovered.protection_command_id is None
+        assert recovered.pending_protection_quantity is None
+
+
+def test_explicit_client_idempotency_conflict_fails_closed_for_owned_execution():
+    _, state = accepted("client-key")
+    broker = record(state, client_idempotency_key="wrong-client-key")
+    result = reconcile((state,), BrokerRuntimeSnapshot(NOW, (broker,)))
+    assert not result.healthy
+    assert result.items[0].reason_code is RuntimeReasonCode.EXECUTION_CONFLICT

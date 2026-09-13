@@ -106,7 +106,7 @@ class RuntimeState:
         object.__setattr__(self, "watermarks", watermarks)
 
     @property
-    def can_open_new_entries(self) -> bool:
+    def lifecycle_allows_new_entries(self) -> bool:
         return self.lifecycle is RuntimeLifecycle.LIVE
 
 

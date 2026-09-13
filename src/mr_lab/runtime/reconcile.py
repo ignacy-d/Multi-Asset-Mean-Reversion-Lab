@@ -91,25 +91,42 @@ def _entry_status(status: BrokerEntryStatus) -> EntryOrderStatus:
     }[status]
 
 
-def _protection_pending(
+def _unsafe_underprotected(
     state: ExecutionState, broker: BrokerExecutionRecord
 ) -> ExecutionState:
-    """Canonical M3-equivalent state needing protection for all exposure."""
-    target = broker.cumulative_filled_quantity
+    """Represent proven economics without inventing a broker command."""
     return replace(
         state,
-        lifecycle=ExecutionLifecycle.PROTECTION_PENDING,
+        lifecycle=ExecutionLifecycle.UNSAFE,
         entry_order_status=_entry_status(broker.entry_status),
-        filled_quantity=target,
+        filled_quantity=broker.cumulative_filled_quantity,
         average_fill_price=broker.average_fill_price,
         broker_order_ref=broker.broker_order_ref or state.broker_order_ref,
-        protection_status=ProtectionStatus.PENDING,
+        protection_status=(
+            ProtectionStatus.ACTIVE
+            if broker.protection_active
+            else ProtectionStatus.NOT_REQUESTED
+        ),
         protection_ref=broker.protection_ref,
         protected_quantity=broker.protected_quantity,
-        protection_command_id=stable_id(
-            "execution-command", state.execution_intent_id, "ensure-protection", target
-        ),
-        pending_protection_quantity=target,
+        protection_command_id=None,
+        pending_protection_quantity=None,
+        updated_at=max(state.updated_at, broker.observed_at),
+    )
+
+
+def _preserve_pending_with_broker_ahead_fill(
+    state: ExecutionState, broker: BrokerExecutionRecord
+) -> ExecutionState:
+    """Recover economics while preserving only the already-persisted command."""
+    return replace(
+        state,
+        entry_order_status=_entry_status(broker.entry_status),
+        filled_quantity=broker.cumulative_filled_quantity,
+        average_fill_price=broker.average_fill_price,
+        broker_order_ref=broker.broker_order_ref or state.broker_order_ref,
+        protection_ref=broker.protection_ref,
+        protected_quantity=broker.protected_quantity,
         updated_at=max(state.updated_at, broker.observed_at),
     )
 
@@ -173,7 +190,7 @@ def _recover_cancel(
     ):
         recovered = _fully_protected(state, broker)
     else:
-        recovered = _protection_pending(state, broker)
+        recovered = _unsafe_underprotected(state, broker)
         return _conflict(
             state,
             "cancelled remainder has exposure not proven fully protected",
@@ -190,17 +207,25 @@ def _recover_protection(
     state: ExecutionState, broker: BrokerExecutionRecord
 ) -> tuple[ReconciliationItem, ExecutionState]:
     target = state.pending_protection_quantity
-    if (
-        not broker.protection_active
-        or target is None
-        or broker.protected_quantity < target
-    ):
+    if target is None:
         return _item(
             state,
             ReconciliationCategory.AMBIGUOUS_IN_FLIGHT,
             "protection operation is not conclusively applied",
             RuntimeReasonCode.AMBIGUOUS_IN_FLIGHT,
         ), state
+    if not broker.protection_active or broker.protected_quantity < target:
+        recovered = (
+            _preserve_pending_with_broker_ahead_fill(state, broker)
+            if broker.cumulative_filled_quantity > state.filled_quantity
+            else state
+        )
+        return _item(
+            state,
+            ReconciliationCategory.AMBIGUOUS_IN_FLIGHT,
+            "persisted protection operation is not conclusively applied",
+            RuntimeReasonCode.AMBIGUOUS_IN_FLIGHT,
+        ), recovered
     if (
         broker.cumulative_filled_quantity > state.filled_quantity
         and broker.average_fill_price is None
@@ -212,7 +237,7 @@ def _recover_protection(
             ReconciliationCategory.BROKER_AHEAD,
             "complete broker-ahead fill and protection recovered",
         ), _fully_protected(state, broker)
-    recovered = _protection_pending(state, broker)
+    recovered = _unsafe_underprotected(state, broker)
     return _conflict(
         state, "broker-ahead exposure is only partially protected", recovered
     )
@@ -283,12 +308,18 @@ def _compare(
         return _conflict(state, "broker-ahead fill has no average price")
     if state.broker_order_ref and broker.broker_order_ref != state.broker_order_ref:
         return _conflict(state, "broker order identity conflicts")
+    expected_client_key = stable_id("execution-client-key", state.execution_intent_id)
+    if (
+        not state.is_terminal
+        and broker.client_idempotency_key is not None
+        and broker.client_idempotency_key != expected_client_key
+    ):
+        return _conflict(state, "client idempotency identity conflicts")
     if state.is_terminal:
         return _terminal_consistency(state, broker)
     if state.lifecycle is ExecutionLifecycle.SUBMITTING:
-        expected_key = stable_id("execution-client-key", state.execution_intent_id)
         if (
-            broker.client_idempotency_key != expected_key
+            broker.client_idempotency_key != expected_client_key
             or broker.entry_status is not BrokerEntryStatus.OPEN
             or not broker.broker_order_ref
             or broker.cumulative_filled_quantity != 0
@@ -325,6 +356,21 @@ def _compare(
         return _recover_cancel(state, broker)
     if state.lifecycle is ExecutionLifecycle.PROTECTION_PENDING:
         return _recover_protection(state, broker)
+    if (
+        state.lifecycle is ExecutionLifecycle.UNSAFE
+        and broker.protection_active
+        and broker.protected_quantity >= broker.cumulative_filled_quantity
+        and broker.cumulative_filled_quantity == state.filled_quantity
+    ):
+        if state.protection_ref and broker.protection_ref != state.protection_ref:
+            return _conflict(state, "protection identity conflicts")
+        return _item(
+            state,
+            ReconciliationCategory.BROKER_AHEAD,
+            "previously unsafe exposure is now fully protected",
+        ), _fully_protected(state, broker)
+    if state.lifecycle is ExecutionLifecycle.UNSAFE:
+        return _conflict(state, "exposure remains insufficiently protected")
     if broker.cumulative_filled_quantity > state.filled_quantity:
         if broker.average_fill_price is None:
             return _conflict(state, "broker-ahead fill has no average price")
@@ -335,7 +381,7 @@ def _compare(
             return _conflict(
                 state,
                 "broker-ahead fill is not proven fully protected",
-                _protection_pending(state, broker),
+                _unsafe_underprotected(state, broker),
             )
         return _item(
             state,
