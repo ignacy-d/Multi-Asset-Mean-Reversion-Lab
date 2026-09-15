@@ -143,7 +143,12 @@ class ShockState:
 
 
 class ShockStateDetector:
-    """Independent per-series threshold/re-arm state machine."""
+    """Independent per-series threshold/re-arm state machine.
+
+    ``shock_sign`` and ``fade_direction`` describe the episode entry and remain
+    fixed until re-arm.  They deliberately do not represent the instantaneous
+    sign of subsequent z-scores within an active episode.
+    """
 
     def __init__(self, shock_threshold: float = 2.0, rearm_threshold: float = 1.0):
         if not isfinite(shock_threshold) or not isfinite(rearm_threshold):
@@ -157,6 +162,7 @@ class ShockStateDetector:
         self.shock_threshold = shock_threshold
         self.rearm_threshold = rearm_threshold
         self._active = False
+        self._episode_sign = Direction.NONE
 
     def update(self, zscore: float) -> ShockState:
         if not isfinite(zscore):
@@ -164,20 +170,15 @@ class ShockStateDetector:
         event = False
         if self._active and abs(zscore) < self.rearm_threshold:
             self._active = False
+            self._episode_sign = Direction.NONE
         if not self._active and abs(zscore) >= self.shock_threshold:
             self._active = True
             event = True
-        sign = (
-            Direction.POSITIVE
-            if zscore > 0
-            else Direction.NEGATIVE
-            if zscore < 0
-            else Direction.NONE
-        )
-        fade = Direction(-sign) if event else Direction.NONE
-        return ShockState(
-            self._active, event, sign if self._active else Direction.NONE, fade
-        )
+            self._episode_sign = (
+                Direction.POSITIVE if zscore > 0 else Direction.NEGATIVE
+            )
+        fade = Direction(-self._episode_sign) if self._active else Direction.NONE
+        return ShockState(self._active, event, self._episode_sign, fade)
 
 
 def reconstruct_from_components(

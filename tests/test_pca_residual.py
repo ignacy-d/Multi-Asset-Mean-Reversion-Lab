@@ -170,6 +170,32 @@ def test_shock_state_machine_rearms_strictly_below_threshold():
     assert states[-1].fade_direction is Direction.POSITIVE
 
 
+def test_active_episode_keeps_entry_sign_across_opposite_threshold():
+    detector = ShockStateDetector(2, 1)
+    entered, opposite = (detector.update(z) for z in (2.5, -2.5))
+
+    assert entered.event_emitted
+    assert entered.shock_sign is Direction.POSITIVE
+    assert entered.fade_direction is Direction.NEGATIVE
+    assert opposite.active
+    assert not opposite.event_emitted
+    assert opposite.shock_sign is Direction.POSITIVE
+    assert opposite.fade_direction is Direction.NEGATIVE
+
+
+def test_rearmed_episode_may_establish_opposite_sign():
+    detector = ShockStateDetector(2, 1)
+    entered, rearmed, opposite = (detector.update(z) for z in (2.5, 0.5, -2.5))
+
+    assert entered.shock_sign is Direction.POSITIVE
+    assert not rearmed.active
+    assert rearmed.shock_sign is Direction.NONE
+    assert rearmed.fade_direction is Direction.NONE
+    assert opposite.event_emitted
+    assert opposite.shock_sign is Direction.NEGATIVE
+    assert opposite.fade_direction is Direction.POSITIVE
+
+
 def test_known_reversal_direction_is_representable_without_outcome_logic():
     state = ShockStateDetector().update(3.0)
     programmed_next_residual_move = -0.5
