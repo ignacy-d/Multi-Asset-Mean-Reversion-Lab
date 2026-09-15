@@ -21,3 +21,19 @@
   reject the whole family.
 - Clearly distinguish discovery from confirmation and out-of-sample work. Do
   not tune methods to produce attractive backtest results.
+- Treat sealed out-of-sample data as inaccessible: do not discover, enumerate,
+  inspect, hash, load, or reference its corpora, artifacts, manifests, or
+  workflow metadata until an authorized confirmation stage explicitly opens it.
+- Access research data only through explicit allowlists and authenticated
+  identities; fail closed rather than searching for a substitute.
+- Freeze a preregistration before empirical visibility. After results become
+  visible, do not rescue a study by changing its hypothesis, outcomes,
+  thresholds, gates, universe, or other research contract.
+- Distinguish implementation bug fixes from methodology changes. Correct bugs
+  with regression tests and an audit trail; require a new preregistered study
+  for methodological changes after empirical visibility.
+- Treat negative and inconclusive findings as valid research results.
+- Do not automate pull-request creation, closure, retargeting, reopening,
+  merging, or other pull-request management. Merge remains a human decision.
+- Keep research code and provenance independent from broker, runtime, and
+  execution integrations.
