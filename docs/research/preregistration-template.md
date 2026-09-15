@@ -1,7 +1,9 @@
 # Research study preregistration
 
 - **study_id:** `REPLACE-WITH-STUDY-ID`
-- **status:** `DRAFT` (allowed values: `DRAFT`, `FROZEN`)
+- **status:** `DRAFT`
+
+Allowed status values are exactly `DRAFT` and `FROZEN`.
 
 ## Research contract
 

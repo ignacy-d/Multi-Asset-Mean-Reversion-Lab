@@ -42,27 +42,51 @@ def test_freeze_writes_canonical_lock_for_explicit_spec(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "status_line",
     (
-        "status: DRAFT",
-        "- **status:** `DRAFT` (allowed values: `DRAFT`, `FROZEN`)",
-        'Status: "DRAFT"',
+        "status: FROZEN",
+        "**status**: FROZEN",
+        "`status`: FROZEN",
+        "- **status:** `FROZEN`",
     ),
 )
-def test_freeze_refuses_obvious_draft_status(tmp_path: Path, status_line: str) -> None:
-    spec = tmp_path / "draft.md"
+def test_freeze_accepts_exactly_one_frozen_markdown_status(
+    tmp_path: Path, status_line: str
+) -> None:
+    spec = tmp_path / "frozen.md"
     spec.write_text(f"# Study\n{status_line}\n")
+    output = tmp_path / "lock.json"
 
-    with pytest.raises(SpecLockError, match="DRAFT"):
+    freeze_study("TEST-1", spec, output)
+
+    assert output.is_file()
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    (
+        ("# Study without a status\n", "exactly one status declaration"),
+        ("status: REVIEWED\n", "status must be exactly FROZEN"),
+        ("status: DRAFT\n", "status must be exactly FROZEN"),
+        (
+            "status: FROZEN\nstatus: FROZEN\n",
+            "exactly one status declaration",
+        ),
+        (
+            "status: FROZEN\n**status**: DRAFT\n",
+            "exactly one status declaration",
+        ),
+    ),
+)
+def test_freeze_rejects_non_frozen_status_contracts(
+    tmp_path: Path, contents: str, message: str
+) -> None:
+    spec = tmp_path / "invalid-status.md"
+    spec.write_text(contents)
+
+    with pytest.raises(SpecLockError, match=message):
         freeze_study("TEST-1", spec, tmp_path / "lock.json")
 
 
-def test_freeze_refuses_any_draft_status_and_mismatched_declared_id(
-    tmp_path: Path,
-) -> None:
-    draft = tmp_path / "draft.md"
-    draft.write_text("status: FROZEN\nstatus: DRAFT\n")
-    with pytest.raises(SpecLockError, match="DRAFT"):
-        freeze_study("TEST-1", draft, tmp_path / "draft-lock.json")
-
+def test_freeze_refuses_mismatched_declared_id(tmp_path: Path) -> None:
     mismatch = tmp_path / "mismatch.md"
     mismatch.write_text("- **study_id:** `OTHER-1`\n- **status:** `FROZEN`\n")
     with pytest.raises(SpecLockError, match="does not match"):
@@ -140,6 +164,45 @@ def test_manifest_schema_round_trip_is_canonical() -> None:
     assert restored.to_json().endswith("\n")
 
 
+@pytest.mark.parametrize("length", (40, 64))
+def test_manifest_accepts_exact_full_git_object_id_lengths(length: int) -> None:
+    manifest = replace(valid_manifest(), git_revision="a" * length)
+
+    assert manifest.git_revision == "a" * length
+
+
+@pytest.mark.parametrize("length", (39, *range(41, 64), 65))
+def test_manifest_rejects_non_object_id_git_revision_lengths(length: int) -> None:
+    with pytest.raises(RunManifestError, match="git_revision"):
+        replace(valid_manifest(), git_revision="a" * length)
+
+
+def test_authenticated_registry_identities_may_share_one_corpus_path() -> None:
+    corpus_path = "explicit/2024-corpus"
+    identities = (
+        AuthenticatedDataIdentity(
+            name="corpus_id",
+            identity="sha256:" + "1" * 64,
+            path=corpus_path,
+        ),
+        AuthenticatedDataIdentity(
+            name="assembled_dataset_id",
+            identity="sha256:" + "2" * 64,
+            path=corpus_path,
+        ),
+    )
+
+    manifest = replace(valid_manifest(), authenticated_data=identities)
+    restored = RunManifest.from_dict(manifest.to_dict())
+
+    assert manifest.authenticated_data == identities
+    assert [item["path"] for item in manifest.to_dict()["authenticated_data"]] == [
+        corpus_path,
+        corpus_path,
+    ]
+    assert restored == manifest
+
+
 def test_manifest_detaches_and_freezes_mutable_parameters() -> None:
     parameters = {"thresholds": [1.0, 2.0]}
     manifest = replace(valid_manifest(), parameters=parameters)
@@ -181,15 +244,29 @@ def test_manifest_rejects_fabricated_or_inconsistent_completion() -> None:
         replace(valid_manifest(), execution_status="FAILED")
     with pytest.raises(RunManifestError, match="non-finite"):
         replace(valid_manifest(), parameters={"result": float("nan")})
+    with pytest.raises(RunManifestError, match="git_revision"):
+        replace(valid_manifest(), git_revision="A" * 40)
 
 
 def test_manifest_rejects_ambiguous_or_untyped_provenance() -> None:
     data = valid_manifest().authenticated_data[0]
+    same_name = AuthenticatedDataIdentity(
+        name=data.name,
+        identity="sha256:" + "3" * 64,
+        path="another/path",
+    )
+    same_identity = AuthenticatedDataIdentity(
+        name="another_identity_type",
+        identity=data.identity,
+        path="another/path",
+    )
     artifact = valid_manifest().generated_artifacts[0]
     with pytest.raises(RunManifestError, match="identity objects"):
         replace(valid_manifest(), authenticated_data=("invented",))
     with pytest.raises(RunManifestError, match="duplicate name"):
-        replace(valid_manifest(), authenticated_data=(data, data))
+        replace(valid_manifest(), authenticated_data=(data, same_name))
+    with pytest.raises(RunManifestError, match="duplicate identity"):
+        replace(valid_manifest(), authenticated_data=(data, same_identity))
     with pytest.raises(RunManifestError, match="artifact objects"):
         replace(valid_manifest(), generated_artifacts=("report.json",))
     with pytest.raises(RunManifestError, match="duplicate paths"):

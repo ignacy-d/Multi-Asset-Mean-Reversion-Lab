@@ -15,7 +15,7 @@ from mr_lab.spec_lock import STUDY_ID_PATTERN
 
 RUN_MANIFEST_SCHEMA_VERSION = "mr-lab-run-manifest-v1"
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
-GIT_REVISION_PATTERN = re.compile(r"[0-9a-f]{40,64}\Z")
+GIT_REVISION_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 EXECUTION_STATUSES = frozenset(("PLANNED", "RUNNING", "SUCCEEDED", "FAILED"))
 RESULT_CLASSIFICATIONS = frozenset(("PASS", "KILL", "INCONCLUSIVE"))
 type JsonScalar = str | int | float | bool | None
@@ -151,7 +151,7 @@ class RunManifest:
             raise RunManifestError(
                 "authenticated_data must contain authenticated identity objects"
             )
-        for field in ("name", "identity", "path"):
+        for field in ("name", "identity"):
             values = [getattr(item, field) for item in self.authenticated_data]
             if len(values) != len(set(values)):
                 raise RunManifestError(f"authenticated_data contains duplicate {field}")

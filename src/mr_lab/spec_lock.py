@@ -14,10 +14,6 @@ from pathlib import Path
 
 LOCK_SCHEMA_VERSION = "mr-lab-study-lock-v1"
 STUDY_ID_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*\Z")
-STATUS_FIELD_PATTERN = re.compile(
-    rb"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?status\s*:(?:\*\*)?\s*"
-    rb"[\"'`*_]*([A-Za-z]+)"
-)
 STUDY_ID_FIELD_PATTERN = re.compile(
     rb"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?study_id\s*:(?:\*\*)?\s*"
     rb"[\"'`*_]*([A-Za-z0-9_-]+)"
@@ -42,12 +38,53 @@ def hash_spec_bytes(spec_bytes: bytes) -> str:
     return hashlib.sha256(spec_bytes).hexdigest()
 
 
-def _reject_draft_status(spec_bytes: bytes) -> None:
-    statuses = (
-        match.group(1).upper() for match in STATUS_FIELD_PATTERN.finditer(spec_bytes)
-    )
-    if b"DRAFT" in statuses:
-        raise SpecLockError("refusing to freeze a DRAFT preregistration")
+def _unwrap_markdown_value(value: str) -> str:
+    value = value.strip()
+    for marker in ("**", "__", "`", '"', "'"):
+        if value.startswith(marker) and value.endswith(marker):
+            value = value[len(marker) : -len(marker)].strip()
+    return value
+
+
+def _parse_status_declaration(line: str) -> str | None:
+    line = line.strip()
+    bullet = re.match(r"^[-*+]\s+", line)
+    if bullet is not None:
+        line = line[bullet.end() :].strip()
+    if ":" not in line:
+        return None
+    raw_key, raw_value = line.split(":", 1)
+    key = raw_key.strip().casefold()
+    complete_keys = {"status", "**status**", "__status__", "`status`"}
+    incomplete_keys = {"**status": "**", "__status": "__", "`status": "`"}
+    if key in complete_keys:
+        value = raw_value
+    elif key in incomplete_keys:
+        value = raw_value.strip()
+        closing_marker = incomplete_keys[key]
+        if value.startswith(closing_marker):
+            value = value[len(closing_marker) :]
+    else:
+        return None
+    return _unwrap_markdown_value(value)
+
+
+def _require_frozen_status(spec_bytes: bytes) -> None:
+    try:
+        text = spec_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SpecLockError("preregistration must be valid UTF-8") from error
+    statuses = [
+        status
+        for line in text.splitlines()
+        if (status := _parse_status_declaration(line)) is not None
+    ]
+    if len(statuses) != 1:
+        raise SpecLockError(
+            "preregistration must contain exactly one status declaration"
+        )
+    if statuses[0] != "FROZEN":
+        raise SpecLockError("preregistration status must be exactly FROZEN")
 
 
 def _validate_declared_study_id(study_id: str, spec_bytes: bytes) -> None:
@@ -72,7 +109,7 @@ def build_spec_lock(study_id: str, spec_path: Path) -> dict[str, str]:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise SpecLockError(f"spec is not a regular file: {spec_path}")
         spec_bytes = stream.read()
-    _reject_draft_status(spec_bytes)
+    _require_frozen_status(spec_bytes)
     _validate_declared_study_id(study_id, spec_bytes)
     return {
         "lock_schema_version": LOCK_SCHEMA_VERSION,
