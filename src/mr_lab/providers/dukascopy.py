@@ -39,6 +39,11 @@ def build_url(instrument: str, day: date) -> str:
     return _build_url(spec, day)
 
 
+def build_candidate_url(instrument: str, day: date) -> str:
+    """Build the same provider path for a declared verification candidate."""
+    return _build_url(get_candidate_instrument_spec(instrument), day)
+
+
 def _build_url(spec: ProviderInstrumentSpec, day: date) -> str:
     normalized = spec.provider_symbol
     return (

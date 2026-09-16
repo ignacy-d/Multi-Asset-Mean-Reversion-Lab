@@ -30,7 +30,7 @@ def test_url_uses_zero_based_january_and_get_datafeed_path() -> None:
 
 def test_unsupported_instrument_is_rejected() -> None:
     with pytest.raises(ValueError, match="unsupported instrument"):
-        build_url("NZDUSD", date(2024, 1, 2))
+        build_url("CADJPY", date(2024, 1, 2))
 
 
 @pytest.mark.parametrize("payload", [b"", b"<html>error</html>"])

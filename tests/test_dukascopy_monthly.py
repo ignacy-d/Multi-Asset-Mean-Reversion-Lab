@@ -54,7 +54,7 @@ def write_month(root: Path, month: int, *, instrument: str = "EURUSD") -> None:
     manifest = build_corpus_manifest(
         start, end, [DailyPayload(start, raw, instrument)], absent, instrument
     )
-    directory = root / f"checkpoint-{month:02d}"
+    directory = root / f"month-{month:02d}"
     directory.mkdir(parents=True)
     stem = directory / f"{instrument}-{start.isoformat()}-M1-BID"
     stem.with_suffix(".bi5").write_bytes(raw)
@@ -119,13 +119,13 @@ def test_legacy_eurusd_full_year_publication_verifies_without_instrument_spec(
 def test_missing_month_and_missing_day_are_rejected(tmp_path: Path) -> None:
     chunks = tmp_path / "chunks"
     complete_chunks(chunks)
-    (chunks / "checkpoint-12" / "corpus-manifest.json").unlink()
-    with pytest.raises(RangeAcquisitionError, match="12 monthly"):
+    (chunks / "month-12" / "corpus-manifest.json").unlink()
+    with pytest.raises(RangeAcquisitionError, match="month 2024-12"):
         assemble_year(chunks, tmp_path / "out")
 
-    shutil.rmtree(chunks / "checkpoint-12")
+    shutil.rmtree(chunks / "month-12")
     write_month(chunks, 12)
-    manifest_path = chunks / "checkpoint-06" / "corpus-manifest.json"
+    manifest_path = chunks / "month-06" / "corpus-manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["confirmed_absent_dates"].pop()
     manifest_path.write_text(json.dumps(manifest))
@@ -133,19 +133,32 @@ def test_missing_month_and_missing_day_are_rejected(tmp_path: Path) -> None:
         assemble_year(chunks, tmp_path / "out")
 
 
+def test_year_assembly_never_discovers_a_substitute_month(tmp_path: Path) -> None:
+    chunks = tmp_path / "chunks"
+    complete_chunks(chunks)
+    expected = chunks / "month-12" / "corpus-manifest.json"
+    decoy = chunks / "unexpected" / "nested"
+    decoy.mkdir(parents=True)
+    shutil.copyfile(expected, decoy / "corpus-manifest.json")
+    expected.unlink()
+
+    with pytest.raises(RangeAcquisitionError, match="month 2024-12"):
+        assemble_year(chunks, tmp_path / "out")
+
+
 def test_duplicate_month_day_and_mixed_instrument_are_rejected(tmp_path: Path) -> None:
     chunks = tmp_path / "chunks"
     complete_chunks(chunks)
-    duplicate = chunks / "checkpoint-02" / "corpus-manifest.json"
+    duplicate = chunks / "month-02" / "corpus-manifest.json"
     value = json.loads(duplicate.read_text())
     value["requested_start_date"] = "2024-01-01"
     duplicate.write_text(json.dumps(value))
-    with pytest.raises(RangeAcquisitionError, match="duplicate"):
+    with pytest.raises(RangeAcquisitionError, match="wrong explicit path"):
         assemble_year(chunks, tmp_path / "out")
 
     chunks = tmp_path / "mixed"
     complete_chunks(chunks)
-    manifest_path = chunks / "checkpoint-03" / "corpus-manifest.json"
+    manifest_path = chunks / "month-03" / "corpus-manifest.json"
     value = json.loads(manifest_path.read_text())
     value["instrument"] = "GBPUSD"
     manifest_path.write_text(json.dumps(value))
@@ -337,7 +350,7 @@ def test_completed_month_resume_is_idempotent_and_makes_no_acquisition(
 def test_raw_hash_mismatch_is_rejected(tmp_path: Path) -> None:
     chunks = tmp_path / "chunks"
     complete_chunks(chunks)
-    (chunks / "checkpoint-04" / "EURUSD-2024-04-01-M1-BID.bi5").write_bytes(b"changed")
+    (chunks / "month-04" / "EURUSD-2024-04-01-M1-BID.bi5").write_bytes(b"changed")
     with pytest.raises(RangeAcquisitionError, match="provenance mismatch"):
         assemble_year(chunks, tmp_path / "out")
 
