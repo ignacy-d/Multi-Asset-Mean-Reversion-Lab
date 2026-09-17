@@ -9,6 +9,7 @@ import lzma
 import time
 from collections.abc import Callable
 from datetime import UTC, date, datetime
+from email.message import Message
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -195,7 +196,7 @@ def _acquire_with_spec(
         try:
             status, payload = getter(url, timeout)
             if status != 200:
-                raise HTTPError(url, status, "unexpected HTTP status", {}, None)
+                raise HTTPError(url, status, "unexpected HTTP status", Message(), None)
             break
         except HTTPError as error:
             if error.code == 404:

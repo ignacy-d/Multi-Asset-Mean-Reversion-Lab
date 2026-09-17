@@ -168,7 +168,7 @@ def _build_dataset_metadata(
     payload: bytes, requested_day: date, spec: ProviderInstrumentSpec
 ) -> DatasetMetadata:
     raw_sha256 = hashlib.sha256(payload).hexdigest()
-    identity_inputs = {
+    identity_inputs: dict[str, object] = {
         "canonical_schema_version": CANONICAL_SCHEMA_VERSION,
         "instrument": spec.instrument,
         "parser_schema_version": PARSER_SCHEMA_VERSION,
@@ -287,8 +287,11 @@ def main() -> None:
     for key, value in expected.items():
         if audit[key] != value:
             raise SystemExit(f"frozen expectation failed: {key}={audit[key]!r}")
+    resamples = audit["resamples"]
+    if not isinstance(resamples, dict):  # pragma: no cover - audit contract
+        raise SystemExit("frozen expectation failed: invalid resampling audit")
     for name, count in (("m5", 288), ("m15", 96), ("h1", 24)):
-        result = audit["resamples"][name]
+        result = resamples[name]
         if result != {"count": count, "incomplete_window_count": 0}:
             raise SystemExit(f"frozen expectation failed: {name}={result!r}")
     args.audit_output.write_text(

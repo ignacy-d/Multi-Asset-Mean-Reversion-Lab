@@ -6,20 +6,25 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from itertools import combinations, pairwise
 from pathlib import Path
 
+from mr_lab.providers.dukascopy import HOST, PROVIDER, build_url, validate_payload
+from mr_lab.providers.dukascopy_bi5 import candidate_canonicalization_audit
 from mr_lab.providers.dukascopy_monthly import verify_full_year_corpus
 from mr_lab.providers.instruments import (
     get_candidate_instrument_spec,
     get_instrument_spec,
 )
 from mr_lab.providers.verify_instruments import (
+    PLAUSIBLE_PRICE_BOUNDS,
     VERIFICATION_DAYS,
     VERIFICATION_REPORT_SCHEMA_VERSION,
+    build_url_for_candidate,
 )
 
 REGISTRY_SCHEMA_VERSION = "fx-universe-2024-registry-v1"
@@ -47,6 +52,7 @@ CANONICAL_HISTORICAL_REGISTRY = Path("configs/stage4a-2024-corpus-registry.json"
 CANONICAL_REGISTRY = Path("configs/fx-universe-2024-registry-v1.json")
 HISTORICAL_REGISTRY_SCHEMA = "stage-4a-2024-corpus-registry-v1"
 SHA256_IDENTITY = re.compile(r"sha256:[0-9a-f]{64}\Z")
+REPOSITORY_ROOT = Path(__file__).parents[3]
 
 
 class FxUniverseError(ValueError):
@@ -61,9 +67,26 @@ def _sha256_identity(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
+def _canonical_path(path: Path) -> Path:
+    """Normalize spelling without resolving symlinks or discovering substitutes."""
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def _expected_path(path: Path) -> Path:
+    return _canonical_path(path if path.is_absolute() else REPOSITORY_ROOT / path)
+
+
+def _identity_path(path: Path, canonical_label: Path | None = None) -> str:
+    """Return one stable label for a path included in a deterministic identity."""
+    normalized = _canonical_path(path)
+    if canonical_label is not None and normalized == _expected_path(canonical_label):
+        return canonical_label.as_posix()
+    return str(normalized)
+
+
 def _same_explicit_path(given: Path, expected: Path) -> bool:
-    """Compare labels without resolving symlinks or discovering filesystem state."""
-    return given.expanduser().absolute() == expected.expanduser().absolute()
+    """Compare normalized labels without resolving symlinks or discovering state."""
+    return _canonical_path(given) == _expected_path(expected)
 
 
 def _read_json(path: Path, description: str) -> dict[str, object]:
@@ -74,6 +97,73 @@ def _read_json(path: Path, description: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise FxUniverseError(f"{description} must be a JSON object")
     return value
+
+
+def _validate_raw_provenance(
+    raw_path: Path,
+    provenance_path: Path,
+    instrument: str,
+    requested_day: date,
+    *,
+    require_instrument_spec: bool,
+) -> tuple[bytes, dict[str, object]]:
+    """Reauthenticate one explicit raw/provenance pair without discovery."""
+    try:
+        payload = raw_path.read_bytes()
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        decoded_byte_length = validate_payload(payload)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise FxUniverseError(
+            f"invalid raw provenance for {instrument} on {requested_day}"
+        ) from error
+    if not isinstance(provenance, dict):
+        raise FxUniverseError(
+            f"invalid raw provenance for {instrument} on {requested_day}"
+        )
+    spec = get_instrument_spec(instrument)
+    expected = {
+        "provider": PROVIDER,
+        "host": HOST,
+        "requested_url": build_url(instrument, requested_day),
+        "canonical_instrument": instrument,
+        "source_timeframe": "M1",
+        "price_side": "BID",
+        "requested_date": requested_day.isoformat(),
+        "http_status": 200,
+        "compressed_byte_length": len(payload),
+        "decoded_byte_length": decoded_byte_length,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    instrument_spec = {
+        "provider_symbol": spec.provider_symbol,
+        "price_scale": spec.price_scale,
+        "price_precision": spec.price_precision,
+    }
+    if require_instrument_spec:
+        expected.update(instrument_spec)
+    elif any(
+        key in provenance and provenance.get(key) != value
+        for key, value in instrument_spec.items()
+    ):
+        raise FxUniverseError(
+            f"raw provenance instrument spec mismatch for {instrument} on "
+            f"{requested_day}"
+        )
+    if any(provenance.get(key) != value for key, value in expected.items()):
+        raise FxUniverseError(
+            f"raw provenance mismatch for {instrument} on {requested_day}"
+        )
+    try:
+        retrieved_at = datetime.fromisoformat(provenance["retrieved_at"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise FxUniverseError(
+            f"invalid retrieval timestamp for {instrument} on {requested_day}"
+        ) from error
+    if retrieved_at.tzinfo is None or retrieved_at.utcoffset() != UTC.utcoffset(None):
+        raise FxUniverseError(
+            f"retrieval timestamp must be UTC for {instrument} on {requested_day}"
+        )
+    return payload, provenance
 
 
 def _verify_report(path: Path, instrument: str) -> dict[str, object]:
@@ -93,12 +183,14 @@ def _verify_report(path: Path, instrument: str) -> dict[str, object]:
             f"verification report candidate spec mismatch for {instrument}"
         )
     spec = get_instrument_spec(instrument)
+    lower_price, upper_price = PLAUSIBLE_PRICE_BOUNDS[instrument]
     if (
         report.get("report_schema_version") != VERIFICATION_REPORT_SCHEMA_VERSION
         or report.get("verification_passed") is not True
         or report.get("authorized_dates")
         != [day.isoformat() for day in VERIFICATION_DAYS]
         or report.get("sample_count") != len(VERIFICATION_DAYS)
+        or report.get("plausible_price_bounds") != [lower_price, upper_price]
     ):
         raise FxUniverseError(f"incomplete verification evidence for {instrument}")
     samples = report.get("samples")
@@ -114,15 +206,42 @@ def _verify_report(path: Path, instrument: str) -> dict[str, object]:
         response = sample.get("provider_response")
         if not isinstance(audit, dict) or not isinstance(response, dict):
             raise FxUniverseError(f"invalid verification evidence for {instrument}")
+        stem = f"{instrument}-{day.isoformat()}-M1-BID"
+        raw_path = path.parent / f"{stem}.bi5"
+        payload, provenance = _validate_raw_provenance(
+            raw_path,
+            path.parent / f"{stem}.json",
+            instrument,
+            day,
+            require_instrument_spec=True,
+        )
+        expected_audit = candidate_canonicalization_audit(payload, day, instrument)
+        minimum_price = expected_audit.get("minimum_price")
+        maximum_price = expected_audit.get("maximum_price")
+        expected_response = {
+            "canonical_instrument": instrument,
+            "provider_symbol": spec.provider_symbol,
+            "price_scale": spec.price_scale,
+            "price_precision": spec.price_precision,
+            "source_timeframe": "M1",
+            "price_side": "BID",
+            "requested_date": day.isoformat(),
+            "requested_url": build_url_for_candidate(instrument, day),
+            "http_status": 200,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
         if (
-            audit.get("instrument") != instrument
-            or audit.get("requested_day") != day.isoformat()
-            or audit.get("price_basis") != "bid"
-            or audit.get("source_timezone") != "UTC"
-            or response.get("http_status") != 200
-            or response.get("canonical_instrument") != instrument
-            or response.get("provider_symbol") != spec.provider_symbol
-            or response.get("sha256") != audit.get("raw_sha256")
+            audit != expected_audit
+            or response != expected_response
+            or not isinstance(provenance, dict)
+            or not isinstance(minimum_price, int | float)
+            or isinstance(minimum_price, bool)
+            or not isinstance(maximum_price, int | float)
+            or isinstance(maximum_price, bool)
+            or not lower_price <= minimum_price <= maximum_price <= upper_price
+            or any(
+                provenance.get(key) != value for key, value in expected_response.items()
+            )
         ):
             raise FxUniverseError(f"verification sample mismatch for {instrument}")
     return report
@@ -175,6 +294,22 @@ def _corpus_entry(
         or manifest.get("assembled_dataset_id") != verified.dataset_id
     ):
         raise FxUniverseError(f"full-year corpus contract mismatch for {instrument}")
+    component_dates = manifest.get("successful_component_dates")
+    if not isinstance(component_dates, list):
+        raise FxUniverseError(f"invalid component dates for {instrument}")
+    for value in component_dates:
+        try:
+            requested_day = date.fromisoformat(value)
+        except (TypeError, ValueError) as error:
+            raise FxUniverseError(f"invalid component date for {instrument}") from error
+        stem = f"{instrument}-{requested_day.isoformat()}-M1-BID"
+        _validate_raw_provenance(
+            corpus_path / f"{stem}.bi5",
+            corpus_path / f"{stem}.json",
+            instrument,
+            requested_day,
+            require_instrument_spec=instrument in EXPANDED_INSTRUMENTS,
+        )
     return {
         "instrument": instrument,
         "provider": spec.provider,
@@ -191,7 +326,7 @@ def _corpus_entry(
         "manifest_sha256": _sha256_identity(manifest_bytes),
         "verification_status": "verified",
         "verification_evidence": dict(verification),
-        "corpus_path": str(corpus_path.absolute()),
+        "corpus_path": _identity_path(corpus_path),
     }
 
 
@@ -221,7 +356,9 @@ def build_registry(
             corpus_path = historical_root / instrument
             evidence = {
                 "kind": "historical-frozen-registry",
-                "registry_path": str(historical_registry_path),
+                "registry_path": _identity_path(
+                    historical_registry_path, CANONICAL_HISTORICAL_REGISTRY
+                ),
                 "registry_sha256": historical_registry_sha,
             }
             entry = _corpus_entry(corpus_path, instrument, evidence)
@@ -238,7 +375,7 @@ def build_registry(
             report = _verify_report(report_path, instrument)
             evidence = {
                 "kind": "bounded-real-provider",
-                "report_path": str(report_path.absolute()),
+                "report_path": _identity_path(report_path),
                 "verification_report_id": report["verification_report_id"],
             }
             entry = _corpus_entry(corpus_path, instrument, evidence)
@@ -328,7 +465,7 @@ def write_registry(
 def _validate_entry_path(entry: Mapping[str, object], instrument: str) -> Path:
     value = entry["corpus_path"]
     assert isinstance(value, str)
-    path = Path(value)
+    path = _canonical_path(Path(value))
     root = (
         CANONICAL_HISTORICAL_ROOT
         if instrument in HISTORICAL_INSTRUMENTS
@@ -404,18 +541,26 @@ def validate_expanded_universe(
         if len(timestamps) != len(bars):
             raise FxUniverseError(f"timestamp uniqueness mismatch for {instrument}")
 
+        if not bars:  # pragma: no cover - full-year corpus verifier rejects this
+            raise FxUniverseError(f"empty canonical dataset for {instrument}")
+        gap_boundaries = [
+            (range_start, bars[0].open_time),
+            *(
+                (previous.close_time, current.open_time)
+                for previous, current in pairwise(bars)
+            ),
+            (bars[-1].close_time, range_end),
+        ]
         large_gaps = []
         maximum_large_gap_minutes = 0
-        for previous, current in pairwise(bars):
-            gap_minutes = int(
-                (current.open_time - previous.close_time).total_seconds() // 60
-            )
+        for gap_start, gap_end in gap_boundaries:
+            gap_minutes = int((gap_end - gap_start).total_seconds() // 60)
             if gap_minutes >= large_gap_minutes:
                 maximum_large_gap_minutes = max(maximum_large_gap_minutes, gap_minutes)
                 large_gaps.append(
                     {
-                        "start": previous.close_time.isoformat(),
-                        "end": current.open_time.isoformat(),
+                        "start": gap_start.isoformat(),
+                        "end": gap_end.isoformat(),
                         "missing_minutes": gap_minutes,
                     }
                 )
@@ -477,7 +622,7 @@ def validate_expanded_universe(
     report_body: dict[str, object] = {
         "validation_schema_version": VALIDATION_SCHEMA_VERSION,
         "registry_id": registry["registry_id"],
-        "registry_path": str(registry_path),
+        "registry_path": _identity_path(registry_path, CANONICAL_REGISTRY),
         "requested_start_date": REQUESTED_START,
         "requested_end_date": REQUESTED_END,
         "semantic_validation_passed": True,
