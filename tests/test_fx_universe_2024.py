@@ -66,6 +66,8 @@ def synthetic_acquire(
     provenance_path.write_text(
         json.dumps(
             {
+                "provider": "Dukascopy",
+                "host": "datafeed.dukascopy.com",
                 "canonical_instrument": instrument,
                 "provider_symbol": spec.provider_symbol,
                 "price_scale": spec.price_scale,
@@ -75,7 +77,10 @@ def synthetic_acquire(
                 "requested_date": day.isoformat(),
                 "requested_url": build_url_for_candidate(instrument, day),
                 "http_status": 200,
+                "compressed_byte_length": len(raw),
+                "decoded_byte_length": 60 * RECORD.size,
                 "sha256": hashlib.sha256(raw).hexdigest(),
+                "retrieved_at": "2024-01-01T00:00:00+00:00",
             }
         ),
         encoding="utf-8",
@@ -168,9 +173,32 @@ def write_full_year_corpus(root: Path, instrument: str) -> dict[str, object]:
     stem.with_suffix(".json").write_text(
         json.dumps(
             {
+                "provider": "Dukascopy",
+                "host": "datafeed.dukascopy.com",
+                "requested_url": (
+                    f"https://datafeed.dukascopy.com/datafeed/{instrument}/2024/"
+                    "00/02/BID_candles_min_1.bi5"
+                ),
                 "requested_date": day.isoformat(),
                 "canonical_instrument": instrument,
+                "source_timeframe": "M1",
+                "price_side": "BID",
+                "http_status": 200,
+                "compressed_byte_length": len(raw),
+                "decoded_byte_length": 60 * RECORD.size,
                 "sha256": hashlib.sha256(raw).hexdigest(),
+                "retrieved_at": "2024-01-01T00:00:00+00:00",
+                **(
+                    {
+                        "provider_symbol": instrument,
+                        "price_scale": get_instrument_spec(instrument).price_scale,
+                        "price_precision": get_instrument_spec(
+                            instrument
+                        ).price_precision,
+                    }
+                    if instrument in EXPANDED_INSTRUMENTS
+                    else {}
+                ),
             }
         ),
         encoding="utf-8",
@@ -218,6 +246,16 @@ def synthetic_registry_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
     return historical_root, expanded_root, historical_registry
 
 
+def rewrite_report_identity(report: dict[str, object]) -> None:
+    body = {
+        key: value for key, value in report.items() if key != "verification_report_id"
+    }
+    encoded = json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    report["verification_report_id"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def test_expanded_registry_is_exact_identity_bound_and_fail_closed(
     tmp_path: Path,
 ) -> None:
@@ -245,6 +283,66 @@ def test_expanded_registry_is_exact_identity_bound_and_fail_closed(
         validate_registry(changed)
 
 
+def test_registry_identity_is_invariant_to_equivalent_path_spellings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    historical_root, expanded_root, historical_registry = synthetic_registry_inputs(
+        tmp_path
+    )
+    absolute = build_registry(historical_root, expanded_root, historical_registry)
+
+    monkeypatch.chdir(tmp_path)
+    relative = build_registry(
+        Path("historical"), Path("expanded"), Path("historical-registry.json")
+    )
+
+    assert relative == absolute
+    assert relative["registry_id"] == absolute["registry_id"]
+
+
+def test_registry_reauthenticates_raw_candidate_verification_evidence(
+    tmp_path: Path,
+) -> None:
+    historical_root, expanded_root, historical_registry = synthetic_registry_inputs(
+        tmp_path
+    )
+    report_path = expanded_root / "verification" / "USDCAD" / "verification-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["samples"][0]["provider_response"]["requested_url"] = "https://invalid"
+    rewrite_report_identity(report)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(FxUniverseError, match="verification sample mismatch"):
+        build_registry(historical_root, expanded_root, historical_registry)
+
+
+def test_registry_reapplies_candidate_plausibility_contract(tmp_path: Path) -> None:
+    historical_root, expanded_root, historical_registry = synthetic_registry_inputs(
+        tmp_path
+    )
+    report_path = expanded_root / "verification" / "USDCAD" / "verification-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["plausible_price_bounds"] = [0.0, 10.0]
+    rewrite_report_identity(report)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(FxUniverseError, match="incomplete verification evidence"):
+        build_registry(historical_root, expanded_root, historical_registry)
+
+
+def test_registry_reauthenticates_full_corpus_provenance(tmp_path: Path) -> None:
+    historical_root, expanded_root, historical_registry = synthetic_registry_inputs(
+        tmp_path
+    )
+    path = expanded_root / "USDCAD" / "USDCAD-2024-01-02-M1-BID.json"
+    provenance = json.loads(path.read_text(encoding="utf-8"))
+    provenance["host"] = "invalid.example"
+    path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(FxUniverseError, match="raw provenance mismatch"):
+        build_registry(historical_root, expanded_root, historical_registry)
+
+
 def test_nine_instrument_semantic_report_has_exact_synchronization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -258,15 +356,26 @@ def test_nine_instrument_semantic_report_has_exact_synchronization(
     monkeypatch.setattr(universe, "CANONICAL_EXPANDED_ROOT", expanded_root)
 
     report_path = validate_expanded_universe(
-        registry_path, tmp_path / "validation.json"
+        registry_path, tmp_path / "validation.json", large_gap_minutes=60
     )
     report = json.loads(report_path.read_text(encoding="utf-8"))
 
+    monkeypatch.chdir(tmp_path)
+    relative_report_path = validate_expanded_universe(
+        Path("registry.json"),
+        Path("validation-relative.json"),
+        large_gap_minutes=60,
+    )
+    relative_report = json.loads(relative_report_path.read_text(encoding="utf-8"))
+
     assert report["semantic_validation_passed"] is True
+    assert relative_report == report
+    assert relative_report["validation_report_id"] == report["validation_report_id"]
     assert set(report["instruments"]) == set(REGISTRY_INSTRUMENTS)
     assert report["synchronization"]["nine_way_intersection_count"] == 60
     assert report["synchronization"]["union_count"] == 60
     assert report["repairs_applied"] == []
+    assert len(report["quality_warnings"]) == len(REGISTRY_INSTRUMENTS)
     assert all(
         item["instrument"] == instrument
         and item["provider"] == "Dukascopy"
@@ -279,5 +388,8 @@ def test_nine_instrument_semantic_report_has_exact_synchronization(
         and item["nonfinite_price_count"] == 0
         and item["invalid_nonpositive_price_count"] == 0
         and item["impossible_ohlc_count"] == 0
+        and item["large_gap_count"] == 2
+        and item["large_gaps"][0]["start"] == "2024-01-01T00:00:00+00:00"
+        and item["large_gaps"][-1]["end"] == "2025-01-01T00:00:00+00:00"
         for instrument, item in report["instruments"].items()
     )
