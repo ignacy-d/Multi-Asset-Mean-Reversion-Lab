@@ -61,6 +61,32 @@ set -o pipefail; mkdir -p results/replay-mr-ou-costs-9pair && \
   2>&1 | tee results/replay-mr-ou-costs-9pair/replay.log
 ```
 
-The runner resumes a completed matching instrument/variant, safely restarts an
-interrupted marker-free variant, rejects identity-mismatched artifacts, validates
-the manifest hash and corpus IDs, and never searches for replacement data.
+The runner resumes a completed matching instrument/variant, rejects incomplete
+or identity-mismatched artifacts, validates the manifest hash and corpus IDs,
+and never searches for replacement data.
+
+## Streaming and disk behavior
+
+Replay aggregation consumes Stage 4B's immutable `trade_row_consumer` stream.
+It does not load `trades.jsonl` into Python dictionaries. Exact medians retain
+only little-endian float64 return arrays (eight bytes per complete observation);
+counts, sums, win/loss totals, MFE, and MAE remain scalar accumulators. New replay
+variants explicitly use compact Stage 4B mode, so `trades.jsonl` is an audited
+empty placeholder rather than a redundant multi-gigabyte row artifact. Default
+Stage 4B callers still persist every trade row unchanged.
+
+The already-completed `AUDJPY/mr` artifact from
+`4ae3b537fa533917dc4f400d85e6d9909b81e0f7` is reusable when its registry,
+corpus, dataset, Stage 4B methodology, OU specification, cost profile, variant,
+filter, and complete output-audit identities match. On first resume its existing
+trade file is streamed once, with progress and SHA-256 verification, to create
+the compact aggregate. It is not deleted or recomputed. A wrapper-only source
+revision difference is recorded but is not treated as a methodology mismatch.
+Any scientific identity or output-contract mismatch fails closed.
+
+For the observed 5,947,644-row AUDJPY full grid, its primary exact-median array
+is about 47.6 MB, plus much smaller comparable/net arrays and the ordinary
+Stage 4B compact reports. Subsequent variants do not add another multi-gigabyte
+trade JSONL, so the replay no longer scales toward roughly 100 GB of redundant
+trade-row storage. The existing legacy 9.8 GB artifact remains in place unless a
+human removes it after review.

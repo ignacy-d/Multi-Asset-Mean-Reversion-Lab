@@ -121,6 +121,12 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _write_trade_row(stream, row, *, persist=True):
+    """Persist by default; replay compact mode explicitly suppresses the row."""
+    if persist:
+        stream.write(_json(row) + "\n")
+
+
 def _sha256_file(path):
     """Hash a file with memory bounded independently of file size."""
     with path.open("rb") as file:
@@ -500,6 +506,7 @@ def run(
     shard_index=None,
     shard_count=None,
     trade_row_consumer=None,
+    persist_trade_rows=True,
 ):
     registry = _load_stage4b_registry(Path(registry_path))
     registry_entry = registry["instruments"].get(instrument)
@@ -697,7 +704,7 @@ def run(
                             # Stage 4B artifact remains byte-for-byte unchanged.
                             if trade_row_consumer is not None:
                                 trade_row_consumer(row.copy())
-                            trades.write(_json(row) + "\n")
+                            _write_trade_row(trades, row, persist=persist_trade_rows)
                             trade_rows_written += 1
             if processed % 1000 == 0 or processed == len(events):
                 elapsed = max(time.monotonic() - started, 1e-9)
@@ -723,6 +730,7 @@ def run(
         filter_identities,
         entry_observations,
         filter_,
+        persist_trade_rows,
     )
     if shard_count is not None:
         _write_shard_manifest(
@@ -1031,6 +1039,7 @@ def _write_outputs(
     filter_identities,
     entry_observations,
     eligibility_filter,
+    persist_trade_rows=True,
 ):
     drows = _aggregate_diagnostics(diagnostics)
     _csv(out / "entry-diagnostics.csv", drows)
@@ -1077,6 +1086,9 @@ def _write_outputs(
         **_filter_provenance(filter_identities),
         "output_sha256": hashes,
     }
+    if not persist_trade_rows:
+        audit["trades_jsonl_persisted"] = False
+        audit["trade_rows_streamed"] = totals["executed"]
     if isinstance(eligibility_filter, FrozenOuEligibilityFilter):
         audit["eligibility_filter_spec"] = asdict(eligibility_filter.spec)
         audit["process_spec_id"] = eligibility_filter.spec.process_spec.process_spec_id
