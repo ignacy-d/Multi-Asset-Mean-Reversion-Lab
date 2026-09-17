@@ -28,11 +28,18 @@ out-of-scope states fail closed. Its downstream grid is immediate entry, TP
 
 ## Output and cost interpretation
 
-`comparison.json` reports gross/zero-cost metrics for both variants. The
-realistic-cost headline is the already-frozen mean-spread, zero-slippage cost
-floor and remains distinct from gross. A net result is emitted only when the
-authenticated Stage 4C profile supplies all required spread, commission, and
-conversion inputs; otherwise it is null and the status is
+`comparison.json` keeps the entire Stage 4B MR grid as the descriptive
+`mr_full_grid` view. Its like-for-like comparison instead derives an
+`mr_comparable_baseline` from ungated MR rows using exactly the OU signal scope
+and downstream grid stated above. OU retention is therefore
+`N(MR+OU) / N(mr_comparable_baseline)`, never `N(MR+OU) / N(mr_full_grid)`.
+
+Gross/zero-cost metrics are reported for the full grid, comparable baseline,
+and MR+OU. The realistic-cost headline is the already-frozen mean-spread,
+zero-slippage cost floor and remains distinct from gross. Comparable-baseline
+and MR+OU net results are emitted only when the authenticated Stage 4C profile
+supplies all required spread, commission, and conversion inputs; otherwise the
+net result is null and the status is
 `BLOCKED_MISSING_AUTHENTICATED_COST_PROFILE`.
 
 The repository contains no machine-readable frozen numeric Stage 4B result

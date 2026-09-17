@@ -20,7 +20,7 @@ from mr_lab.stage4b import STAGE4B_METHODOLOGY_ID
 from mr_lab.stage4b_runner import _load_stage4b_registry, run
 from mr_lab.stage4c import CostProfile, Stage4CError, transform_trade
 
-SCHEMA = "frozen-mr-ou-nine-pair-replay-v1"
+SCHEMA = "frozen-mr-ou-nine-pair-replay-v2"
 OU_FILTER = "frozen-ou-crossasset-v1"
 HISTORICAL_FIVE = frozenset(("EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "AUDJPY"))
 
@@ -75,6 +75,9 @@ def _read_jsonl(path):
 
 def _cost_status(profile, instrument, rows):
     try:
+        # Authenticate the instrument even when a deterministic replay has no
+        # complete rows, then validate every session that would be priced.
+        profile.costs(instrument, None, "mean")
         for session in {row.get("session") for row in rows}:
             profile.costs(instrument, session, "mean")
     except Stage4CError:
@@ -89,6 +92,55 @@ def _net_metrics(profile, rows):
         if row.get("complete")
     ]
     return _metrics(transformed, "net_pips_adverse_first")
+
+
+def _is_mr_comparable_row(row, ou_spec):
+    """Match the frozen OU signal scope and downstream grid, without its gate."""
+    return (
+        row.get("signal_timeframe") == ou_spec.timeframe
+        and row.get("session") == ou_spec.session
+        and row.get("direction") == ou_spec.direction
+        and row.get("benchmark_family") in ou_spec.benchmark_families
+        and row.get("lookback") in ou_spec.lookbacks
+        and row.get("signal_threshold") == 2.0
+        and row.get("filter_family") == "none"
+        and row.get("filter_spec_id") == "none-v1"
+        and row.get("entry_mode") == "immediate"
+        and row.get("tp_target_fraction") in (0.75, 1.0)
+        and row.get("sl_extension_fraction") in (0.25, 0.5)
+        and row.get("time_stop_minutes") in (60, 120)
+    )
+
+
+def _mr_comparable_baseline(rows, ou_spec):
+    return [row for row in rows if _is_mr_comparable_row(row, ou_spec)]
+
+
+def _retention_ratio(ou_rows, comparable_rows):
+    numerator = _metrics(ou_rows)["n_trades"]
+    denominator = _metrics(comparable_rows)["n_trades"]
+    return numerator / denominator if denominator else 0.0
+
+
+def _comparison_metrics(mr_rows, ou_rows, ou_spec, profile, cost_status):
+    comparable = _mr_comparable_baseline(mr_rows, ou_spec)
+    return comparable, {
+        "mr_full_grid_gross": _metrics(mr_rows),
+        "mr_comparable_baseline_gross": _metrics(comparable),
+        "mr_comparable_baseline_net": (
+            _net_metrics(profile, comparable)
+            if cost_status == "AUTHENTICATED"
+            else None
+        ),
+        "mr_ou_gross": _metrics(ou_rows),
+        "mr_ou_net": (
+            _net_metrics(profile, ou_rows) if cost_status == "AUTHENTICATED" else None
+        ),
+        "mr_full_grid_trade_count": _metrics(mr_rows)["n_trades"],
+        "mr_comparable_baseline_trade_count": _metrics(comparable)["n_trades"],
+        "mr_ou_trade_count": _metrics(ou_rows)["n_trades"],
+        "ou_retention_ratio": _retention_ratio(ou_rows, comparable),
+    }
 
 
 def _finished(directory, identity):
@@ -136,8 +188,15 @@ def replay(registry_path: Path, cost_path: Path, output_dir: Path):
     (output_dir / "run-identity.json").write_text(_canonical(identity) + "\n")
 
     comparisons = []
-    all_rows: dict[str, list[dict]] = {"mr": [], "mr_ou": []}
-    all_net_rows: dict[str, list[dict]] = {"mr": [], "mr_ou": []}
+    all_rows: dict[str, list[dict]] = {
+        "mr_full_grid": [],
+        "mr_comparable_baseline": [],
+        "mr_ou": [],
+    }
+    all_net_rows: dict[str, list[dict]] = {
+        "mr_comparable_baseline": [],
+        "mr_ou": [],
+    }
     for instrument, entry in registry["instruments"].items():
         corpus = Path(entry["corpus_path"])
         variants = {}
@@ -155,13 +214,20 @@ def replay(registry_path: Path, cost_path: Path, output_dir: Path):
             rows = _read_jsonl(destination / "trades.jsonl")
             summary = json.loads((destination / "summary.json").read_text())
             variants[name] = (rows, summary)
-            all_rows[name].extend(rows)
         mr_rows, mr_summary = variants["mr"]
         ou_rows, ou_summary = variants["mr_ou"]
         status = _cost_status(profile, instrument, mr_rows + ou_rows)
-        mr_gross, ou_gross = _metrics(mr_rows), _metrics(ou_rows)
+        comparable_rows, comparison_metrics = _comparison_metrics(
+            mr_rows, ou_rows, ou, profile, status
+        )
+        all_rows["mr_full_grid"].extend(mr_rows)
+        all_rows["mr_comparable_baseline"].extend(comparable_rows)
+        all_rows["mr_ou"].extend(ou_rows)
         if status == "AUTHENTICATED":
-            for name, rows in (("mr", mr_rows), ("mr_ou", ou_rows)):
+            for name, rows in (
+                ("mr_comparable_baseline", comparable_rows),
+                ("mr_ou", ou_rows),
+            ):
                 all_net_rows[name].extend(
                     transform_trade(row, profile, "mean", 0.0)
                     for row in rows
@@ -170,20 +236,11 @@ def replay(registry_path: Path, cost_path: Path, output_dir: Path):
         comparisons.append(
             {
                 "instrument": instrument,
-                "mr_gross": mr_gross,
-                "mr_net": _net_metrics(profile, mr_rows)
-                if status == "AUTHENTICATED"
-                else None,
-                "mr_ou_gross": ou_gross,
-                "mr_ou_net": _net_metrics(profile, ou_rows)
-                if status == "AUTHENTICATED"
-                else None,
-                "mr_trade_count": mr_gross["n_trades"],
-                "mr_ou_trade_count": ou_gross["n_trades"],
-                "ou_retention_ratio": ou_gross["n_trades"] / mr_gross["n_trades"]
-                if mr_gross["n_trades"]
-                else 0.0,
+                **comparison_metrics,
                 "mr_incomplete_count": mr_summary["incomplete_count"],
+                "mr_comparable_baseline_incomplete_count": sum(
+                    not row.get("complete") for row in comparable_rows
+                ),
                 "mr_ou_incomplete_count": ou_summary["incomplete_count"],
                 "cost_profile_status": status,
                 "corpus_id": entry["corpus_id"],
@@ -208,6 +265,9 @@ def replay(registry_path: Path, cost_path: Path, output_dir: Path):
         "aggregate_gross": aggregate,
         "aggregate_net_authenticated_profiles_only": aggregate_net,
         "aggregate_net_excludes_blocked_instruments": True,
+        "aggregate_ou_retention_ratio": _retention_ratio(
+            all_rows["mr_ou"], all_rows["mr_comparable_baseline"]
+        ),
     }
     target = output_dir / "comparison.json"
     if target.exists() and json.loads(target.read_text()) != result:
