@@ -171,7 +171,7 @@ def assemble_daily_payloads(
         )
         bars.extend(daily_bars)
 
-    identity_inputs = {
+    identity_inputs: dict[str, object] = {
         "canonical_schema_version": CANONICAL_SCHEMA_VERSION,
         "components": [component.as_dict() for component in components],
         "instrument": spec.instrument,

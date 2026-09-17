@@ -293,7 +293,9 @@ def test_registry_identity_is_invariant_to_equivalent_path_spellings(
 
     monkeypatch.chdir(tmp_path)
     relative = build_registry(
-        Path("historical"), Path("expanded"), Path("historical-registry.json")
+        Path("./historical"),
+        Path("expanded/../expanded"),
+        Path("./historical-registry.json"),
     )
 
     assert relative == absolute

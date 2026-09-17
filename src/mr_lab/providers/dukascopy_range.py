@@ -263,7 +263,7 @@ def acquire_range(
         progress = f"[{index + 1}/{len(days)}]"
         logger(f"{progress} acquiring {day.isoformat()}")
         try:
-            kwargs = {"timeout": timeout, "retries": retries}
+            kwargs: dict[str, object] = {"timeout": timeout, "retries": retries}
             if spec.instrument != INSTRUMENT:
                 kwargs["instrument"] = spec.instrument
             raw_path, provenance_path = acquire_day(output_dir, day, **kwargs)
