@@ -85,14 +85,25 @@ def test_candidate_specs_and_verification_decoding(instrument, scale, encoded, d
 
 
 def test_supported_universe_is_production_verified_and_rejects_unknown():
-    assert SUPPORTED_INSTRUMENTS == ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "AUDJPY")
+    assert SUPPORTED_INSTRUMENTS == (
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "AUDUSD",
+        "AUDJPY",
+        "USDCAD",
+        "USDCHF",
+        "NZDUSD",
+        "EURGBP",
+    )
     for instrument in SUPPORTED_INSTRUMENTS:
         assert get_instrument_spec(instrument).decoding_verified
         assert build_url(instrument, DAY).endswith(
             f"/{instrument}/2024/00/02/BID_candles_min_1.bi5"
         )
     with pytest.raises(InstrumentSpecError, match="unsupported instrument"):
-        get_instrument_spec("NZDUSD")
+        get_instrument_spec("CADJPY")
+    assert get_instrument_spec("NZDUSD").decoding_verified
     with pytest.raises(InstrumentSpecError, match="price_scale"):
         ProviderInstrumentSpec("TEST", "TEST", 100, 5)
     candidate = ProviderInstrumentSpec(
@@ -256,7 +267,8 @@ def test_frozen_strategy_modules_do_not_branch_on_instrument():
         assert "instrument-specific" not in source
 
 
-def test_acquisition_rejects_2025_before_provider_access(tmp_path):
+@pytest.mark.parametrize("outside", [date(2023, 12, 31), date(2025, 1, 1)])
+def test_acquisition_rejects_non_2024_before_provider_access(tmp_path, outside):
     called = False
 
     def acquire_day(*_args, **_kwargs):
@@ -266,8 +278,8 @@ def test_acquisition_rejects_2025_before_provider_access(tmp_path):
     with pytest.raises(RangeAcquisitionError, match="only 2024"):
         acquire_range(
             tmp_path,
-            date(2025, 1, 1),
-            date(2025, 1, 1),
+            outside,
+            outside,
             acquire_day=acquire_day,
         )
     assert not called

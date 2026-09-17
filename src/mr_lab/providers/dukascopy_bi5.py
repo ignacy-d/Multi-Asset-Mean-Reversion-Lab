@@ -144,6 +144,17 @@ def parse_m1_bid_bars(
     )
 
 
+def parse_candidate_m1_bid_bars(
+    payload: bytes, requested_day: date, instrument: str
+) -> tuple[Bar, ...]:
+    """Decode a bounded verification sample without granting production use."""
+    return _parse_decoded_m1_bid_bars(
+        decode_m1_bid_payload(payload),
+        requested_day,
+        get_candidate_instrument_spec(instrument),
+    )
+
+
 def build_dataset_metadata(
     payload: bytes, requested_day: date, instrument: str = INSTRUMENT
 ) -> DatasetMetadata:

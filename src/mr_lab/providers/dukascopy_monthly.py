@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import TypedDict, Unpack
 
 from mr_lab.providers.dukascopy import (
     HOST,
@@ -28,7 +29,11 @@ from mr_lab.providers.dukascopy_bi5 import (
     PARSER_SCHEMA_VERSION,
     SOURCE_TIMEZONE,
 )
-from mr_lab.providers.dukascopy_multiday import DailyPayload, assemble_daily_payloads
+from mr_lab.providers.dukascopy_multiday import (
+    DailyPayload,
+    MultiDayDataset,
+    assemble_daily_payloads,
+)
 from mr_lab.providers.dukascopy_range import (
     CORPUS_SCHEMA_VERSION,
     GENERIC_CORPUS_SCHEMA_VERSION,
@@ -42,6 +47,14 @@ from mr_lab.providers.dukascopy_range import (
 from mr_lab.providers.instruments import get_instrument_spec
 
 DISCOVERY_YEAR = 2024
+
+
+class _AcquisitionOptions(TypedDict, total=False):
+    timeout: float
+    retries: int
+    acquire_day: Callable[..., tuple[Path, Path]]
+    sleeper: Callable[[float], None]
+    logger: Callable[[str], None]
 
 
 def month_bounds(year: int, month: int) -> tuple[date, date]:
@@ -61,7 +74,7 @@ def acquire_month(
     instrument: str = INSTRUMENT,
     delay_seconds: float = 2.0,
     resume: bool = False,
-    **kwargs: object,
+    **kwargs: Unpack[_AcquisitionOptions],
 ) -> RangeAcquisitionResult:
     """Acquire one independently checkpointable month, sequentially."""
     start, end = month_bounds(year, month)
@@ -268,6 +281,7 @@ class YearAssemblyResult:
     manifest_path: Path
     corpus_id: str
     dataset_id: str
+    dataset: MultiDayDataset | None = None
 
 
 def verify_full_year_corpus(
@@ -348,7 +362,7 @@ def verify_full_year_corpus(
         raise RangeAcquisitionError("full-year corpus identity mismatch")
     dataset = load_offline_corpus(corpus_dir)
     return YearAssemblyResult(
-        manifest_path, actual_corpus_id, dataset.metadata.dataset_id
+        manifest_path, actual_corpus_id, dataset.metadata.dataset_id, dataset
     )
 
 
@@ -423,24 +437,43 @@ def assemble_year(
     *,
     year: int = DISCOVERY_YEAR,
     instrument: str = INSTRUMENT,
+    month_directory_template: str = "month-{month:02d}",
 ) -> YearAssemblyResult:
-    """Verify exactly 12 monthly checkpoints and reproduce full-year semantics."""
+    """Verify 12 explicit monthly paths and reproduce full-year semantics."""
     spec = get_instrument_spec(instrument)
     if year != DISCOVERY_YEAR:
         raise RangeAcquisitionError("year assembly accepts only 2024")
-    manifests = sorted(chunks_root.rglob("corpus-manifest.json"))
-    if len(manifests) != 12:
-        raise RangeAcquisitionError("exactly 12 monthly corpora are required")
     by_month: dict[int, Path] = {}
-    for path in manifests:
+    for month in range(1, 13):
+        try:
+            directory_name = month_directory_template.format(
+                instrument=spec.instrument, year=year, month=month
+            )
+        except (KeyError, ValueError) as error:
+            raise RangeAcquisitionError("invalid month directory template") from error
+        relative = Path(directory_name)
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 1
+            or relative.name in {"", ".", ".."}
+        ):
+            raise RangeAcquisitionError(
+                "month directory template must produce one explicit child name"
+            )
+        directory = chunks_root / relative
+        path = directory / "corpus-manifest.json"
         try:
             value = json.loads(path.read_text())
             start = date.fromisoformat(value["requested_start_date"])
         except (OSError, KeyError, ValueError, json.JSONDecodeError) as error:
-            raise RangeAcquisitionError(f"invalid monthly manifest {path}") from error
-        if start.year != year or start.month in by_month:
-            raise RangeAcquisitionError("duplicate or out-of-year monthly corpus")
-        by_month[start.month] = path.parent
+            raise RangeAcquisitionError(
+                f"missing or invalid month {year}-{month:02d}"
+            ) from error
+        if start != date(year, month, 1):
+            raise RangeAcquisitionError(
+                "monthly corpus is bound to the wrong explicit path"
+            )
+        by_month[month] = directory
     payloads: list[DailyPayload] = []
     absent: list[date] = []
     source_paths: list[tuple[Path, Path]] = []
@@ -466,7 +499,10 @@ def assemble_year(
     manifest_path = output_dir / "corpus-manifest.json"
     manifest_path.write_text(manifest.to_json() + "\n", encoding="utf-8")
     return YearAssemblyResult(
-        manifest_path, manifest.corpus_id, manifest.dataset.metadata.dataset_id
+        manifest_path,
+        manifest.corpus_id,
+        manifest.dataset.metadata.dataset_id,
+        manifest.dataset,
     )
 
 
@@ -478,43 +514,49 @@ def main() -> None:
     acquire_parser.add_argument("--month", type=int, required=True)
     acquire_parser.add_argument("--instrument", default=INSTRUMENT)
     acquire_parser.add_argument("--output-dir", type=Path, required=True)
+    acquire_parser.add_argument("--delay-seconds", type=float, default=2.0)
     acquire_parser.add_argument("--resume", action="store_true")
     assembly_parser = subparsers.add_parser("assemble-year")
     assembly_parser.add_argument("--year", type=int, default=DISCOVERY_YEAR)
     assembly_parser.add_argument("--instrument", default=INSTRUMENT)
     assembly_parser.add_argument("--chunks-root", type=Path, required=True)
     assembly_parser.add_argument("--output-dir", type=Path, required=True)
+    assembly_parser.add_argument(
+        "--month-directory-template", default="month-{month:02d}"
+    )
     verify_parser = subparsers.add_parser("verify-year")
     verify_parser.add_argument("--year", type=int, default=DISCOVERY_YEAR)
     verify_parser.add_argument("--instrument", required=True)
     verify_parser.add_argument("--corpus-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "acquire-month":
-        result = acquire_month(
+        month_result = acquire_month(
             args.output_dir,
             args.year,
             args.month,
             instrument=args.instrument,
+            delay_seconds=args.delay_seconds,
             resume=args.resume,
         )
-        print(f"month_manifest={result.manifest_path}")
+        print(f"month_manifest={month_result.manifest_path}")
     elif args.command == "assemble-year":
-        result = assemble_year(
+        year_result = assemble_year(
             args.chunks_root,
             args.output_dir,
             year=args.year,
             instrument=args.instrument,
+            month_directory_template=args.month_directory_template,
         )
-        print(f"corpus_manifest={result.manifest_path}")
-        print(f"corpus_id={result.corpus_id}")
-        print(f"assembled_dataset_id={result.dataset_id}")
+        print(f"corpus_manifest={year_result.manifest_path}")
+        print(f"corpus_id={year_result.corpus_id}")
+        print(f"assembled_dataset_id={year_result.dataset_id}")
     else:
-        result = verify_full_year_corpus(
+        verification_result = verify_full_year_corpus(
             args.corpus_dir, year=args.year, instrument=args.instrument
         )
-        print(f"corpus_manifest={result.manifest_path}")
-        print(f"corpus_id={result.corpus_id}")
-        print(f"assembled_dataset_id={result.dataset_id}")
+        print(f"corpus_manifest={verification_result.manifest_path}")
+        print(f"corpus_id={verification_result.corpus_id}")
+        print(f"assembled_dataset_id={verification_result.dataset_id}")
 
 
 if __name__ == "__main__":

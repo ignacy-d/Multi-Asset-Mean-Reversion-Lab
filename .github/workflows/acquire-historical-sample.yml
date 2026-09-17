@@ -8,7 +8,7 @@ on:
         required: true
         default: EURUSD
         type: choice
-        options: [EURUSD, GBPUSD, USDJPY, AUDUSD, AUDJPY]
+        options: [EURUSD, GBPUSD, USDJPY, AUDUSD, AUDJPY, USDCAD, USDCHF, NZDUSD, EURGBP]
 
 permissions:
   contents: read
@@ -65,6 +65,7 @@ jobs:
           uv run python -m mr_lab.providers.dukascopy_monthly assemble-year
           --year 2024 --instrument "${{ inputs.instrument }}"
           --chunks-root data/raw/months
+          --month-directory-template "dukascopy-${{ inputs.instrument }}-m1-bid-2024-{month:02d}"
           --output-dir data/raw/stage-3a-corpus
       - name: Fail closed on the assembled publication contract
         run: >-

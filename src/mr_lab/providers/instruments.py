@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from mr_lab.data import PriceBasis, Timeframe, VolumeSemantics
 
@@ -84,7 +84,7 @@ class ProviderInstrumentSpec:
         return decoded
 
 
-_SPECS = {
+_DECLARED_SPECS = {
     # EURUSD is the historically verified Stage 1A contract. The four Stage 3A
     # specifications were promoted after bounded real-provider verification.
     "EURUSD": ProviderInstrumentSpec("EURUSD", "EURUSD", 100_000, 5),
@@ -92,9 +92,40 @@ _SPECS = {
     "USDJPY": ProviderInstrumentSpec("USDJPY", "USDJPY", 1_000, 3),
     "AUDUSD": ProviderInstrumentSpec("AUDUSD", "AUDUSD", 100_000, 5),
     "AUDJPY": ProviderInstrumentSpec("AUDJPY", "AUDJPY", 1_000, 3),
+    # Candidate declarations remain unverified facts even after promotion, so
+    # bounded verification reports are reproducible and cannot imply approval.
+    "USDCAD": ProviderInstrumentSpec(
+        "USDCAD", "USDCAD", 100_000, 5, decoding_verified=False
+    ),
+    "USDCHF": ProviderInstrumentSpec(
+        "USDCHF", "USDCHF", 100_000, 5, decoding_verified=False
+    ),
+    "NZDUSD": ProviderInstrumentSpec(
+        "NZDUSD", "NZDUSD", 100_000, 5, decoding_verified=False
+    ),
+    "EURGBP": ProviderInstrumentSpec(
+        "EURGBP", "EURGBP", 100_000, 5, decoding_verified=False
+    ),
 }
 
-SUPPORTED_INSTRUMENTS = tuple(_SPECS)
+DECLARED_INSTRUMENTS = tuple(_DECLARED_SPECS)
+SUPPORTED_INSTRUMENTS = (
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "AUDJPY",
+    # Promoted only after the exact bounded real-provider reports passed.
+    "USDCAD",
+    "USDCHF",
+    "NZDUSD",
+    "EURGBP",
+)
+_PRODUCTION_SPECS = {
+    name: (spec if spec.decoding_verified else replace(spec, decoding_verified=True))
+    for name, spec in _DECLARED_SPECS.items()
+    if name in SUPPORTED_INSTRUMENTS
+}
 
 
 def get_candidate_instrument_spec(instrument: str) -> ProviderInstrumentSpec:
@@ -103,7 +134,7 @@ def get_candidate_instrument_spec(instrument: str) -> ProviderInstrumentSpec:
         raise InstrumentSpecError("instrument must be a string")
     symbol = instrument.strip().upper()
     try:
-        return _SPECS[symbol]
+        return _DECLARED_SPECS[symbol]
     except KeyError as error:
         raise InstrumentSpecError(f"unsupported instrument: {instrument!r}") from error
 
@@ -119,4 +150,10 @@ def require_verified(spec: ProviderInstrumentSpec) -> ProviderInstrumentSpec:
 
 def get_instrument_spec(instrument: str) -> ProviderInstrumentSpec:
     """Resolve only production-verified instrument decoding specifications."""
-    return require_verified(get_candidate_instrument_spec(instrument))
+    if not isinstance(instrument, str):
+        raise InstrumentSpecError("instrument must be a string")
+    symbol = instrument.strip().upper()
+    try:
+        return require_verified(_PRODUCTION_SPECS[symbol])
+    except KeyError as error:
+        raise InstrumentSpecError(f"unsupported instrument: {instrument!r}") from error

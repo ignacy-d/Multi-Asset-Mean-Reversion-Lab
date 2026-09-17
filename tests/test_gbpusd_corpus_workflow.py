@@ -4,7 +4,10 @@ from pathlib import Path
 def test_gbpusd_uses_exact_bounded_generic_acquisition_and_publication() -> None:
     workflow = Path(".github/workflows/acquire-historical-sample.yml").read_text()
 
-    assert "options: [EURUSD, GBPUSD, USDJPY, AUDUSD, AUDJPY]" in workflow
+    assert (
+        "options: [EURUSD, GBPUSD, USDJPY, AUDUSD, AUDJPY, "
+        "USDCAD, USDCHF, NZDUSD, EURGBP]" in workflow
+    )
     assert "--year 2024 --month ${{ matrix.month }}" in workflow
     assert '--instrument "${{ inputs.instrument }}"' in workflow
     assert '--year 2024 --instrument "${{ inputs.instrument }}"' in workflow
