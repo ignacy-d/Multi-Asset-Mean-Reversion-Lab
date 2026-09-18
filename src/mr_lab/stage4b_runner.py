@@ -32,6 +32,7 @@ from mr_lab.ornstein_uhlenbeck import (
     frozen_ou_eligibility_spec,
 )
 from mr_lab.providers.dukascopy_range import load_offline_corpus
+from mr_lab.providers.fx_universe_2024 import validate_registry as validate_fx_registry
 from mr_lab.research import Direction, build_research_observations
 from mr_lab.sessions import DEFAULT_SESSION_SPEC
 from mr_lab.stage4a_runner import (
@@ -72,6 +73,7 @@ from mr_lab.vwap_m1_robustness import (
 )
 
 LOOKBACKS = (20, 40)
+FX_UNIVERSE_REGISTRY_SCHEMA = "fx-universe-2024-registry-v1"
 OUTPUTS = (
     "candidate-events.jsonl",
     "trades.jsonl",
@@ -119,10 +121,61 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _write_trade_row(stream, row, *, persist=True):
+    """Persist by default; replay compact mode explicitly suppresses the row."""
+    if persist:
+        stream.write(_json(row) + "\n")
+
+
 def _sha256_file(path):
     """Hash a file with memory bounded independently of file size."""
     with path.open("rb") as file:
         return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def _load_stage4b_registry(path):
+    """Load either historical Stage 4A pins or the authenticated nine-pair pin."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("invalid or missing corpus registry") from error
+    if raw.get("registry_schema_version") != FX_UNIVERSE_REGISTRY_SCHEMA:
+        return load_corpus_registry(path)
+    validate_fx_registry(raw)
+    entries = raw["instruments"]
+    for name, entry in entries.items():
+        _validate_fx_universe_entry(name, entry)
+    return raw
+
+
+def _validate_fx_universe_entry(instrument, entry, *, manifest=None):
+    """Fail closed on the exact, explicit 2024 registry entry contract."""
+    if not isinstance(entry, dict) or entry.get("instrument") != instrument:
+        raise ValueError("registry key and instrument disagree")
+    if entry.get("verification_status") != "verified":
+        raise ValueError(f"{instrument} is not authenticated")
+    if (entry.get("requested_start_date"), entry.get("requested_end_date")) != (
+        "2024-01-01",
+        "2024-12-31",
+    ):
+        raise ValueError("registry entry is not the exact 2024 range")
+    if not isinstance(entry.get("corpus_path"), str) or not entry["corpus_path"]:
+        raise ValueError("registry entry lacks an explicit corpus path")
+    for identity_field in ("corpus_id", "assembled_dataset_id", "manifest_sha256"):
+        value = entry.get(identity_field)
+        if not isinstance(value, str) or not value.startswith("sha256:"):
+            raise ValueError(f"registry entry lacks authenticated {identity_field}")
+    if manifest is not None:
+        for field in (
+            "instrument",
+            "corpus_id",
+            "assembled_dataset_id",
+            "requested_start_date",
+            "requested_end_date",
+        ):
+            if entry.get(field) != manifest.get(field):
+                raise ValueError(f"registry and manifest disagree on {field}")
+    return dict(entry)
 
 
 def _state(
@@ -453,15 +506,31 @@ def run(
     shard_index=None,
     shard_count=None,
     trade_row_consumer=None,
+    persist_trade_rows=True,
 ):
-    registry = load_corpus_registry(registry_path)
-    registry_entry = validate_registry_entry(
-        instrument, registry["instruments"][instrument], require_verified=True
-    )
+    registry = _load_stage4b_registry(Path(registry_path))
+    registry_entry = registry["instruments"].get(instrument)
+    if registry["registry_schema_version"] == FX_UNIVERSE_REGISTRY_SCHEMA:
+        registry_entry = _validate_fx_universe_entry(instrument, registry_entry)
+    else:
+        registry_entry = validate_registry_entry(
+            instrument, registry_entry, require_verified=True
+        )
+    if registry["registry_schema_version"] == FX_UNIVERSE_REGISTRY_SCHEMA:
+        actual_manifest_id = "sha256:" + _sha256_file(
+            Path(corpus_dir) / "corpus-manifest.json"
+        )
+        if actual_manifest_id != registry_entry["manifest_sha256"]:
+            raise ValueError(
+                "corpus manifest hash does not match authenticated registry"
+            )
     manifest = read_and_validate_manifest(corpus_dir, instrument)
-    validate_registry_entry(
-        instrument, registry_entry, manifest=manifest, require_verified=True
-    )
+    if registry["registry_schema_version"] == FX_UNIVERSE_REGISTRY_SCHEMA:
+        _validate_fx_universe_entry(instrument, registry_entry, manifest=manifest)
+    else:
+        validate_registry_entry(
+            instrument, registry_entry, manifest=manifest, require_verified=True
+        )
     dataset = load_offline_corpus(corpus_dir)
     index = M1Index(dataset.bars)
     print("STAGE4B_PROGRESS corpus_loaded m1_index_complete", flush=True)
@@ -635,7 +704,7 @@ def run(
                             # Stage 4B artifact remains byte-for-byte unchanged.
                             if trade_row_consumer is not None:
                                 trade_row_consumer(row.copy())
-                            trades.write(_json(row) + "\n")
+                            _write_trade_row(trades, row, persist=persist_trade_rows)
                             trade_rows_written += 1
             if processed % 1000 == 0 or processed == len(events):
                 elapsed = max(time.monotonic() - started, 1e-9)
@@ -661,6 +730,7 @@ def run(
         filter_identities,
         entry_observations,
         filter_,
+        persist_trade_rows,
     )
     if shard_count is not None:
         _write_shard_manifest(
@@ -713,10 +783,10 @@ def _write_shard_manifest(
         "registry_schema": registry["registry_schema_version"],
         "corpus_id": corpus_manifest["corpus_id"],
         "assembled_dataset_id": corpus_manifest["assembled_dataset_id"],
-        "source_workflow_run_id": entry["source_workflow_run_id"],
-        "source_artifact_id": entry["source_artifact_id"],
-        "source_artifact_name": entry["source_artifact_name"],
-        "source_mode": entry.get("source_mode", "github-artifact"),
+        "source_workflow_run_id": entry.get("source_workflow_run_id"),
+        "source_artifact_id": entry.get("source_artifact_id"),
+        "source_artifact_name": entry.get("source_artifact_name"),
+        "source_mode": entry.get("source_mode", "authenticated-registry"),
         "source_acquisition_commit_sha": entry.get("source_acquisition_commit_sha"),
         "raw_artifact_name": os.environ.get(
             "STAGE4B_RAW_ARTIFACT_NAME", f"local-stage4b-raw-shard-{shard_index}"
@@ -969,6 +1039,7 @@ def _write_outputs(
     filter_identities,
     entry_observations,
     eligibility_filter,
+    persist_trade_rows=True,
 ):
     drows = _aggregate_diagnostics(diagnostics)
     _csv(out / "entry-diagnostics.csv", drows)
@@ -1003,10 +1074,10 @@ def _write_outputs(
         "source_commit_sha": _commit_sha(),
         "registry_schema": registry["registry_schema_version"],
         "instrument": entry["instrument"],
-        "source_workflow_run_id": entry["source_workflow_run_id"],
-        "source_artifact_id": entry["source_artifact_id"],
-        "source_artifact_name": entry["source_artifact_name"],
-        "source_mode": entry.get("source_mode", "github-artifact"),
+        "source_workflow_run_id": entry.get("source_workflow_run_id"),
+        "source_artifact_id": entry.get("source_artifact_id"),
+        "source_artifact_name": entry.get("source_artifact_name"),
+        "source_mode": entry.get("source_mode", "authenticated-registry"),
         "source_acquisition_commit_sha": entry.get("source_acquisition_commit_sha"),
         "corpus_id": entry["corpus_id"],
         "assembled_dataset_id": entry["assembled_dataset_id"],
@@ -1015,6 +1086,9 @@ def _write_outputs(
         **_filter_provenance(filter_identities),
         "output_sha256": hashes,
     }
+    if not persist_trade_rows:
+        audit["trades_jsonl_persisted"] = False
+        audit["trade_rows_streamed"] = totals["executed"]
     if isinstance(eligibility_filter, FrozenOuEligibilityFilter):
         audit["eligibility_filter_spec"] = asdict(eligibility_filter.spec)
         audit["process_spec_id"] = eligibility_filter.spec.process_spec.process_spec_id
