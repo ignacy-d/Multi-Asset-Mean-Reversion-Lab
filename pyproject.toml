@@ -31,6 +31,7 @@ mr-lab-trend-exhaustion-quality = "mr_lab.trend_exhaustion_quality:main"
 mr-lab-bollinger-incremental = "mr_lab.bollinger_incremental:main"
 mr-lab-ou-diagnostics = "mr_lab.ornstein_uhlenbeck_runner:main"
 mr-lab-ou-monte-carlo = "mr_lab.ou_monte_carlo_runner:main"
+mr-lab-replay-ou-bidirectional = "mr_lab.ou_bidirectional_runner:main"
 mr-lab-freeze-study = "mr_lab.spec_lock:main"
 
 [dependency-groups]

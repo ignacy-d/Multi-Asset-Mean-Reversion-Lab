@@ -507,7 +507,14 @@ def run(
     shard_count=None,
     trade_row_consumer=None,
     persist_trade_rows=True,
+    grid_restriction=None,
 ):
+    """Run Stage 4B; an explicit restriction only removes frozen grid cells.
+
+    ``None`` retains the historical execution path and output byte semantics.
+    The bidirectional replay passes a fully enumerated mapping which is recorded
+    by its own study identity.
+    """
     registry = _load_stage4b_registry(Path(registry_path))
     registry_entry = registry["instruments"].get(instrument)
     if registry["registry_schema_version"] == FX_UNIVERSE_REGISTRY_SCHEMA:
@@ -538,6 +545,23 @@ def run(
     # of the existing global state assembly and global re-arm/deduplication.
     signal_states = assemble_signal_states(dataset, manifest)
     full_events = deduplicate_states(signal_states)
+    if grid_restriction is not None:
+        allowed = {
+            "signal_timeframes": tuple(grid_restriction["signal_timeframes"]),
+            "sessions": tuple(grid_restriction["sessions"]),
+            "benchmark_families": tuple(grid_restriction["benchmark_families"]),
+            "lookbacks": tuple(grid_restriction["lookbacks"]),
+            "directions": tuple(grid_restriction["directions"]),
+        }
+        full_events = tuple(
+            event
+            for event in full_events
+            if str(event.signal.signal_timeframe) in allowed["signal_timeframes"]
+            and event.signal.session in allowed["sessions"]
+            and event.signal.benchmark_family in allowed["benchmark_families"]
+            and event.signal.lookback in allowed["lookbacks"]
+            and event.signal.direction.name in allowed["directions"]
+        )
     print(
         "STAGE4B_PROGRESS signal_generation_complete "
         f"candidate_dedup_complete candidate_count={len(full_events)}",
@@ -612,8 +636,13 @@ def run(
                 for d in path_diagnostic(event, index)
             )
             decision = decisions[event.candidate_event_id]
+            entry_modes = (
+                tuple(grid_restriction["entry_modes"])
+                if grid_restriction is not None
+                else ENTRY_MODES
+            )
             entries = (
-                {mode: construct_entry(event, index, mode) for mode in ENTRY_MODES}
+                {mode: construct_entry(event, index, mode) for mode in entry_modes}
                 if decision.eligible
                 else {}
             )
@@ -657,9 +686,24 @@ def run(
                     decision.filter_spec_id,
                     mode,
                 )
-                for tp in (0.75, 1.0) if frozen_ou_run else TP_FRACTIONS:
-                    for sl in (0.25, 0.5) if frozen_ou_run else SL_FRACTIONS:
-                        for stop in (60, 120) if frozen_ou_run else TIME_STOPS_MINUTES:
+                tps = (
+                    tuple(grid_restriction["tp_fractions"])
+                    if grid_restriction
+                    else ((0.75, 1.0) if frozen_ou_run else TP_FRACTIONS)
+                )
+                sls = (
+                    tuple(grid_restriction["sl_fractions"])
+                    if grid_restriction
+                    else ((0.25, 0.5) if frozen_ou_run else SL_FRACTIONS)
+                )
+                stops = (
+                    tuple(grid_restriction["time_stops_minutes"])
+                    if grid_restriction
+                    else ((60, 120) if frozen_ou_run else TIME_STOPS_MINUTES)
+                )
+                for tp in tps:
+                    for sl in sls:
+                        for stop in stops:
                             key = (*base, tp, sl, stop)
                             agg = groups[key]
                             agg.candidate_ids.add(event.candidate_event_id)
