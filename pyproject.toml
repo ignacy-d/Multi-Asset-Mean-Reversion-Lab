@@ -32,6 +32,7 @@ mr-lab-bollinger-incremental = "mr_lab.bollinger_incremental:main"
 mr-lab-ou-diagnostics = "mr_lab.ornstein_uhlenbeck_runner:main"
 mr-lab-ou-monte-carlo = "mr_lab.ou_monte_carlo_runner:main"
 mr-lab-freeze-study = "mr_lab.spec_lock:main"
+mr-lab-pca-stage0-2024 = "mr_lab.pca_stage0_runner:main"
 
 [dependency-groups]
 dev = [
