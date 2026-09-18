@@ -8,7 +8,8 @@ reinterpret that historical result.
 The only methodological change from `frozen-ou-crossasset-v1` is direction
 scope: both LONG and SHORT candidates are evaluated. The process remains listed
 price residual `p0 - e0` (not log price and not reciprocal/inversion invariant),
-M15 London VWAP/canonical-M1 VWAP, lookbacks 20/40, `|z| >= 2`, 128 valid OU
+M15 London VWAP/canonical-M1 VWAP, lookbacks 20/40, strict signal boundaries
+(`z < -2` for LONG and `z > +2` for SHORT; equality does not signal), 128 valid OU
 transitions, strict directional score `> 1.5`, half-life `<= 120` minutes,
 immediate entry, TP 0.75/1.0, SL 0.25/0.5, and 60/120 minute stops. Stage 4C's
 existing authenticated transform is reused without a new cost formula. The old
@@ -32,7 +33,7 @@ timing estimate is claimed before the external run.
 ```bash
 cd ~/projects/Multi-Asset-Mean-Reversion-Lab
 git fetch origin
-git switch codex/ou-bidirectional-audit-v1
+git switch codex/create-bidirectional-ou-implementation
 git pull --ff-only
 mkdir -p results/ou-bidirectional-2024-v1
 nohup bash scripts/run_ou_bidirectional_2024_v1.sh \

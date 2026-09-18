@@ -115,10 +115,54 @@ GROUP_FIELDS = (
     "sl_extension_fraction",
     "time_stop_minutes",
 )
+GRID_RESTRICTION_DOMAINS = {
+    "signal_timeframes": frozenset(str(value) for value in FROZEN_TIMEFRAMES),
+    "sessions": frozenset((None, "asia", "london", "new_york")),
+    "benchmark_families": frozenset(("vwap", "vwap-canonical-m1", "bollinger")),
+    "lookbacks": frozenset(LOOKBACKS),
+    "directions": frozenset(("LONG", "SHORT")),
+    "entry_modes": frozenset(ENTRY_MODES),
+    "tp_fractions": frozenset(TP_FRACTIONS),
+    "sl_fractions": frozenset(SL_FRACTIONS),
+    "time_stops_minutes": frozenset(TIME_STOPS_MINUTES),
+}
+GRID_RESTRICTION_KEYS = frozenset((*GRID_RESTRICTION_DOMAINS, "signal_threshold"))
 
 
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def validate_grid_restriction(restriction):
+    """Fail closed unless every requested cell belongs to frozen Stage 4B."""
+    if not isinstance(restriction, dict):
+        raise ValueError("grid_restriction must be a mapping")
+    if set(restriction) != GRID_RESTRICTION_KEYS:
+        raise ValueError("grid_restriction must contain exactly the frozen grid keys")
+    if restriction["signal_threshold"] != SIGNAL_THRESHOLD:
+        raise ValueError("grid_restriction cannot change the signal threshold")
+    normalized = {"signal_threshold": SIGNAL_THRESHOLD}
+    for key, domain in GRID_RESTRICTION_DOMAINS.items():
+        values = restriction[key]
+        if isinstance(values, str) or not isinstance(values, list | tuple):
+            raise ValueError(f"grid_restriction {key} must be a sequence")
+        if not values:
+            raise ValueError(f"grid_restriction {key} cannot be empty")
+        try:
+            unique_count = len(set(values))
+        except TypeError as error:
+            raise ValueError(
+                f"grid_restriction {key} contains an unhashable value"
+            ) from error
+        if len(values) != unique_count:
+            raise ValueError(f"grid_restriction {key} cannot contain duplicates")
+        if not all(
+            any(type(value) is type(allowed) and value == allowed for allowed in domain)
+            for value in values
+        ):
+            raise ValueError(f"grid_restriction {key} is outside frozen Stage 4B")
+        normalized[key] = tuple(values)
+    return normalized
 
 
 def _write_trade_row(stream, row, *, persist=True):
@@ -515,6 +559,8 @@ def run(
     The bidirectional replay passes a fully enumerated mapping which is recorded
     by its own study identity.
     """
+    if grid_restriction is not None:
+        grid_restriction = validate_grid_restriction(grid_restriction)
     registry = _load_stage4b_registry(Path(registry_path))
     registry_entry = registry["instruments"].get(instrument)
     if registry["registry_schema_version"] == FX_UNIVERSE_REGISTRY_SCHEMA:
