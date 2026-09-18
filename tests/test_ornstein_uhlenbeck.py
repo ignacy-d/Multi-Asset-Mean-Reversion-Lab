@@ -256,7 +256,14 @@ def frozen_event(direction=Direction.SHORT, **changes):
     return deduplicate_states((state,))[0]
 
 
-def filter_state(event, *, score=1.5001, half_life=120.0, status="valid"):
+def filter_state(
+    event,
+    *,
+    score=1.5001,
+    half_life=120.0,
+    status="valid",
+    spec_name="frozen-ou-crossasset-v1",
+):
     observation = residual_observations(
         (
             SignalState(
@@ -277,7 +284,7 @@ def filter_state(event, *, score=1.5001, half_life=120.0, status="valid"):
             ),
         )
     )[0]
-    spec = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    spec = frozen_ou_eligibility_spec(spec_name)
     return OrnsteinUhlenbeckProcessState(
         observation.process_id,
         spec.process_spec.process_spec_id,
@@ -330,6 +337,57 @@ def test_frozen_filter_identity_is_deterministic_and_bound_to_process_spec():
     )
     assert gate.filter_spec_id == duplicate.filter_spec_id == expected
     assert control.filter_spec_id != gate.filter_spec_id
+
+
+def test_historical_frozen_ou_exact_identity_regression():
+    gate = frozen_ou_eligibility_spec("frozen-ou-crossasset-v1")
+    assert gate.process_spec.process_spec_id == (
+        "sha256:08971f5792993cc5a5438c683c2597d7496292a3d6bf0faeababeb588904f58d"
+    )
+    assert gate.filter_spec_id == (
+        "sha256:0d061cc590454c56f3dca0d69cf79b05d3c0d53c23676a5657f9562da5fb6b36"
+    )
+
+
+@pytest.mark.parametrize(
+    ("direction", "score", "half_life", "eligible"),
+    [
+        (Direction.SHORT, 2.0, 120.0, True),
+        (Direction.LONG, 2.0, 120.0, False),
+        (Direction.LONG, -2.0, 120.0, True),
+        (Direction.SHORT, -2.0, 120.0, False),
+        (Direction.SHORT, 1.5, 120.0, False),
+        (Direction.LONG, -1.5, 120.0, False),
+        (Direction.SHORT, 1.5000001, 120.0, True),
+        (Direction.LONG, -1.5000001, 120.0, True),
+        (Direction.SHORT, 2.0, 120.0001, False),
+        (Direction.LONG, -2.0, 120.0001, False),
+    ],
+)
+def test_bidirectional_score_sign_and_boundaries(direction, score, half_life, eligible):
+    event = frozen_event(direction)
+    spec = frozen_ou_eligibility_spec("frozen-ou-bidirectional-v1")
+    state = filter_state(
+        event,
+        score=score,
+        half_life=half_life,
+        spec_name="frozen-ou-bidirectional-v1",
+    )
+    assert (
+        FrozenOuEligibilityFilter(spec, (state,)).evaluate(event).eligible is eligible
+    )
+
+
+def test_bidirectional_process_is_shared_but_directional_score_flips():
+    long = frozen_event(Direction.LONG)
+    short = frozen_event(Direction.SHORT)
+    assert filter_state(long).process_id == filter_state(short).process_id
+    spec = frozen_ou_eligibility_spec("frozen-ou-bidirectional-v1")
+    state = filter_state(short, score=2.0, spec_name="frozen-ou-bidirectional-v1")
+    long_decision = FrozenOuEligibilityFilter(spec, (state,)).evaluate(long)
+    short_decision = FrozenOuEligibilityFilter(spec, (state,)).evaluate(short)
+    assert dict(long_decision.metadata)["directional_ou_score"] == "-2.0"
+    assert dict(short_decision.metadata)["directional_ou_score"] == "2.0"
 
 
 def test_frozen_ou_direction_scope_exact_time_and_fail_closed():
