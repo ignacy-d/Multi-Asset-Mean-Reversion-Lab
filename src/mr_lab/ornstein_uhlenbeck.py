@@ -20,6 +20,7 @@ ESTIMATOR_VERSION = "ols-ar1-with-intercept-v1"
 FROZEN_OU_FILTER_CHOICES = (
     "frozen-ou-crossasset-v1",
     "frozen-ou-score-only-control-v1",
+    "frozen-ou-bidirectional-v1",
 )
 
 
@@ -135,6 +136,7 @@ class FrozenOuEligibilitySpec:
         expected_cap = {
             "frozen-ou-crossasset-v1": 120.0,
             "frozen-ou-score-only-control-v1": None,
+            "frozen-ou-bidirectional-v1": 120.0,
         }
         if (
             self.name not in expected_cap
@@ -148,7 +150,8 @@ class FrozenOuEligibilitySpec:
             and self.score_threshold == 1.5
             and self.timeframe == "15m"
             and self.session == "london"
-            and self.direction == "SHORT"
+            and self.direction
+            == ("BOTH" if self.name == "frozen-ou-bidirectional-v1" else "SHORT")
             and self.benchmark_families == ("vwap", "vwap-canonical-m1")
             and self.lookbacks == (20, 40)
             and self.specification_version == "frozen-ou-crossasset-eligibility-v1"
@@ -178,6 +181,8 @@ def frozen_ou_eligibility_spec(name):
         return FrozenOuEligibilitySpec(name)
     if name == "frozen-ou-score-only-control-v1":
         return FrozenOuEligibilitySpec(name, half_life_cap_minutes=None)
+    if name == "frozen-ou-bidirectional-v1":
+        return FrozenOuEligibilitySpec(name, direction="BOTH")
     raise OrnsteinUhlenbeckError("unknown frozen OU eligibility filter")
 
 
@@ -204,7 +209,10 @@ class FrozenOuEligibilityFilter:
         in_scope = (
             str(signal.signal_timeframe) == self.spec.timeframe
             and signal.session == self.spec.session
-            and signal.direction.name == self.spec.direction
+            and (
+                self.spec.direction == "BOTH"
+                or signal.direction.name == self.spec.direction
+            )
             and signal.benchmark_family in self.spec.benchmark_families
             and signal.lookback in self.spec.lookbacks
         )
