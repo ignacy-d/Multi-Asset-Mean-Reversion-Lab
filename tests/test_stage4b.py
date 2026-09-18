@@ -184,6 +184,56 @@ def test_tp_sl_and_ambiguity_first_exit():
     assert sl.mae_price_certain == pytest.approx(0.005)
 
 
+@pytest.mark.parametrize(
+    ("direction", "favorable_bar", "adverse_bar", "tp_price", "sl_price"),
+    [
+        (
+            Direction.LONG,
+            bar(1, h=1.006, c=1.006),
+            bar(1, low=0.994, c=0.994),
+            1.005,
+            0.995,
+        ),
+        (
+            Direction.SHORT,
+            bar(1, low=0.994, c=0.994),
+            bar(1, h=1.006, c=1.006),
+            0.995,
+            1.005,
+        ),
+    ],
+)
+def test_long_short_real_execution_pnl_sign_and_barrier_placement(
+    direction, favorable_bar, adverse_bar, tp_price, sl_price
+):
+    candidate = deduplicate_states(
+        (state(0, -2.1 if direction is Direction.LONG else 2.1, direction=direction),)
+    )[0]
+    entry = construct_entry(candidate, M1Index(()), "immediate")
+    favorable = simulate_exit(
+        candidate,
+        entry,
+        (favorable_bar,),
+        tp_fraction=0.5,
+        sl_fraction=0.5,
+        time_stop_minutes=30,
+    )
+    adverse = simulate_exit(
+        candidate,
+        entry,
+        (adverse_bar,),
+        tp_fraction=0.5,
+        sl_fraction=0.5,
+        time_stop_minutes=30,
+    )
+    assert favorable.exit_reason == "tp"
+    assert favorable.exit_price_adverse_first == pytest.approx(tp_price)
+    assert favorable.gross_return_pips_adverse_first > 0
+    assert adverse.exit_reason == "sl"
+    assert adverse.exit_price_adverse_first == pytest.approx(sl_price)
+    assert adverse.gross_return_pips_adverse_first < 0
+
+
 def test_time_stop_exact_close_and_missing_is_incomplete():
     e = event()
     entry = construct_entry(e, M1Index(()), "immediate")

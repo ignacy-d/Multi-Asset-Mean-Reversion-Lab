@@ -21,7 +21,55 @@ from mr_lab.stage4b_runner import (
     _quantile,
     partition_candidate_groups,
     stable_group_key,
+    validate_grid_restriction,
 )
+
+VALID_RESTRICTION = {
+    "signal_timeframes": ("15m",),
+    "sessions": ("london",),
+    "benchmark_families": ("vwap", "vwap-canonical-m1"),
+    "lookbacks": (20, 40),
+    "signal_threshold": 2.0,
+    "directions": ("LONG", "SHORT"),
+    "entry_modes": ("immediate",),
+    "tp_fractions": (0.75, 1.0),
+    "sl_fractions": (0.25, 0.5),
+    "time_stops_minutes": (60, 120),
+}
+
+
+def test_grid_restriction_accepts_only_nonempty_frozen_subsets():
+    assert validate_grid_restriction(VALID_RESTRICTION) == VALID_RESTRICTION
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("signal_timeframes", ("2m",)),
+        ("sessions", ("weekend",)),
+        ("benchmark_families", ("future-alpha",)),
+        ("lookbacks", (19,)),
+        ("directions", ("BOTH",)),
+        ("entry_modes", ("future-entry",)),
+        ("tp_fractions", (1.25,)),
+        ("sl_fractions", (0.75,)),
+        ("time_stops_minutes", (90,)),
+        ("signal_threshold", 1.5),
+        ("directions", ()),
+    ],
+)
+def test_grid_restriction_rejects_nonfrozen_or_empty_values(key, value):
+    with pytest.raises(ValueError, match="grid_restriction"):
+        validate_grid_restriction(VALID_RESTRICTION | {key: value})
+
+
+def test_grid_restriction_rejects_unknown_or_missing_keys():
+    with pytest.raises(ValueError, match="exactly"):
+        validate_grid_restriction(VALID_RESTRICTION | {"surprise": (1,)})
+    incomplete = dict(VALID_RESTRICTION)
+    del incomplete["tp_fractions"]
+    with pytest.raises(ValueError, match="exactly"):
+        validate_grid_restriction(incomplete)
 
 
 def test_gbpusd_promoted_entry_is_accepted():

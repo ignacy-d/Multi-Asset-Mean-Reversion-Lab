@@ -247,6 +247,28 @@ def test_warmup_and_strict_signal_boundaries() -> None:
     assert signal_direction(feature, 1.5) is None
 
 
+def test_frozen_stage4b_threshold_two_is_strict() -> None:
+    start = datetime(2024, 1, 2, 8, tzinfo=UTC)
+    bars = tuple(
+        bar(start + timedelta(minutes=5 * i), close=value)
+        for i, value in enumerate((100, 101, 99))
+    )
+    feature = [
+        item
+        for item in build_vwap_features(observations(*bars), DEFAULT_SESSION_SPEC, 2)
+        if item.anchor_session == "london"
+    ][-1]
+    for value, expected in (
+        (2.0, None),
+        (-2.0, None),
+        (2.000001, "SHORT"),
+        (-2.000001, "LONG"),
+    ):
+        object.__setattr__(feature, "vwap_deviation_z", value)
+        direction = signal_direction(feature, 2.0)
+        assert (None if direction is None else direction.name) == expected
+
+
 def test_strategy_identity_is_canonical_sensitive_and_separate() -> None:
     first = VwapStrategySpec(20, 1.5)
     same = VwapStrategySpec(deviation_threshold=1.5, volatility_lookback=20)
