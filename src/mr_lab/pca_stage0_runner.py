@@ -12,7 +12,7 @@ import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from math import isfinite, log
 from pathlib import Path
@@ -26,6 +26,7 @@ from mr_lab.pca_residual import (
     SynchronizedClosePanel,
 )
 from mr_lab.providers.dukascopy_range import load_offline_corpus
+from mr_lab.providers.fx_universe_2024 import FxUniverseError, validate_registry
 
 REGISTRY = Path("configs/fx-universe-2024-registry-v1.json")
 INSTRUMENTS = (
@@ -39,13 +40,19 @@ INSTRUMENTS = (
     "NZDUSD",
     "EURGBP",
 )
-REGISTRY_SCHEMA = "fx-universe-2024-registry-v1"
 ACTIVITY_POLICY = "zero-activity-and-flat-ohlc-padding-v1"
-PROCESS_ID = "RV-PCA-SHOCK-1/2024-Stage0;W=1024;ddof=1;K=2;RW=256;shock=2;rearm=1"
 BLOCKER = "BLOCKED_MISSING_FROZEN_ATR_NORMALIZATION_DEFINITION"
 HORIZONS = (5, 15, 30, 60)
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 20240918
+FROZEN_PCA_CONFIG = PCAResidualConfig(
+    pca_training_window=1024,
+    components=2,
+    residual_normalization_window=256,
+    shock_threshold=2.0,
+    rearm_threshold=1.0,
+    variance_epsilon=1e-12,
+)
 
 
 class Stage0Error(ValueError):
@@ -58,11 +65,36 @@ class PanelBuild:
     counts: Mapping[str, Mapping[str, int]]
     identity: str
     bars: Mapping[str, Mapping[datetime, Bar]]
+    open_bars: Mapping[str, Mapping[datetime, Bar]]
 
 
 def _sha(value: object) -> str:
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _config_identity(config: PCAResidualConfig) -> dict[str, object]:
+    return {
+        "pca_training_window": config.pca_training_window,
+        "components": config.components,
+        "residual_normalization_window": config.residual_normalization_window,
+        "shock_threshold": config.shock_threshold,
+        "rearm_threshold": config.rearm_threshold,
+        "variance_epsilon": config.variance_epsilon,
+    }
+
+
+STUDY_SPEC = {
+    "study_version": "RV-PCA-SHOCK-1/2024-Stage0-v2",
+    "pca_config": _config_identity(FROZEN_PCA_CONFIG),
+    "standardization": "strictly-prior-window-ddof-1",
+    "residual_normalization": "strictly-prior-window-ddof-1",
+    "return_definition": "adjacent-active-M1-log-close-return",
+    "synchronization": "exact-nine-way-valid-return-timestamp-intersection",
+    "activity_policy": ACTIVITY_POLICY,
+    "instruments": INSTRUMENTS,
+}
+PROCESS_ID = _sha(STUDY_SPEC)
 
 
 def load_registry(path: Path = REGISTRY) -> dict[str, object]:
@@ -73,39 +105,12 @@ def load_registry(path: Path = REGISTRY) -> dict[str, object]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise Stage0Error("invalid or missing explicit 2024 registry") from exc
-    entries = value.get("instruments") if isinstance(value, dict) else None
-    if (
-        value.get("registry_schema_version") != REGISTRY_SCHEMA
-        or value.get("requested_start_date") != "2024-01-01"
-        or value.get("requested_end_date") != "2024-12-31"
-        or not isinstance(entries, dict)
-        or set(entries) != set(INSTRUMENTS)
-    ):
-        raise Stage0Error("registry contract mismatch")
-    for name in INSTRUMENTS:
-        entry = entries[name]
-        if (
-            not isinstance(entry, dict)
-            or entry.get("instrument") != name
-            or entry.get("verification_status") != "verified"
-        ):
-            raise Stage0Error(f"malformed registry entry: {name}")
-        if any(
-            entry.get(k) in (None, "")
-            for k in (
-                "corpus_path",
-                "corpus_id",
-                "assembled_dataset_id",
-                "manifest_sha256",
-            )
-        ):
-            raise Stage0Error(f"incomplete corpus identity: {name}")
-        if (entry.get("requested_start_date"), entry.get("requested_end_date")) != (
-            "2024-01-01",
-            "2024-12-31",
-        ):
-            raise Stage0Error("only the exact 2024 range is authorized")
-    return value
+    if not isinstance(value, dict):
+        raise Stage0Error("registry must be a JSON object")
+    try:
+        return validate_registry(value)
+    except FxUniverseError as exc:
+        raise Stage0Error("registry contract mismatch") from exc
 
 
 def authenticate_corpus(entry: Mapping[str, object]) -> Path:
@@ -136,19 +141,37 @@ def is_padding(bar: Bar) -> bool:
 
 
 def build_panel(
-    series: Mapping[str, Sequence[Bar]], dataset_ids: Mapping[str, str]
+    series: Mapping[str, Sequence[Bar]],
+    dataset_ids: Mapping[str, str],
+    *,
+    registry_identity: str = "unregistered-test-input",
 ) -> PanelBuild:
     """Create the exact nine-way intersection of valid, contiguous M1 returns."""
     if set(series) != set(INSTRUMENTS) or set(dataset_ids) != set(INSTRUMENTS):
         raise Stage0Error("all and only nine instruments are required")
     valid: dict[str, dict[datetime, tuple[float, Bar]]] = {}
     indexed: dict[str, dict[datetime, Bar]] = {}
+    open_indexed: dict[str, dict[datetime, Bar]] = {}
     counts: dict[str, dict[str, int]] = {}
     for name in INSTRUMENTS:
         bars = tuple(series[name])
+        for bar in bars:
+            if (
+                bar.instrument != name
+                or bar.timeframe.value != "1m"
+                or bar.open_time.tzinfo is None
+                or bar.open_time.utcoffset() != UTC.utcoffset(None)
+                or bar.close_time.tzinfo is None
+                or bar.close_time.utcoffset() != UTC.utcoffset(None)
+                or bar.close_time != bar.open_time + timedelta(minutes=1)
+            ):
+                raise Stage0Error(f"invalid bar identity/timeframe: {name}")
+        if any(right.close_time <= left.close_time for left, right in pairwise(bars)):
+            raise Stage0Error(f"bar timestamps must be strictly increasing: {name}")
         indexed[name] = {b.close_time: b for b in bars}
-        if len(indexed[name]) != len(bars) or any(b.instrument != name for b in bars):
-            raise Stage0Error(f"invalid bar identity/order: {name}")
+        open_indexed[name] = {b.open_time: b for b in bars}
+        if len(indexed[name]) != len(bars) or len(open_indexed[name]) != len(bars):
+            raise Stage0Error(f"duplicate bar timestamp: {name}")
         padding = sum(is_padding(b) for b in bars)
         returns: dict[datetime, tuple[float, Bar]] = {}
         for previous, current in pairwise(bars):
@@ -180,12 +203,12 @@ def build_panel(
     panel = SynchronizedClosePanel((first, *common), INSTRUMENTS, closes)
     identity = _sha(
         {
+            "registry": registry_identity,
             "datasets": dict(dataset_ids),
-            "timestamps": [x.isoformat() for x in common],
             "policy": ACTIVITY_POLICY,
         }
     )
-    return PanelBuild(panel, counts, identity, indexed)
+    return PanelBuild(panel, counts, identity, indexed, open_indexed)
 
 
 def event_id(timestamp: datetime, instrument: str, panel_identity: str) -> str:
@@ -199,48 +222,90 @@ def event_id(timestamp: datetime, instrument: str, panel_identity: str) -> str:
     )
 
 
+def panel_identity_at(built: PanelBuild, timestamp: datetime | None = None) -> str:
+    """Identify the synchronized panel prefix available at ``timestamp``."""
+    stamps = built.panel.timestamps[1:]
+    if timestamp is not None:
+        stamps = tuple(stamp for stamp in stamps if stamp <= timestamp)
+    return _sha(
+        {
+            "source_identity": built.identity,
+            "synchronized_timestamps": [stamp.isoformat() for stamp in stamps],
+            "activity_policy": ACTIVITY_POLICY,
+        }
+    )
+
+
 def event_outcomes(built: PanelBuild) -> list[dict[str, object]]:
-    observations = PCAResidualEngine(PCAResidualConfig()).run(built.panel)
+    observations = PCAResidualEngine(FROZEN_PCA_CONFIG).run(built.panel)
     events = []
     for row in observations:
         if not row.event_emitted:
             continue
         bars = built.bars[row.instrument]
+        open_bars = built.open_bars[row.instrument]
         entry_time = row.timestamp + timedelta(minutes=1)
-        entry = bars.get(entry_time)
+        entry = open_bars.get(entry_time)
         exits = {h: bars.get(row.timestamp + timedelta(minutes=h)) for h in HORIZONS}
-        if entry is None or any(x is None for x in exits.values()):
-            continue
-        assert all(x is not None for x in exits.values())
+        entry_reason = _price_incomplete_reason(entry, "open")
+        entry_complete = entry_reason is None
+        causal_panel_identity = panel_identity_at(built, row.timestamp)
         record: dict[str, object] = {
-            "event_id": event_id(row.timestamp, row.instrument, built.identity),
+            "event_id": event_id(row.timestamp, row.instrument, causal_panel_identity),
             "timestamp": row.timestamp.isoformat(),
             "instrument": row.instrument,
             "residual": row.residual,
             "residual_z": row.residual_zscore,
             "shock_sign": int(row.residual_shock_sign),
             "fade_direction": int(row.fade_direction),
-            "entry_timestamp": entry_time.isoformat(),
-            "entry_price": entry.open,
+            "entry_target_timestamp": entry_time.isoformat(),
+            "entry_complete": entry_complete,
+            "entry_incomplete_reason": entry_reason,
+            "entry_timestamp": entry_time.isoformat() if entry_complete else None,
+            "entry_price": entry.open if entry_complete and entry is not None else None,
             "process_identity": PROCESS_ID,
-            "panel_identity": built.identity,
-            "pca_window": 1024,
-            "residual_window": 256,
+            "panel_identity": causal_panel_identity,
+            "pca_config": _config_identity(FROZEN_PCA_CONFIG),
             "activity_policy": ACTIVITY_POLICY,
         }
         for h, bar in exits.items():
-            assert bar is not None
-            signed = int(row.fade_direction) * log(bar.close / entry.open)
+            exit_reason = _price_incomplete_reason(bar, "close")
+            reason = "entry_incomplete" if not entry_complete else exit_reason
+            complete = reason is None
+            signed = (
+                int(row.fade_direction) * log(bar.close / entry.open)
+                if complete and bar is not None and entry is not None
+                else None
+            )
             record.update(
                 {
-                    f"h{h}_exit_timestamp": bar.close_time.isoformat(),
-                    f"h{h}_exit_price": bar.close,
+                    f"h{h}_complete": complete,
+                    f"h{h}_incomplete_reason": reason,
+                    f"h{h}_exit_timestamp": bar.close_time.isoformat()
+                    if complete and bar is not None
+                    else None,
+                    f"h{h}_exit_price": bar.close
+                    if complete and bar is not None
+                    else None,
                     f"h{h}_signed_raw_return": signed,
-                    f"h{h}_signed_bps_return": signed * 10_000,
+                    f"h{h}_signed_bps_return": signed * 10_000
+                    if signed is not None
+                    else None,
                 }
             )
         events.append(record)
     return events
+
+
+def _price_incomplete_reason(bar: Bar | None, field: str) -> str | None:
+    if bar is None:
+        return "missing_bar"
+    if is_padding(bar):
+        return "provider_padding"
+    price = getattr(bar, field)
+    if not isfinite(price) or price <= 0:
+        return f"invalid_{field}_price"
+    return None
 
 
 def _number(value: object, field: str) -> float:
@@ -281,16 +346,17 @@ def concentration(events: Sequence[Mapping[str, object]]) -> tuple[float, float,
         + str((int(str(x["timestamp"])[5:7]) - 1) // 3 + 1)
         for x in events
     )
+    complete = [x for x in events if x.get("h15_complete", True)]
     positive = sum(
         np.mean(
             [
                 _number(x["h15_signed_bps_return"], "h15_signed_bps_return")
-                for x in events
+                for x in complete
                 if x["instrument"] == name
             ]
         )
         > 0
-        for name in instruments
+        for name in {str(x["instrument"]) for x in complete}
     )
     return (
         max(instruments.values()) / len(events),
@@ -303,6 +369,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
+    artifact_paths = (
+        args.output_dir / "events.jsonl",
+        args.output_dir / "summary.json",
+    )
+    if any(path.exists() for path in artifact_paths):
+        raise Stage0Error("refusing to overwrite existing Stage0 empirical artifacts")
     registry = load_registry()
     entries = registry["instruments"]
     assert isinstance(entries, dict)
@@ -312,6 +384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     built = build_panel(
         {n: datasets[n].bars for n in INSTRUMENTS},
         {n: str(entries[n]["assembled_dataset_id"]) for n in INSTRUMENTS},
+        registry_identity=str(registry["registry_id"]),
     )
     events = event_outcomes(built)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -320,10 +393,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     inst_conc, quarter_conc, positive = concentration(events)
     summary = {
-        "event_count": len(events),
+        "emitted_event_count": len(events),
+        "executable_entry_count": sum(bool(x["entry_complete"]) for x in events),
+        "complete_h15_outcome_count": sum(bool(x["h15_complete"]) for x in events),
         "activity_counts": built.counts,
         "process_identity": PROCESS_ID,
-        "panel_identity": built.identity,
+        "panel_identity": panel_identity_at(built),
         "activity_policy": ACTIVITY_POLICY,
         "primary_decision": BLOCKER,
         "bootstrap_seed": BOOTSTRAP_SEED,
