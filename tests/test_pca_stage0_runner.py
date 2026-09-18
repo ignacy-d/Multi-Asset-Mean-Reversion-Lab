@@ -237,14 +237,14 @@ def test_events_survive_missing_execution_and_independent_outcomes(monkeypatch):
     assert baseline["entry_complete"] and baseline["h15_complete"]
 
     missing_entry = long_panel_series()
-    missing_entry["EURUSD"].pop(11)
+    missing_entry["EURUSD"].pop(10)
     event = _outcomes(monkeypatch, missing_entry, stamp)[0]
     assert not event["entry_complete"]
     assert event["entry_incomplete_reason"] == "missing_bar"
     assert all(not event[f"h{h}_complete"] for h in stage0.HORIZONS)
 
     padding_entry = long_panel_series()
-    padding_entry["EURUSD"][11] = bar("EURUSD", 11, 101, volume=0)
+    padding_entry["EURUSD"][10] = bar("EURUSD", 10, 101, volume=0)
     event = _outcomes(monkeypatch, padding_entry, stamp)[0]
     assert not event["entry_complete"]
     assert event["entry_incomplete_reason"] == "provider_padding"
@@ -258,6 +258,50 @@ def test_events_survive_missing_execution_and_independent_outcomes(monkeypatch):
         event = _outcomes(monkeypatch, changed, stamp)[0]
         assert not event["h15_complete"]
         assert event["h5_complete"]
+
+
+def test_entry_uses_next_bar_open_at_completed_return_timestamp(monkeypatch):
+    base = datetime(2024, 1, 2, 10, tzinfo=UTC)
+    series = {}
+    for j, name in enumerate(INSTRUMENTS):
+        bars = []
+        for minute in range(80):
+            start = base + timedelta(minutes=minute)
+            price = 100 + j + minute / 100
+            bars.append(
+                Bar(
+                    name,
+                    Timeframe("1m"),
+                    start,
+                    start + timedelta(minutes=1),
+                    start + timedelta(minutes=1),
+                    price,
+                    price + 0.01,
+                    price - 0.01,
+                    price,
+                    PriceBasis.BID,
+                    1.0,
+                    VolumeSemantics.QUOTE_ACTIVITY,
+                )
+            )
+        series[name] = bars
+
+    row_timestamp = base + timedelta(minutes=15)
+    completed_bar = series["EURUSD"][14]
+    entry_bar = series["EURUSD"][15]
+    assert completed_bar.open_time == base + timedelta(minutes=14)
+    assert completed_bar.close_time == row_timestamp
+    assert entry_bar.open_time == row_timestamp
+    assert entry_bar.close_time == base + timedelta(minutes=16)
+
+    event = _outcomes(monkeypatch, series, row_timestamp)[0]
+    assert event["entry_target_timestamp"] == row_timestamp.isoformat()
+    assert event["entry_timestamp"] == row_timestamp.isoformat()
+    assert event["entry_price"] == entry_bar.open
+    for horizon in stage0.HORIZONS:
+        assert event[f"h{horizon}_exit_timestamp"] == (
+            row_timestamp + timedelta(minutes=horizon)
+        ).isoformat()
 
 
 def test_future_h60_absence_changes_only_h60_completeness(monkeypatch):

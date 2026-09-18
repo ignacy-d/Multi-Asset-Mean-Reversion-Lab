@@ -244,7 +244,11 @@ def event_outcomes(built: PanelBuild) -> list[dict[str, object]]:
             continue
         bars = built.bars[row.instrument]
         open_bars = built.open_bars[row.instrument]
-        entry_time = row.timestamp + timedelta(minutes=1)
+        # The completed return stamped at ``row.timestamp`` is known when the
+        # following M1 bar opens.  That bar's open time is numerically equal to
+        # the completed bar's close time, so this is Open[t+1] in bar-index
+        # semantics rather than same-bar execution.
+        entry_time = row.timestamp
         entry = open_bars.get(entry_time)
         exits = {h: bars.get(row.timestamp + timedelta(minutes=h)) for h in HORIZONS}
         entry_reason = _price_incomplete_reason(entry, "open")
