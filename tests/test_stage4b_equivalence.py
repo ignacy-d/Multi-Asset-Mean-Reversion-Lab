@@ -11,6 +11,7 @@ from pathlib import Path
 
 import mr_lab.stage4b_runner as stage4b_runner
 from mr_lab.ornstein_uhlenbeck import residual_observations
+from mr_lab.ou_bidirectional_runner import StreamingMetrics
 from mr_lab.providers.dukascopy_multiday import DailyPayload
 from mr_lab.providers.dukascopy_range import build_corpus_manifest
 from mr_lab.stage4b import ENTRY_MODES, SL_FRACTIONS, TIME_STOPS_MINUTES, TP_FRACTIONS
@@ -339,3 +340,137 @@ def test_filtered_runner_internal_state_slice_and_shard_reducer_parity(
         assert _canonical_rows(_csv_rows(reduced / name)) == _canonical_rows(
             _csv_rows(unsharded / name)
         )
+
+
+def test_restricted_short_rows_exactly_equal_postfiltered_unrestricted_rows(
+    tmp_path, monkeypatch
+):
+    """Audit restriction after global construction/dedup for baseline and old OU."""
+    corpus, registry = _write_offline_fixture(tmp_path)
+    original_builder = stage4b_runner.build_candidate_ou_states
+    original_assemble = stage4b_runner.assemble_signal_states
+
+    def with_short_candidates(dataset, manifest):
+        states = list(original_assemble(dataset, manifest))
+        for index, state in enumerate(states):
+            if (
+                str(state.signal_timeframe) == "15m"
+                and state.session == "london"
+                and state.direction.name == "SHORT"
+                and state.benchmark_family in {"vwap", "vwap-canonical-m1"}
+                and state.lookback in {20, 40}
+                and state.p0 > state.e0
+            ):
+                states[index] = replace(state, z=2.1, qualifying=True)
+        return tuple(states)
+
+    def valid_short_ou(signal_states, process_spec, required):
+        states = original_builder(signal_states, process_spec, required)
+        return tuple(
+            replace(
+                state,
+                status="valid",
+                invalid_reason=None,
+                half_life_minutes=120.0,
+                ornstein_uhlenbeck_score=2.0,
+            )
+            for state in states
+        )
+
+    monkeypatch.setattr(stage4b_runner, "assemble_signal_states", with_short_candidates)
+    monkeypatch.setattr(stage4b_runner, "build_candidate_ou_states", valid_short_ou)
+    restriction = {
+        "signal_timeframes": ("15m",),
+        "sessions": ("london",),
+        "benchmark_families": ("vwap", "vwap-canonical-m1"),
+        "lookbacks": (20, 40),
+        "signal_threshold": 2.0,
+        "directions": ("SHORT",),
+        "entry_modes": ("immediate",),
+        "tp_fractions": (0.75, 1.0),
+        "sl_fractions": (0.25, 0.5),
+        "time_stops_minutes": (60, 120),
+    }
+
+    def candidate_in_scope(row):
+        signal = row["signal"]
+        return (
+            signal["signal_timeframe"] == "15m"
+            and signal["session"] == "london"
+            and signal["benchmark_family"] in restriction["benchmark_families"]
+            and signal["lookback"] in restriction["lookbacks"]
+            and signal["direction"] == "SHORT"
+        )
+
+    def trade_in_scope(row):
+        return (
+            row["signal_timeframe"] == "15m"
+            and row["session"] == "london"
+            and row["benchmark_family"] in restriction["benchmark_families"]
+            and row["lookback"] in restriction["lookbacks"]
+            and row["direction"] == "SHORT"
+            and row["entry_mode"] == "immediate"
+            and row["tp_target_fraction"] in restriction["tp_fractions"]
+            and row["sl_extension_fraction"] in restriction["sl_fractions"]
+            and row["time_stop_minutes"] in restriction["time_stops_minutes"]
+        )
+
+    for label, filter_name in (
+        ("baseline", None),
+        ("old-short-ou", "frozen-ou-crossasset-v1"),
+    ):
+        full = tmp_path / f"{label}-full"
+        narrow = tmp_path / f"{label}-narrow"
+        run(corpus, full, "EURUSD", registry, eligibility_filter=filter_name)
+        run(
+            corpus,
+            narrow,
+            "EURUSD",
+            registry,
+            eligibility_filter=filter_name,
+            grid_restriction=restriction,
+        )
+        expected_candidates = [
+            row
+            for row in _jsonl(full / "candidate-events.jsonl")
+            if candidate_in_scope(row)
+        ]
+        actual_candidates = _jsonl(narrow / "candidate-events.jsonl")
+        assert [row["candidate_event_id"] for row in actual_candidates] == [
+            row["candidate_event_id"] for row in expected_candidates
+        ]
+        assert actual_candidates == expected_candidates
+
+        expected_trades = [
+            row for row in _jsonl(full / "trades.jsonl") if trade_in_scope(row)
+        ]
+        actual_trades = _jsonl(narrow / "trades.jsonl")
+        assert actual_trades == expected_trades
+        fields = (
+            "candidate_event_id",
+            "benchmark_family",
+            "signal_timeframe",
+            "session",
+            "direction",
+            "lookback",
+            "entry_mode",
+            "tp_target_fraction",
+            "sl_extension_fraction",
+            "time_stop_minutes",
+            "complete",
+            "gross_return_pips_adverse_first",
+            "mfe_pips_certain",
+            "mae_pips_certain",
+            "exit_reason",
+        )
+        assert [tuple(row[field] for field in fields) for row in actual_trades] == [
+            tuple(row[field] for field in fields) for row in expected_trades
+        ]
+        expected_metrics = StreamingMetrics()
+        actual_metrics = StreamingMetrics()
+        for row in expected_trades:
+            expected_metrics.add(row)
+        for row in actual_trades:
+            actual_metrics.add(row)
+        assert actual_metrics.result() == expected_metrics.result()
+        assert len(actual_trades) == len(expected_trades)
