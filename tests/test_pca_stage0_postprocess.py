@@ -38,6 +38,8 @@ def test_normal_processing_is_deterministic_and_records_provenance(tmp_path):
     )
     first = post.build_summary(*post.read_events(source))
     second = post.build_summary(*post.read_events(source))
+    accumulated, digest = post.aggregate_events(source)
+    assert post.build_aggregated_summary(accumulated, digest) == first
     assert first == second
     assert first["event_count"] == 2
     assert first["source_events_sha256"] == "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -124,6 +126,47 @@ def test_bootstrap_is_seeded_and_uses_whole_month_blocks(tmp_path):
     assert first["seed"] == 20240918
 
 
+def test_bootstrap_sufficient_statistics_equal_explicit_unequal_blocks():
+    blocks = ([0.0, 2.0, 4.0], [10.0])
+    month_sums = np.asarray([sum(block) for block in blocks])
+    month_counts = np.asarray([len(block) for block in blocks])
+    selected = np.asarray([0, 1, 1])
+    explicit = np.mean([value for index in selected for value in blocks[index]])
+    assert post._bootstrap_replicate_mean(
+        month_sums, month_counts, selected
+    ) == pytest.approx(explicit)
+
+
+def test_bootstrap_is_event_weighted_not_month_weighted(monkeypatch):
+    monkeypatch.setattr(post, "BOOTSTRAP_REPLICATES", 1)
+
+    class FixedRng:
+        def integers(self, *_args, **_kwargs):
+            return np.asarray([0, 1])
+
+    monkeypatch.setattr(np.random, "default_rng", lambda _seed: FixedRng())
+    result = post._bootstrap_month_values(
+        {"2024-01": [0.0, 0.0, 0.0], "2024-02": [10.0]}
+    )
+    assert result["bootstrap_mean_bps"] == 2.5
+    assert result["bootstrap_mean_bps"] != 5.0
+
+
+def test_bootstrap_work_is_independent_of_event_count(monkeypatch):
+    monkeypatch.setattr(post, "BOOTSTRAP_REPLICATES", 7)
+    calls = 0
+    original = post._bootstrap_replicate_mean
+
+    def counted(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(post, "_bootstrap_replicate_mean", counted)
+    post._bootstrap_month_values({"2024-01": [1.0] * 10_000, "2024-02": [2.0] * 20_000})
+    assert calls == 7
+
+
 def test_concentration_and_signed_contribution_arithmetic(tmp_path):
     source = tmp_path / "events.jsonl"
     rows = [
@@ -154,6 +197,41 @@ def test_sha_changes_with_exact_source_bytes(tmp_path):
     source.write_bytes(source.read_bytes().rstrip(b"\n"))
     second = post.read_events(source)[1]
     assert first != second
+
+
+def test_streaming_sha_matches_compatibility_reader(tmp_path):
+    source = tmp_path / "events.jsonl"
+    raw = write_events(source, [event("01"), event("02")])
+    assert post.aggregate_events(source)[1] == post.read_events(source)[1]
+    assert (
+        post.aggregate_events(source)[1] == "sha256:" + hashlib.sha256(raw).hexdigest()
+    )
+
+
+def test_production_path_does_not_use_full_event_reader(tmp_path, monkeypatch):
+    source = tmp_path / "events.jsonl"
+    write_events(source, [event("01"), event("02")])
+
+    def forbidden_reader(*_args, **_kwargs):
+        raise AssertionError("production must not retain full event dictionaries")
+
+    monkeypatch.setattr(post, "read_events", forbidden_reader)
+    post.postprocess(source, tmp_path / "out")
+    accumulated, _ = post.aggregate_events(source)
+    assert not any(
+        isinstance(item, dict)
+        for values in accumulated.horizon_values.values()
+        for item in values
+    )
+
+
+def test_streaming_path_preserves_validation(tmp_path):
+    row = event("01")
+    row["entry_complete"] = "yes"
+    source = tmp_path / "events.jsonl"
+    write_events(source, [row])
+    with pytest.raises(post.PostprocessError, match="entry_complete must be boolean"):
+        post.postprocess(source, tmp_path / "out")
 
 
 def test_output_refuses_overwrite_and_never_mutates_source(tmp_path):
