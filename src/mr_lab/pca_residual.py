@@ -150,6 +150,19 @@ class PCAQualityObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class MultiKQualityObservation:
+    """One K-specific result from a PCA fit shared by all requested K values."""
+
+    pca_k: int
+    observation: ResidualObservation
+    explained_variance_ratio: float
+    eigengap_ratio: float | None
+    subspace_distance_60: float | None
+    cross_sectional_standardized_return_dispersion: float
+    prior_residuals: NDArray[np.float64] | None
+
+
+@dataclass(frozen=True, slots=True)
 class ShockState:
     active: bool
     event_emitted: bool
@@ -352,3 +365,131 @@ class PCAResidualEngine:
             residual_history.append(residual.copy())
             if include_quality:
                 projections.append(projection)
+
+
+class MultiKPCAResidualEngine:
+    """Causal K=1/2/3 residuals from exactly one eigendecomposition per row.
+
+    Rolling return statistics and the ordered eigenbasis are common.  Every
+    residual normalizer, detector, and projection history is K-local.  The
+    current residual is appended only after all observations for that row have
+    been formed.
+    """
+
+    def __init__(
+        self,
+        config: PCAResidualConfig | None = None,
+        *,
+        components: tuple[int, ...] = (1, 2, 3),
+        subspace_lag: int = 60,
+    ):
+        self.config = config or PCAResidualConfig()
+        if components != (1, 2, 3):
+            raise PCAResidualError("multi-K components must be exactly (1, 2, 3)")
+        if subspace_lag < 1:
+            raise PCAResidualError("subspace_lag must be positive")
+        self.components = components
+        self.subspace_lag = subspace_lag
+
+    def iter_with_quality(
+        self, panel: SynchronizedClosePanel
+    ) -> Iterator[MultiKQualityObservation]:
+        prices = panel.validated_copy()
+        n_instruments = prices.shape[1]
+        if max(self.components) >= n_instruments:
+            raise PCAResidualError("K must leave at least one residual dimension")
+        returns = np.diff(np.log(prices), axis=0)
+        rw = self.config.residual_normalization_window
+        histories: dict[int, deque[NDArray[np.float64]]] = {
+            k: deque(maxlen=rw) for k in self.components
+        }
+        detectors = {
+            k: [
+                ShockStateDetector(
+                    self.config.shock_threshold, self.config.rearm_threshold
+                )
+                for _ in panel.instruments
+            ]
+            for k in self.components
+        }
+        projections: dict[int, deque[NDArray[np.float64]]] = {
+            k: deque(maxlen=self.subspace_lag) for k in self.components
+        }
+        w = self.config.pca_training_window
+        for index in range(w, len(returns)):
+            prior = returns[index - w : index]
+            mean = prior.mean(axis=0)
+            scale = prior.std(axis=0, ddof=1)
+            if (scale <= self.config.variance_epsilon).any():
+                raise PCAResidualError("prior return variance is zero or near zero")
+            training = (prior - mean) / scale
+            pca_mean = training.mean(axis=0)
+            covariance = np.cov(training, rowvar=False, ddof=1)
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            order = np.argsort(eigenvalues)[::-1]
+            ordered_values = eigenvalues[order]
+            ordered_vectors = eigenvectors[:, order]
+            positive = eigenvalues[np.isfinite(eigenvalues) & (eigenvalues > 0)]
+            eigenvalue_sum = float(positive.sum())
+            if eigenvalue_sum <= self.config.variance_epsilon:
+                raise PCAResidualError("PCA positive eigenvalue sum is near zero")
+            current = (returns[index] - mean) / scale
+            dispersion = float(current.std(ddof=1))
+            row_residuals: dict[int, NDArray[np.float64]] = {}
+            for k in self.components:
+                components = ordered_vectors[:, :k].T
+                projection = components.T @ components
+                reconstruction = reconstruct_from_components(
+                    current, pca_mean, components
+                )
+                residual = current - reconstruction
+                row_residuals[k] = residual
+                explained = float(ordered_values[:k].sum() / eigenvalue_sum)
+                eigengap = (
+                    float((ordered_values[k - 1] - ordered_values[k]) / eigenvalue_sum)
+                    if len(ordered_values) > k
+                    else None
+                )
+                distance = None
+                if len(projections[k]) == self.subspace_lag:
+                    distance = float(
+                        np.linalg.norm(projection - projections[k][0], ord="fro")
+                        / np.sqrt(2 * k)
+                    )
+                if len(histories[k]) >= rw:
+                    history = np.asarray(histories[k])
+                    rmean = history.mean(axis=0)
+                    rscale = history.std(axis=0, ddof=1)
+                    if (rscale <= self.config.variance_epsilon).any():
+                        raise PCAResidualError(
+                            "prior residual variance is zero or near zero"
+                        )
+                    zscores = (residual - rmean) / rscale
+                    timestamp = panel.timestamps[index + 1]
+                    for column, instrument in enumerate(panel.instruments):
+                        state = detectors[k][column].update(float(zscores[column]))
+                        observation = ResidualObservation(
+                            timestamp,
+                            instrument,
+                            float(returns[index, column]),
+                            float(current[column]),
+                            float(reconstruction[column]),
+                            float(residual[column]),
+                            float(zscores[column]),
+                            state.active,
+                            state.event_emitted,
+                            state.shock_sign,
+                            state.fade_direction,
+                        )
+                        yield MultiKQualityObservation(
+                            k,
+                            observation,
+                            explained,
+                            eigengap,
+                            distance,
+                            dispersion,
+                            history[:, column].copy() if state.event_emitted else None,
+                        )
+                projections[k].append(projection)
+            for k, residual in row_residuals.items():
+                histories[k].append(residual.copy())
