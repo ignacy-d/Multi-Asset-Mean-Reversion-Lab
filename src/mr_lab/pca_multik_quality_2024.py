@@ -128,6 +128,20 @@ STUDY_IDENTITIES = {
     "k3_robustness": _identity(K3_SPEC),
     "ou_quality": _identity(OU_SPEC),
 }
+K_PROCESS_IDENTITIES = {
+    k: _identity(
+        {
+            "identity_type": "pca-multik-k-specific-process",
+            "pca_spec_identity": STUDY_IDENTITIES[
+                {1: "k1_robustness", 2: "k2_frozen_primary", 3: "k3_robustness"}[k]
+            ],
+        }
+    )
+    for k in K_VALUES
+}
+# K2 event provenance remains the frozen Stage0 process identity rather than
+# the wrapper identity above.  The mapping is useful only for new K1/K3 streams.
+K_PROCESS_IDENTITIES[2] = PROCESS_ID
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -211,11 +225,20 @@ class AtomicGzipShardWriter:
                         zipped.write(line)
                 raw.flush()
                 os.fsync(raw.fileno())
-            os.replace(temporary, final)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
-        size = final.stat().st_size
+        size = temporary.stat().st_size
+        current_total = _as_int(
+            self.manifest["finalized_output_bytes"], "finalized_output_bytes"
+        )
+        prospective_total = current_total + size
+        if prospective_total > self.max_output_bytes:
+            temporary.unlink()
+            raise MultiKStudyError(
+                "finalizing shard would exceed maximum compressed output bytes"
+            )
+        os.replace(temporary, final)
         metadata = {
             "filename": f"events/{filename}",
             "event_count": len(self._events),
@@ -225,20 +248,10 @@ class AtomicGzipShardWriter:
             "last_event_timestamp": self._last,
         }
         shards.append(metadata)
-        self.manifest["finalized_output_bytes"] = (
-            _as_int(self.manifest["finalized_output_bytes"], "finalized_output_bytes")
-            + size
-        )
+        self.manifest["finalized_output_bytes"] = prospective_total
         _atomic_json(self.manifest_path, self.manifest)
         self._events.clear()
         self._first = self._last = None
-        if (
-            _as_int(self.manifest["finalized_output_bytes"], "finalized_output_bytes")
-            >= self.max_output_bytes
-        ):
-            raise MultiKStudyError(
-                "maximum compressed output bytes reached or exceeded"
-            )
 
     def close(self) -> None:
         self.finalize()
@@ -321,6 +334,32 @@ def enrich_event(
     return base
 
 
+def apply_k_specific_provenance(
+    event: dict[str, object], pca_k: int
+) -> dict[str, object]:
+    """Replace K2 helper provenance only for the new robustness streams."""
+    if pca_k == 2:
+        return event
+    if pca_k not in (1, 3):
+        raise MultiKStudyError("unsupported PCA K provenance")
+    event["frozen_k2_reference_process_identity"] = PROCESS_ID
+    event["process_identity"] = K_PROCESS_IDENTITIES[pca_k]
+    config = asdict(FROZEN_PCA_CONFIG)
+    config["components"] = pca_k
+    event["pca_config"] = config
+    return event
+
+
+def _normalize_multik_summary_identity(
+    summary: dict[str, object], manifest_identity: str
+) -> dict[str, object]:
+    """Rename the legacy single-file hash field for a multi-shard artifact."""
+    summary.pop("source_events_sha256", None)
+    summary["source_event_manifest_identity"] = manifest_identity
+    summary["frozen_k2_source_events_sha256"] = SOURCE_EVENTS_SHA256
+    return summary
+
+
 def _iter_shards(
     output_dir: Path, manifest: Mapping[str, object]
 ) -> Iterator[dict[str, object]]:
@@ -361,13 +400,13 @@ def postprocess(output_dir: Path) -> Path:
     comparisons: dict[str, object] = {}
     for group in GROUPS:
         accumulator = accumulators[group]
+        manifest_identity = str(manifest["event_manifest_identity"])
         summary: dict[str, object] = (
-            build_aggregated_summary(
-                accumulator, str(manifest["event_manifest_identity"])
-            )
+            build_aggregated_summary(accumulator, manifest_identity)
             if accumulator.event_count
             else {"event_count": 0}
         )
+        _normalize_multik_summary_identity(summary, manifest_identity)
         k = int(group[1])
         raw_count = accumulators[f"K{k}_RAW"].event_count
         summary["retention_fraction_vs_same_k_raw"] = (
@@ -481,6 +520,7 @@ def run(
                         "study": STUDY_NAME,
                     }
                 )
+                apply_k_specific_provenance(event, quality.pca_k)
             enriched = enrich_event(event, quality)
             writer.write(enriched)
             counts[str(quality.pca_k)] += 1

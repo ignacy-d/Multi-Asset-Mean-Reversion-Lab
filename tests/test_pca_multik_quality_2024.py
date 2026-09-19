@@ -10,6 +10,8 @@ from test_pca_residual import config, panel_from_returns, process
 import mr_lab.pca_multik_quality_2024 as multik
 import mr_lab.pca_residual as residual
 from mr_lab.pca_residual import MultiKPCAResidualEngine, PCAResidualEngine
+from mr_lab.pca_stage0_postprocess import EventAccumulator, build_aggregated_summary
+from mr_lab.pca_stage0_runner import FROZEN_PCA_CONFIG, PROCESS_ID
 
 
 def _rows(shock=0.03):
@@ -138,6 +140,54 @@ def test_exact_six_groups():
     )
 
 
+def test_k_specific_provenance_preserves_k2_and_corrects_robustness_streams():
+    frozen = {
+        "process_identity": PROCESS_ID,
+        "pca_config": {
+            "pca_training_window": 1024,
+            "components": 2,
+            "residual_normalization_window": 256,
+            "shock_threshold": 2.0,
+            "rearm_threshold": 1.0,
+            "variance_epsilon": FROZEN_PCA_CONFIG.variance_epsilon,
+        },
+    }
+    k2 = copy.deepcopy(frozen)
+    assert multik.apply_k_specific_provenance(k2, 2) == frozen
+    for k in (1, 3):
+        event = multik.apply_k_specific_provenance(copy.deepcopy(frozen), k)
+        assert event["process_identity"] == multik.K_PROCESS_IDENTITIES[k]
+        assert event["process_identity"] != PROCESS_ID
+        assert event["pca_config"]["components"] == k
+        assert event["pca_config"]["pca_training_window"] == 1024
+        assert event["pca_config"]["residual_normalization_window"] == 256
+        assert event["frozen_k2_reference_process_identity"] == PROCESS_ID
+
+
+def test_k_specific_summary_identity_and_manifest_naming():
+    for k in (1, 3):
+        accumulator = EventAccumulator()
+        accumulator.add(
+            {
+                "timestamp": "2024-01-01T00:00:00+00:00",
+                "instrument": "EURUSD",
+                "entry_complete": True,
+                "process_identity": multik.K_PROCESS_IDENTITIES[k],
+                "activity_policy": multik.ACTIVITY_POLICY,
+                **{f"h{h}_complete": True for h in (5, 15, 30, 60)},
+                **{f"h{h}_signed_bps_return": 1.0 for h in (5, 15, 30, 60)},
+            }
+        )
+        summary = multik._normalize_multik_summary_identity(
+            build_aggregated_summary(accumulator, "manifest-commitment"),
+            "manifest-commitment",
+        )
+        assert summary["process_identity"] == multik.K_PROCESS_IDENTITIES[k]
+        assert summary["source_event_manifest_identity"] == "manifest-commitment"
+        assert summary["frozen_k2_source_events_sha256"] == multik.SOURCE_EVENTS_SHA256
+        assert "source_events_sha256" not in summary
+
+
 def test_atomic_gzip_shard_is_readable_hashed_and_manifested(tmp_path):
     root = tmp_path / "run"
     events = root / "events"
@@ -169,8 +219,36 @@ def test_output_cap_preserves_final_shard_and_incomplete_manifest(tmp_path):
     )
     with pytest.raises(multik.MultiKStudyError, match="output bytes"):
         writer.write({"timestamp": "2024-01-01T00:00:00+00:00"})
-    assert (events / "part-00000.jsonl.gz").exists()
+    assert not (events / "part-00000.jsonl.gz").exists()
+    assert not manifest["shards"]
+    assert manifest["finalized_output_bytes"] == 0
     assert not json.loads(path.read_text())["run_complete"]
+
+
+def test_output_cap_allows_below_and_exact_but_rejects_one_byte_over(tmp_path):
+    event = {"timestamp": "2024-01-01T00:00:00+00:00", "value": "fixed"}
+
+    def write_at(root, cap):
+        events = root / "events"
+        events.mkdir(parents=True)
+        manifest = {"shards": [], "finalized_output_bytes": 0, "run_complete": False}
+        path = root / "manifest.json"
+        multik._atomic_json(path, manifest)
+        writer = multik.AtomicGzipShardWriter(
+            events, manifest, path, event_limit=1, max_output_bytes=cap
+        )
+        writer.write(event)
+        return manifest
+
+    baseline = write_at(tmp_path / "baseline", 10_000)
+    exact_size = baseline["finalized_output_bytes"]
+    below = write_at(tmp_path / "below", exact_size + 1)
+    exact = write_at(tmp_path / "exact", exact_size)
+    assert below["finalized_output_bytes"] < exact_size + 1
+    assert exact["finalized_output_bytes"] == exact_size
+    with pytest.raises(multik.MultiKStudyError, match="exceed"):
+        write_at(tmp_path / "over", exact_size - 1)
+    assert not tuple((tmp_path / "over" / "events").glob("part-*.jsonl.gz"))
 
 
 def test_postprocessor_rejects_incomplete_manifest(tmp_path):
