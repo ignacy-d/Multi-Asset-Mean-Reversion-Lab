@@ -299,9 +299,10 @@ def test_entry_uses_next_bar_open_at_completed_return_timestamp(monkeypatch):
     assert event["entry_timestamp"] == row_timestamp.isoformat()
     assert event["entry_price"] == entry_bar.open
     for horizon in stage0.HORIZONS:
-        assert event[f"h{horizon}_exit_timestamp"] == (
-            row_timestamp + timedelta(minutes=horizon)
-        ).isoformat()
+        assert (
+            event[f"h{horizon}_exit_timestamp"]
+            == (row_timestamp + timedelta(minutes=horizon)).isoformat()
+        )
 
 
 def test_future_h60_absence_changes_only_h60_completeness(monkeypatch):
@@ -413,3 +414,22 @@ def test_concentration_arithmetic():
         {"timestamp": "2024-07-01", "instrument": "C", "h15_signed_bps_return": 1},
     ]
     assert concentration(events) == (0.5, 0.5, 2)
+
+
+def test_concentration_result_is_standard_json_serializable():
+    events = [
+        {
+            "timestamp": "2024-01-01",
+            "instrument": "A",
+            "h15_signed_bps_return": np.float64(2),
+        }
+    ]
+    result = concentration(events)
+    assert type(result[0]) is float
+    assert type(result[1]) is float
+    assert type(result[2]) is int
+    assert json.loads(json.dumps({"concentration": result}))["concentration"] == [
+        1.0,
+        1.0,
+        1,
+    ]
