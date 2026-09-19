@@ -23,6 +23,7 @@ from mr_lab.data import Bar
 from mr_lab.pca_residual import (
     PCAResidualConfig,
     PCAResidualEngine,
+    ResidualObservation,
     SynchronizedClosePanel,
 )
 from mr_lab.providers.dukascopy_range import load_offline_corpus
@@ -197,8 +198,10 @@ def build_panel(
         raise Stage0Error("no complete nine-pair synchronized rows")
     # Synthetic closes encode already validated returns; the causal engine then
     # operates unchanged and timestamps are the true synchronized row stamps.
-    returns = np.array([[valid[n][t][0] for n in INSTRUMENTS] for t in common])
-    closes = np.vstack((np.ones(len(INSTRUMENTS)), np.exp(np.cumsum(returns, axis=0))))
+    return_matrix = np.array([[valid[n][t][0] for n in INSTRUMENTS] for t in common])
+    closes = np.vstack(
+        (np.ones(len(INSTRUMENTS)), np.exp(np.cumsum(return_matrix, axis=0)))
+    )
     first = common[0] - timedelta(minutes=1)
     panel = SynchronizedClosePanel((first, *common), INSTRUMENTS, closes)
     identity = _sha(
@@ -242,63 +245,73 @@ def event_outcomes(built: PanelBuild) -> list[dict[str, object]]:
     for row in observations:
         if not row.event_emitted:
             continue
-        bars = built.bars[row.instrument]
-        open_bars = built.open_bars[row.instrument]
-        # The completed return stamped at ``row.timestamp`` is known when the
-        # following M1 bar opens.  That bar's open time is numerically equal to
-        # the completed bar's close time, so this is Open[t+1] in bar-index
-        # semantics rather than same-bar execution.
-        entry_time = row.timestamp
-        entry = open_bars.get(entry_time)
-        exits = {h: bars.get(row.timestamp + timedelta(minutes=h)) for h in HORIZONS}
-        entry_reason = _price_incomplete_reason(entry, "open")
-        entry_complete = entry_reason is None
-        causal_panel_identity = panel_identity_at(built, row.timestamp)
-        record: dict[str, object] = {
-            "event_id": event_id(row.timestamp, row.instrument, causal_panel_identity),
-            "timestamp": row.timestamp.isoformat(),
-            "instrument": row.instrument,
-            "residual": row.residual,
-            "residual_z": row.residual_zscore,
-            "shock_sign": int(row.residual_shock_sign),
-            "fade_direction": int(row.fade_direction),
-            "entry_target_timestamp": entry_time.isoformat(),
-            "entry_complete": entry_complete,
-            "entry_incomplete_reason": entry_reason,
-            "entry_timestamp": entry_time.isoformat() if entry_complete else None,
-            "entry_price": entry.open if entry_complete and entry is not None else None,
-            "process_identity": PROCESS_ID,
-            "panel_identity": causal_panel_identity,
-            "pca_config": _config_identity(FROZEN_PCA_CONFIG),
-            "activity_policy": ACTIVITY_POLICY,
-        }
-        for h, bar in exits.items():
-            exit_reason = _price_incomplete_reason(bar, "close")
-            reason = "entry_incomplete" if not entry_complete else exit_reason
-            complete = reason is None
-            signed = (
-                int(row.fade_direction) * log(bar.close / entry.open)
-                if complete and bar is not None and entry is not None
-                else None
-            )
-            record.update(
-                {
-                    f"h{h}_complete": complete,
-                    f"h{h}_incomplete_reason": reason,
-                    f"h{h}_exit_timestamp": bar.close_time.isoformat()
-                    if complete and bar is not None
-                    else None,
-                    f"h{h}_exit_price": bar.close
-                    if complete and bar is not None
-                    else None,
-                    f"h{h}_signed_raw_return": signed,
-                    f"h{h}_signed_bps_return": signed * 10_000
-                    if signed is not None
-                    else None,
-                }
-            )
-        events.append(record)
+        events.append(event_outcome(built, row))
     return events
+
+
+def event_outcome(
+    built: PanelBuild,
+    row: ResidualObservation,
+    *,
+    causal_panel_identity: str | None = None,
+) -> dict[str, object]:
+    """Attach unchanged entry/outcomes to one emitted legacy observation."""
+    bars = built.bars[row.instrument]
+    open_bars = built.open_bars[row.instrument]
+    # The completed return stamped at ``row.timestamp`` is known when the
+    # following M1 bar opens.  That bar's open time is numerically equal to
+    # the completed bar's close time, so this is Open[t+1] in bar-index
+    # semantics rather than same-bar execution.
+    entry_time = row.timestamp
+    entry = open_bars.get(entry_time)
+    exits = {h: bars.get(row.timestamp + timedelta(minutes=h)) for h in HORIZONS}
+    entry_reason = _price_incomplete_reason(entry, "open")
+    entry_complete = entry_reason is None
+    causal_panel_identity = causal_panel_identity or panel_identity_at(
+        built, row.timestamp
+    )
+    record: dict[str, object] = {
+        "event_id": event_id(row.timestamp, row.instrument, causal_panel_identity),
+        "timestamp": row.timestamp.isoformat(),
+        "instrument": row.instrument,
+        "residual": row.residual,
+        "residual_z": row.residual_zscore,
+        "shock_sign": int(row.residual_shock_sign),
+        "fade_direction": int(row.fade_direction),
+        "entry_target_timestamp": entry_time.isoformat(),
+        "entry_complete": entry_complete,
+        "entry_incomplete_reason": entry_reason,
+        "entry_timestamp": entry_time.isoformat() if entry_complete else None,
+        "entry_price": entry.open if entry_complete and entry is not None else None,
+        "process_identity": PROCESS_ID,
+        "panel_identity": causal_panel_identity,
+        "pca_config": _config_identity(FROZEN_PCA_CONFIG),
+        "activity_policy": ACTIVITY_POLICY,
+    }
+    for h, bar in exits.items():
+        exit_reason = _price_incomplete_reason(bar, "close")
+        reason = "entry_incomplete" if not entry_complete else exit_reason
+        complete = reason is None
+        signed = (
+            int(row.fade_direction) * log(bar.close / entry.open)
+            if complete and bar is not None and entry is not None
+            else None
+        )
+        record.update(
+            {
+                f"h{h}_complete": complete,
+                f"h{h}_incomplete_reason": reason,
+                f"h{h}_exit_timestamp": bar.close_time.isoformat()
+                if complete and bar is not None
+                else None,
+                f"h{h}_exit_price": bar.close if complete and bar is not None else None,
+                f"h{h}_signed_raw_return": signed,
+                f"h{h}_signed_bps_return": signed * 10_000
+                if signed is not None
+                else None,
+            }
+        )
+    return record
 
 
 def _price_incomplete_reason(bar: Bar | None, field: str) -> str | None:
