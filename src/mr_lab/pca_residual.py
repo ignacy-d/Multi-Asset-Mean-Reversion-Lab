@@ -10,6 +10,8 @@ No missing-value repair or data loading is performed here.
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import IntEnum
@@ -135,6 +137,18 @@ class ResidualObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class PCAQualityObservation:
+    """A legacy observation plus diagnostics from its one canonical PCA fit."""
+
+    observation: ResidualObservation
+    k2_explained_variance_ratio: float
+    k2_eigengap_ratio: float
+    subspace_distance_60: float | None
+    cross_sectional_standardized_return_dispersion: float
+    prior_residuals: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ShockState:
     active: bool
     event_emitted: bool
@@ -198,7 +212,28 @@ class PCAResidualEngine:
         self.config = config or PCAResidualConfig()
 
     def run(self, panel: SynchronizedClosePanel) -> tuple[ResidualObservation, ...]:
+        return tuple(row.observation for row in self.run_with_quality(panel))
+
+    def run_with_quality(
+        self, panel: SynchronizedClosePanel, *, subspace_lag: int = 60
+    ) -> tuple[PCAQualityObservation, ...]:
+        return tuple(self.iter_with_quality(panel, subspace_lag=subspace_lag))
+
+    def iter_with_quality(
+        self, panel: SynchronizedClosePanel, *, subspace_lag: int = 60
+    ) -> Iterator[PCAQualityObservation]:
+        """Return diagnostics without performing an independent PCA calculation.
+
+        Projection distance is Frobenius distance divided by ``sqrt(2*K)``, the
+        maximum distance between two rank-K orthogonal projections.
+        """
         prices = panel.validated_copy()
+        if (
+            isinstance(subspace_lag, bool)
+            or not isinstance(subspace_lag, int)
+            or subspace_lag < 1
+        ):
+            raise PCAResidualError("subspace_lag must be a positive integer")
         n_instruments = prices.shape[1]
         if self.config.components > n_instruments:
             raise PCAResidualError("components cannot exceed instrument count")
@@ -207,14 +242,14 @@ class PCAResidualEngine:
                 "components must leave at least one residual dimension"
             )
         returns = np.diff(np.log(prices), axis=0)
-        residual_history: list[NDArray[np.float64]] = []
+        rw = self.config.residual_normalization_window
+        residual_history: deque[NDArray[np.float64]] = deque(maxlen=rw)
         detectors = [
             ShockStateDetector(self.config.shock_threshold, self.config.rearm_threshold)
             for _ in panel.instruments
         ]
-        output: list[ResidualObservation] = []
+        projections: deque[NDArray[np.float64]] = deque(maxlen=subspace_lag)
         w = self.config.pca_training_window
-        rw = self.config.residual_normalization_window
         for index in range(w, len(returns)):
             prior = returns[index - w : index]
             mean = prior.mean(axis=0)
@@ -225,15 +260,34 @@ class PCAResidualEngine:
             pca_mean = training.mean(axis=0)
             covariance = np.cov(training, rowvar=False, ddof=1)
             eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-            order = np.argsort(eigenvalues)[::-1][: self.config.components]
+            full_order = np.argsort(eigenvalues)[::-1]
+            order = full_order[: self.config.components]
             components = eigenvectors[:, order].T
+            projection = components.T @ components
+            positive = eigenvalues[np.isfinite(eigenvalues) & (eigenvalues > 0)]
+            eigenvalue_sum = float(positive.sum())
+            if eigenvalue_sum <= self.config.variance_epsilon:
+                raise PCAResidualError("PCA positive eigenvalue sum is near zero")
+            ordered_values = eigenvalues[full_order]
+            explained = float(ordered_values[:2].sum() / eigenvalue_sum)
+            eigengap = (
+                float((ordered_values[1] - ordered_values[2]) / eigenvalue_sum)
+                if len(ordered_values) >= 3
+                else 0.0
+            )
+            subspace = None
+            if len(projections) == subspace_lag:
+                subspace = float(
+                    np.linalg.norm(projection - projections[0], ord="fro")
+                    / np.sqrt(2 * self.config.components)
+                )
             current = (returns[index] - mean) / scale
             reconstruction = reconstruct_from_components(current, pca_mean, components)
             residual = current - reconstruction
             if not np.isfinite(residual).all():
                 raise PCAResidualError("PCA produced a nonfinite residual")
             if len(residual_history) >= rw:
-                history = np.asarray(residual_history[-rw:])
+                history = np.asarray(residual_history)
                 rmean = history.mean(axis=0)
                 rscale = history.std(axis=0, ddof=1)
                 if (rscale <= self.config.variance_epsilon).any():
@@ -248,20 +302,30 @@ class PCAResidualEngine:
                 timestamp = panel.timestamps[index + 1]
                 for column, instrument in enumerate(panel.instruments):
                     state = detectors[column].update(float(zscores[column]))
-                    output.append(
-                        ResidualObservation(
-                            timestamp,
-                            instrument,
-                            float(returns[index, column]),
-                            float(current[column]),
-                            float(reconstruction[column]),
-                            float(residual[column]),
-                            float(zscores[column]),
-                            state.active,
-                            state.event_emitted,
-                            state.shock_sign,
-                            state.fade_direction,
-                        )
+                    observation = ResidualObservation(
+                        timestamp,
+                        instrument,
+                        float(returns[index, column]),
+                        float(current[column]),
+                        float(reconstruction[column]),
+                        float(residual[column]),
+                        float(zscores[column]),
+                        state.active,
+                        state.event_emitted,
+                        state.shock_sign,
+                        state.fade_direction,
+                    )
+                    yield PCAQualityObservation(
+                        observation=observation,
+                        k2_explained_variance_ratio=explained,
+                        k2_eigengap_ratio=eigengap,
+                        subspace_distance_60=subspace,
+                        cross_sectional_standardized_return_dispersion=float(
+                            current.std(ddof=1)
+                        ),
+                        prior_residuals=tuple(
+                            float(value) for value in history[:, column]
+                        ),
                     )
             residual_history.append(residual.copy())
-        return tuple(output)
+            projections.append(projection)

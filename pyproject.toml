@@ -34,6 +34,7 @@ mr-lab-ou-monte-carlo = "mr_lab.ou_monte_carlo_runner:main"
 mr-lab-freeze-study = "mr_lab.spec_lock:main"
 mr-lab-pca-stage0-2024 = "mr_lab.pca_stage0_runner:main"
 mr-lab-pca-stage0-postprocess = "mr_lab.pca_stage0_postprocess:main"
+mr-lab-pca-rv-quality-2024 = "mr_lab.pca_rv_quality_2024:main"
 
 [dependency-groups]
 dev = [
