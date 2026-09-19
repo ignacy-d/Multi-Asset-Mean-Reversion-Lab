@@ -351,20 +351,24 @@ def concentration(events: Sequence[Mapping[str, object]]) -> tuple[float, float,
         for x in events
     )
     complete = [x for x in events if x.get("h15_complete", True)]
-    positive = sum(
-        np.mean(
-            [
-                _number(x["h15_signed_bps_return"], "h15_signed_bps_return")
-                for x in complete
-                if x["instrument"] == name
-            ]
+    # ``np.mean(...) > 0`` is a numpy.bool_; summing those values produces a
+    # numpy.int64, which the standard-library JSON encoder rejects.
+    positive = int(
+        sum(
+            np.mean(
+                [
+                    _number(x["h15_signed_bps_return"], "h15_signed_bps_return")
+                    for x in complete
+                    if x["instrument"] == name
+                ]
+            )
+            > 0
+            for name in {str(x["instrument"]) for x in complete}
         )
-        > 0
-        for name in {str(x["instrument"]) for x in complete}
     )
     return (
-        max(instruments.values()) / len(events),
-        max(quarters.values()) / len(events),
+        float(max(instruments.values()) / len(events)),
+        float(max(quarters.values()) / len(events)),
         positive,
     )
 
@@ -398,18 +402,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     inst_conc, quarter_conc, positive = concentration(events)
     summary = {
         "emitted_event_count": len(events),
-        "executable_entry_count": sum(bool(x["entry_complete"]) for x in events),
-        "complete_h15_outcome_count": sum(bool(x["h15_complete"]) for x in events),
+        "executable_entry_count": int(sum(bool(x["entry_complete"]) for x in events)),
+        "complete_h15_outcome_count": int(sum(bool(x["h15_complete"]) for x in events)),
         "activity_counts": built.counts,
         "process_identity": PROCESS_ID,
         "panel_identity": panel_identity_at(built),
         "activity_policy": ACTIVITY_POLICY,
         "primary_decision": BLOCKER,
-        "bootstrap_seed": BOOTSTRAP_SEED,
-        "bootstrap_replicates": BOOTSTRAP_REPLICATES,
-        "max_instrument_concentration": inst_conc,
-        "max_quarter_concentration": quarter_conc,
-        "positive_instruments": positive,
+        "bootstrap_seed": int(BOOTSTRAP_SEED),
+        "bootstrap_replicates": int(BOOTSTRAP_REPLICATES),
+        "max_instrument_concentration": float(inst_conc),
+        "max_quarter_concentration": float(quarter_conc),
+        "positive_instruments": int(positive),
     }
     (args.output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
