@@ -1,13 +1,22 @@
+import copy
 import hashlib
 from math import exp, log
 
 import numpy as np
 import pytest
 from test_pca_residual import config, panel_from_returns, process
+from test_pca_stage0_runner import long_panel_series
 
+import mr_lab.pca_residual as pca_residual
 import mr_lab.pca_rv_quality_2024 as quality
-from mr_lab.pca_residual import PCAResidualEngine
-from mr_lab.pca_stage0_runner import _sha
+from mr_lab.pca_residual import PCAResidualConfig, PCAResidualEngine
+from mr_lab.pca_stage0_runner import (
+    INSTRUMENTS,
+    _sha,
+    build_panel,
+    event_outcome,
+    panel_identity_at,
+)
 
 
 def ar_series(phi, alpha=0.25, count=256):
@@ -81,6 +90,66 @@ def test_quality_instrumentation_is_exactly_legacy_equivalent():
     assert instrumented == legacy
 
 
+def test_legacy_fast_path_never_constructs_quality_payloads(monkeypatch):
+    panel = panel_from_returns(process(80))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy run constructed a quality payload")
+
+    monkeypatch.setattr(pca_residual, "PCAQualityObservation", forbidden)
+    assert PCAResidualEngine(config()).run(panel)
+
+
+def test_prior_residual_payload_exists_only_for_emitted_events():
+    panel = panel_from_returns(process(100, shock_index=70, shock=0.03))
+    rows = PCAResidualEngine(config()).run_with_quality(panel)
+    assert any(row.observation.event_emitted for row in rows)
+    assert all(
+        (row.prior_residuals is not None) == row.observation.event_emitted
+        for row in rows
+    )
+
+
+def test_ar_calculation_is_invoked_only_for_emitted_events(monkeypatch):
+    panel = panel_from_returns(process(100, shock_index=70, shock=0.03))
+    rows = PCAResidualEngine(config()).run_with_quality(panel)
+    event = next(row for row in rows if row.observation.event_emitted)
+    non_event = next(row for row in rows if not row.observation.event_emitted)
+    calls = 0
+
+    def counted(_prior, _epsilon):
+        nonlocal calls
+        calls += 1
+        return quality._invalid_ar()
+
+    monkeypatch.setattr(quality, "estimate_ar1", counted)
+    with pytest.raises(quality.PCAQualityError, match="only for emitted"):
+        quality.enrich_event({}, non_event)
+    assert calls == 0
+    quality.enrich_event({}, event)
+    assert calls == 1
+
+
+def test_current_and_future_mutation_do_not_change_event_prior_ar_input():
+    original = process(100, shock_index=70, shock=0.03)
+    changed = process(100, shock_index=70, shock=0.06)
+    changed[71:] += np.random.default_rng(31).normal(0, 0.02, changed[71:].shape)
+    engine = PCAResidualEngine(config())
+    first = next(
+        row
+        for row in engine.run_with_quality(panel_from_returns(original))
+        if row.observation.instrument == "A" and row.observation.event_emitted
+    )
+    second = next(
+        row
+        for row in engine.run_with_quality(panel_from_returns(changed))
+        if row.observation.timestamp == first.observation.timestamp
+        and row.observation.instrument == "A"
+    )
+    assert second.observation.event_emitted
+    assert second.prior_residuals == first.prior_residuals
+
+
 def test_source_sha_rejection(tmp_path):
     source = tmp_path / "source.jsonl"
     source.write_text("{}\n")
@@ -115,6 +184,23 @@ def test_quality_identity_is_canonical_and_deterministic():
     )
 
 
+def test_quality_identity_binds_every_frozen_feature_definition():
+    for field in (
+        "base_process_identity",
+        "residual_ar1",
+        "residual_ou",
+        "idio_ratio",
+        "k2_explained_variance_ratio",
+        "k2_eigengap_ratio",
+        "subspace_distance",
+        "cross_sectional_standardized_return_dispersion",
+        "bootstrap",
+    ):
+        changed = copy.deepcopy(quality.QUALITY_SPEC)
+        changed[field] = "changed"
+        assert quality._identity(changed) != quality.QUALITY_STUDY_ID
+
+
 def test_incremental_panel_identity_is_stage0_equivalent():
     incremental = quality._PrefixPanelIdentities("panel-source")
     stamps = ["2024-01-01T00:00:00+00:00", "2024-01-01T00:01:00+00:00"]
@@ -126,6 +212,39 @@ def test_incremental_panel_identity_is_stage0_equivalent():
                 "activity_policy": quality.ACTIVITY_POLICY,
             }
         )
+
+
+def test_multi_instrument_timestamp_reuses_exact_frozen_panel_identity():
+    built = build_panel(
+        long_panel_series(90), {name: "synthetic" for name in INSTRUMENTS}
+    )
+    engine = PCAResidualEngine(
+        PCAResidualConfig(
+            pca_training_window=24,
+            components=2,
+            residual_normalization_window=12,
+            shock_threshold=0.5,
+            rearm_threshold=0.1,
+            variance_epsilon=1e-14,
+        )
+    )
+    rows = list(quality.iter_quality_with_panel_identities(built, engine))
+    by_timestamp = {}
+    for row, identity in rows:
+        by_timestamp.setdefault(row.observation.timestamp, []).append((row, identity))
+    assert by_timestamp
+    for timestamp, timestamp_rows in by_timestamp.items():
+        identities = {identity for _, identity in timestamp_rows}
+        assert len(timestamp_rows) == len(INSTRUMENTS)
+        assert identities == {panel_identity_at(built, timestamp)}
+    emitted, identity = next(
+        (row, identity) for row, identity in rows if row.observation.event_emitted
+    )
+    regenerated = event_outcome(
+        built, emitted.observation, causal_panel_identity=identity
+    )
+    frozen = event_outcome(built, emitted.observation)
+    assert regenerated["event_id"] == frozen["event_id"]
 
 
 def test_runner_refuses_existing_output_before_data_access(tmp_path):

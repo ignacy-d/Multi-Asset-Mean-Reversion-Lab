@@ -23,6 +23,7 @@ from mr_lab.pca_stage0_runner import (
     INSTRUMENTS,
     PROCESS_ID,
     REGISTRY,
+    PanelBuild,
     authenticate_corpus,
     build_panel,
     event_outcome,
@@ -72,9 +73,36 @@ QUALITY_SPEC = {
     "study": "PCA-RV-QUALITY-2024-v1",
     "status": STUDY_STATUS,
     "base_process_identity": PROCESS_ID,
-    "ar_window": 256,
-    "half_life_limit_rows": HALF_LIFE_LIMIT,
-    "subspace_lag_rows": SUBSPACE_LAG,
+    "residual_ar1": {
+        "definition": "closed-form-ols-with-intercept:y=r[1:];x=r[:-1]",
+        "prior_residual_window_rows": 256,
+        "variance_denominator_policy": "invalid-if-nonfinite-or-le-variance-epsilon",
+    },
+    "residual_ou": {
+        "kappa_definition": "-log(phi)-iff-0-lt-phi-lt-1",
+        "half_life_definition": "log(2)/kappa",
+        "eligibility": "0-lt-phi-lt-1-and-finite-half-life-rows-le-60",
+        "half_life_limit_rows": HALF_LIFE_LIMIT,
+    },
+    "idio_ratio": {
+        "definition": "abs(residual)/(abs(residual)+abs(factor_reconstruction))",
+        "denominator_policy": "null-if-denominator-le-variance-epsilon",
+    },
+    "k2_explained_variance_ratio": (
+        "(lambda1+lambda2)/sum(all-positive-finite-covariance-eigenvalues)"
+    ),
+    "k2_eigengap_ratio": (
+        "(lambda2-lambda3)/sum(all-positive-finite-covariance-eigenvalues)"
+    ),
+    "subspace_distance": {
+        "projection": "P=V.T@V",
+        "definition": "frobenius-norm(P_t-P_t_minus_lag)/sqrt(2*K)",
+        "components": 2,
+        "lag_rows": SUBSPACE_LAG,
+    },
+    "cross_sectional_standardized_return_dispersion": (
+        "sample-standard-deviation-ddof=1"
+    ),
     "bootstrap": {"replicates": BOOTSTRAP_REPLICATES, "seed": BOOTSTRAP_SEED},
     "features_are_gates": ["residual_ou_eligible"],
 }
@@ -243,10 +271,35 @@ class _PrefixPanelIdentities:
         return "sha256:" + snapshot.hexdigest()
 
 
+def iter_quality_with_panel_identities(
+    built: PanelBuild,
+    engine: PCAResidualEngine,
+    *,
+    subspace_lag: int = SUBSPACE_LAG,
+) -> Iterator[tuple[PCAQualityObservation, str]]:
+    """Pair observations with one prefix identity update per synchronized row."""
+    prefix_identities = _PrefixPanelIdentities(built.identity)
+    warmup = (
+        engine.config.pca_training_window + engine.config.residual_normalization_window
+    )
+    for timestamp in built.panel.timestamps[1 : warmup + 1]:
+        prefix_identities.add(timestamp.isoformat())
+    current_timestamp = None
+    causal_identity = ""
+    for quality in engine.iter_with_quality(built.panel, subspace_lag=subspace_lag):
+        timestamp = quality.observation.timestamp
+        if timestamp != current_timestamp:
+            causal_identity = prefix_identities.add(timestamp.isoformat())
+            current_timestamp = timestamp
+        yield quality, causal_identity
+
+
 def enrich_event(
     base: dict[str, object], quality: PCAQualityObservation
 ) -> dict[str, object]:
     observation = quality.observation
+    if not observation.event_emitted or quality.prior_residuals is None:
+        raise PCAQualityError("AR quality is available only for emitted events")
     ar = estimate_ar1(quality.prior_residuals, FROZEN_PCA_CONFIG.variance_epsilon)
     base.update(
         {
@@ -338,22 +391,24 @@ def run(source_events: Path, output_dir: Path) -> None:
     sources = _source_events(source_events)
     expected = next(sources, None)
     emitted = 0
-    prefix_identities = _PrefixPanelIdentities(built.identity)
-    warmup = (
-        FROZEN_PCA_CONFIG.pca_training_window
-        + FROZEN_PCA_CONFIG.residual_normalization_window
-    )
-    for timestamp in built.panel.timestamps[1 : warmup + 1]:
-        prefix_identities.add(timestamp.isoformat())
+    processed_rows = 0
+    previous_timestamp = None
     with StreamingJSONLWriter(enriched_path) as target:
-        for processed, quality in enumerate(
-            PCAResidualEngine(FROZEN_PCA_CONFIG).iter_with_quality(
-                built.panel, subspace_lag=SUBSPACE_LAG
-            ),
-            1,
+        for quality, causal_identity in iter_quality_with_panel_identities(
+            built,
+            PCAResidualEngine(FROZEN_PCA_CONFIG),
+            subspace_lag=SUBSPACE_LAG,
         ):
             row = quality.observation
-            causal_identity = prefix_identities.add(row.timestamp.isoformat())
+            if row.timestamp != previous_timestamp:
+                processed_rows += 1
+                previous_timestamp = row.timestamp
+                if processed_rows % PROGRESS_INTERVAL == 0:
+                    print(
+                        f"processed_synchronized_rows={processed_rows} "
+                        f"emitted_enriched_events={emitted}",
+                        flush=True,
+                    )
             if row.event_emitted:
                 if expected is None:
                     raise PCAQualityError("regenerated event stream has extra events")
@@ -364,11 +419,6 @@ def run(source_events: Path, output_dir: Path) -> None:
                 target.write(enrich_event(regenerated, quality))
                 emitted += 1
                 expected = next(sources, None)
-            if processed % PROGRESS_INTERVAL == 0:
-                print(
-                    f"processed_rows={processed} emitted_enriched_events={emitted}",
-                    flush=True,
-                )
     if expected is not None:
         raise PCAQualityError("regenerated event stream ended before frozen source")
     audit = {

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import IntEnum
 from math import isfinite
+from typing import cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -145,7 +146,7 @@ class PCAQualityObservation:
     k2_eigengap_ratio: float
     subspace_distance_60: float | None
     cross_sectional_standardized_return_dispersion: float
-    prior_residuals: tuple[float, ...]
+    prior_residuals: tuple[float, ...] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,7 +213,11 @@ class PCAResidualEngine:
         self.config = config or PCAResidualConfig()
 
     def run(self, panel: SynchronizedClosePanel) -> tuple[ResidualObservation, ...]:
-        return tuple(row.observation for row in self.run_with_quality(panel))
+        """Run without constructing event-quality payloads."""
+        return tuple(
+            cast(ResidualObservation, row)
+            for row in self._iter(panel, include_quality=False, subspace_lag=60)
+        )
 
     def run_with_quality(
         self, panel: SynchronizedClosePanel, *, subspace_lag: int = 60
@@ -222,7 +227,18 @@ class PCAResidualEngine:
     def iter_with_quality(
         self, panel: SynchronizedClosePanel, *, subspace_lag: int = 60
     ) -> Iterator[PCAQualityObservation]:
-        """Return diagnostics without performing an independent PCA calculation.
+        """Return diagnostics without performing an independent PCA calculation."""
+        for row in self._iter(panel, include_quality=True, subspace_lag=subspace_lag):
+            yield cast(PCAQualityObservation, row)
+
+    def _iter(
+        self,
+        panel: SynchronizedClosePanel,
+        *,
+        include_quality: bool,
+        subspace_lag: int,
+    ) -> Iterator[ResidualObservation | PCAQualityObservation]:
+        """Execute the single canonical PCA loop with optional instrumentation.
 
         Projection distance is Frobenius distance divided by ``sqrt(2*K)``, the
         maximum distance between two rank-K orthogonal projections.
@@ -263,24 +279,25 @@ class PCAResidualEngine:
             full_order = np.argsort(eigenvalues)[::-1]
             order = full_order[: self.config.components]
             components = eigenvectors[:, order].T
-            projection = components.T @ components
-            positive = eigenvalues[np.isfinite(eigenvalues) & (eigenvalues > 0)]
-            eigenvalue_sum = float(positive.sum())
-            if eigenvalue_sum <= self.config.variance_epsilon:
-                raise PCAResidualError("PCA positive eigenvalue sum is near zero")
-            ordered_values = eigenvalues[full_order]
-            explained = float(ordered_values[:2].sum() / eigenvalue_sum)
-            eigengap = (
-                float((ordered_values[1] - ordered_values[2]) / eigenvalue_sum)
-                if len(ordered_values) >= 3
-                else 0.0
-            )
-            subspace = None
-            if len(projections) == subspace_lag:
-                subspace = float(
-                    np.linalg.norm(projection - projections[0], ord="fro")
-                    / np.sqrt(2 * self.config.components)
+            if include_quality:
+                projection = components.T @ components
+                positive = eigenvalues[np.isfinite(eigenvalues) & (eigenvalues > 0)]
+                eigenvalue_sum = float(positive.sum())
+                if eigenvalue_sum <= self.config.variance_epsilon:
+                    raise PCAResidualError("PCA positive eigenvalue sum is near zero")
+                ordered_values = eigenvalues[full_order]
+                explained = float(ordered_values[:2].sum() / eigenvalue_sum)
+                eigengap = (
+                    float((ordered_values[1] - ordered_values[2]) / eigenvalue_sum)
+                    if len(ordered_values) >= 3
+                    else 0.0
                 )
+                subspace = None
+                if len(projections) == subspace_lag:
+                    subspace = float(
+                        np.linalg.norm(projection - projections[0], ord="fro")
+                        / np.sqrt(2 * self.config.components)
+                    )
             current = (returns[index] - mean) / scale
             reconstruction = reconstruct_from_components(current, pca_mean, components)
             residual = current - reconstruction
@@ -315,17 +332,23 @@ class PCAResidualEngine:
                         state.shock_sign,
                         state.fade_direction,
                     )
-                    yield PCAQualityObservation(
-                        observation=observation,
-                        k2_explained_variance_ratio=explained,
-                        k2_eigengap_ratio=eigengap,
-                        subspace_distance_60=subspace,
-                        cross_sectional_standardized_return_dispersion=float(
-                            current.std(ddof=1)
-                        ),
-                        prior_residuals=tuple(
-                            float(value) for value in history[:, column]
-                        ),
-                    )
+                    if include_quality:
+                        yield PCAQualityObservation(
+                            observation=observation,
+                            k2_explained_variance_ratio=explained,
+                            k2_eigengap_ratio=eigengap,
+                            subspace_distance_60=subspace,
+                            cross_sectional_standardized_return_dispersion=float(
+                                current.std(ddof=1)
+                            ),
+                            prior_residuals=(
+                                tuple(float(value) for value in history[:, column])
+                                if state.event_emitted
+                                else None
+                            ),
+                        )
+                    else:
+                        yield observation
             residual_history.append(residual.copy())
-            projections.append(projection)
+            if include_quality:
+                projections.append(projection)
