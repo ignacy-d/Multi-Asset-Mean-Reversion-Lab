@@ -23,6 +23,9 @@ AVAILABLE = "AUTHENTICATED_COST_OVERLAY_AVAILABLE"
 MISSING_SPREAD = "BLOCKED_MISSING_SPREAD_PROFILE"
 MISSING_CONVERSION = "BLOCKED_MISSING_COMMISSION_CONVERSION"
 MISSING_REFERENCE = "BLOCKED_MISSING_REFERENCE_RATE"
+MISSING_ADJUSTMENT = "BLOCKED_MISSING_CONVERSION_ADJUSTMENT"
+MISSING_SESSION_POLICY = "BLOCKED_MISSING_COST_PROFILE_SESSION"
+SESSION_KEYS = ("overall", "asia", "london", "new_york")
 
 
 class EconomicAnalysisError(ValueError):
@@ -76,6 +79,7 @@ class ResearchOutcome:
     exit_price: float
     horizon_minutes: int
     gross_signed_bps_return: float
+    cost_profile_session: str = "overall"
     session_labels: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -95,7 +99,7 @@ class ResearchOutcome:
             ):
                 raise EconomicAnalysisError(f"{name} must be timezone-aware UTC")
         if (
-            self.entry_timestamp > self.timestamp
+            self.entry_timestamp < self.timestamp
             or self.exit_timestamp < self.entry_timestamp
         ):
             raise EconomicAnalysisError("timestamps violate point-in-time ordering")
@@ -104,6 +108,10 @@ class ResearchOutcome:
         _finite(self.gross_signed_bps_return, "gross_signed_bps_return")
         if isinstance(self.horizon_minutes, bool) or self.horizon_minutes <= 0:
             raise EconomicAnalysisError("horizon_minutes must be positive")
+        if self.cost_profile_session not in SESSION_KEYS:
+            raise EconomicAnalysisError(
+                f"cost_profile_session must be one of: {', '.join(SESSION_KEYS)}"
+            )
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
     @property
@@ -133,21 +141,34 @@ class CostProfileV2:
             raise EconomicAnalysisError("v2 requires exactly the frozen 16 scenarios")
         return cls(raw)
 
+    def _session_key(self, session: str | None) -> str | None:
+        if session is not None:
+            return session
+        if self.raw.get("null_session_cost_profile") == "overall":
+            return "overall"
+        return None
+
     def coverage_status(self, instrument: str, session: str | None = None) -> str:
-        key = session or "overall"
+        key = self._session_key(session)
+        if key is None:
+            return MISSING_SESSION_POLICY
         profile = self.raw.get("instruments", {}).get(instrument)
         if not profile or not profile.get("spread_profiles", {}).get(key, {}).get(
             "authenticated", False
         ):
             return MISSING_SPREAD
-        conversion = profile.get("commission_conversion", {})
-        if not conversion.get("authenticated", False):
+        conversion = (
+            profile.get("commission_conversion", {}).get("profiles", {}).get(key)
+        )
+        if not conversion or not conversion.get("authenticated", False):
             return MISSING_CONVERSION
         if conversion.get("quote_currency_per_usd") is None:
             return MISSING_REFERENCE
         adjustment = profile.get("conversion_adjustment", {})
-        if not adjustment.get("defined", False):
-            return MISSING_REFERENCE
+        if not adjustment.get("defined", False) or not adjustment.get(
+            "authenticated", False
+        ):
+            return MISSING_ADJUSTMENT
         return AVAILABLE
 
     def costs(
@@ -159,11 +180,12 @@ class CostProfileV2:
         if status != AVAILABLE:
             raise EconomicAnalysisError(status)
         data = self.raw["instruments"][instrument]
-        spread = _finite(
-            data["spread_profiles"][session or "overall"][f"{statistic}_pips"], "spread"
-        )
+        key = self._session_key(session)
+        if key is None:  # coverage_status already protects this branch.
+            raise EconomicAnalysisError(MISSING_SESSION_POLICY)
+        spread = _finite(data["spread_profiles"][key][f"{statistic}_pips"], "spread")
         conversion = _finite(
-            data["commission_conversion"]["quote_currency_per_usd"],
+            data["commission_conversion"]["profiles"][key]["quote_currency_per_usd"],
             "quote_currency_per_usd",
             positive=True,
         )
@@ -246,6 +268,34 @@ def break_even_additional_slippage(
     return (low + high) / 2
 
 
+def _break_even_for_observations(
+    observations: Sequence[tuple[float, float, float, float]],
+    base_slippage: float = 0.0,
+) -> float:
+    """Return additional slippage for heterogeneous exact cost observations."""
+    if not observations:
+        raise EconomicAnalysisError("break-even requires observations")
+
+    def mean_at(additional: float) -> float:
+        return statistics.fmean(
+            net_pips(gross, spread, base_slippage + additional, commission, rate)
+            for gross, spread, commission, rate in observations
+        )
+
+    if mean_at(0.0) <= 0:
+        return 0.0
+    low, high = 0.0, 1.0
+    while mean_at(high) > 0:
+        high *= 2
+    for _ in range(200):
+        mid = (low + high) / 2
+        if mean_at(mid) > 0:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2
+
+
 def _trimmed_mean(values: Sequence[float]) -> float:
     ordered = sorted(values)
     trim = int(len(ordered) * 0.05)
@@ -310,39 +360,66 @@ def analyze(
         "bootstrap_event_weighted_mean_pips": calendar_month_block_bootstrap(
             outcomes, replicates=bootstrap_replicates, seed=seed
         ),
-        "cost_floor_label": COST_FLOOR_LABEL,
+        "cost_floor": {
+            "label": COST_FLOOR_LABEL,
+            "net_mean_pips": None,
+            "break_even_additional_slippage_pips": None,
+        },
         "cost_scenarios": {},
     }
     if profile is not None:
         for statistic, slip in scenarios():
-            supported, blocked = [], Counter[str]()
+            supported: list[float] = []
+            supported_gross: list[float] = []
+            supported_spreads: list[float] = []
+            supported_commissions: list[float] = []
+            cost_observations: list[tuple[float, float, float, float]] = []
+            blocked = Counter[str]()
             for event in outcomes:
                 status = profile.coverage_status(
-                    event.instrument,
-                    event.session_labels[0] if event.session_labels else None,
+                    event.instrument, event.cost_profile_session
                 )
                 if status != AVAILABLE:
                     blocked[status] += 1
                     continue
                 spread, commission, rate = profile.costs(
-                    event.instrument,
-                    event.session_labels[0] if event.session_labels else None,
-                    statistic,
+                    event.instrument, event.cost_profile_session, statistic
                 )
+                supported_gross.append(event.gross_pips)
+                supported_spreads.append(spread)
+                supported_commissions.append(commission)
+                cost_observations.append((event.gross_pips, spread, commission, rate))
                 supported.append(
                     net_pips(event.gross_pips, spread, slip, commission, rate)
                 )
             summary: dict[str, Any] = {
+                "n": len(supported),
                 "supported_n": len(supported),
                 "blocked": dict(blocked),
+                "slippage_pips": slip,
             }
             if supported:
                 summary |= {
+                    "gross_mean_pips": statistics.fmean(supported_gross),
+                    "mean_spread_pips": statistics.fmean(supported_spreads),
+                    "commission_pips": statistics.fmean(supported_commissions),
                     "mean_net_pips": statistics.fmean(supported),
                     "median_net_pips": statistics.median(supported),
                     "net_positive_fraction": sum(x > 0 for x in supported)
                     / len(supported),
                     "total_net_pips": sum(supported),
+                    "break_even_additional_slippage_pips": (
+                        _break_even_for_observations(cost_observations, slip)
+                    ),
                 }
+                if statistic == "mean" and slip == 0.0:
+                    summary["label"] = COST_FLOOR_LABEL
+                    result["cost_floor"] = {
+                        "label": COST_FLOOR_LABEL,
+                        "net_mean_pips": summary["mean_net_pips"],
+                        "break_even_additional_slippage_pips": summary[
+                            "break_even_additional_slippage_pips"
+                        ],
+                    }
             result["cost_scenarios"][f"{statistic}|{slip:g}"] = summary
     return result

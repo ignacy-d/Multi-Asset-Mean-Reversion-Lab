@@ -23,12 +23,12 @@
   "instruments": {
     "AUDJPY": {
       "commission_conversion": {
-        "authenticated": false,
-        "quote_currency_per_usd": null
+        "profiles": {}
       },
       "conversion_adjustment": {
+        "authenticated": true,
         "defined": true,
-        "rate": 0.0
+        "rate": 0.007
       },
       "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
       "metadata": {
@@ -41,10 +41,31 @@
     },
     "AUDUSD": {
       "commission_conversion": {
-        "authenticated": true,
-        "quote_currency_per_usd": 1.0
+        "profiles": {
+          "asia": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "london": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "new_york": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "overall": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          }
+        }
       },
       "conversion_adjustment": {
+        "authenticated": true,
         "defined": true,
         "rate": 0.0
       },
@@ -59,12 +80,12 @@
     },
     "EURGBP": {
       "commission_conversion": {
-        "authenticated": false,
-        "quote_currency_per_usd": null
+        "profiles": {}
       },
       "conversion_adjustment": {
+        "authenticated": true,
         "defined": true,
-        "rate": 0.0
+        "rate": 0.007
       },
       "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
       "metadata": {
@@ -77,10 +98,31 @@
     },
     "EURUSD": {
       "commission_conversion": {
-        "authenticated": true,
-        "quote_currency_per_usd": 1.0
+        "profiles": {
+          "asia": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "london": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "new_york": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "overall": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          }
+        }
       },
       "conversion_adjustment": {
+        "authenticated": true,
         "defined": true,
         "rate": 0.0
       },
@@ -95,10 +137,31 @@
     },
     "GBPUSD": {
       "commission_conversion": {
-        "authenticated": true,
-        "quote_currency_per_usd": 1.0
+        "profiles": {
+          "asia": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "london": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "new_york": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "overall": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          }
+        }
       },
       "conversion_adjustment": {
+        "authenticated": true,
         "defined": true,
         "rate": 0.0
       },
@@ -113,10 +176,31 @@
     },
     "NZDUSD": {
       "commission_conversion": {
-        "authenticated": true,
-        "quote_currency_per_usd": 1.0
+        "profiles": {
+          "asia": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "london": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "new_york": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "overall": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          }
+        }
       },
       "conversion_adjustment": {
+        "authenticated": true,
         "defined": true,
         "rate": 0.0
       },
@@ -131,12 +215,12 @@
     },
     "USDCAD": {
       "commission_conversion": {
-        "authenticated": false,
-        "quote_currency_per_usd": null
+        "profiles": {}
       },
       "conversion_adjustment": {
+        "authenticated": true,
         "defined": true,
-        "rate": 0.0
+        "rate": 0.007
       },
       "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
       "metadata": {
@@ -149,12 +233,12 @@
     },
     "USDCHF": {
       "commission_conversion": {
-        "authenticated": false,
-        "quote_currency_per_usd": null
+        "profiles": {}
       },
       "conversion_adjustment": {
+        "authenticated": true,
         "defined": true,
-        "rate": 0.0
+        "rate": 0.007
       },
       "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
       "metadata": {
@@ -167,12 +251,12 @@
     },
     "USDJPY": {
       "commission_conversion": {
-        "authenticated": false,
-        "quote_currency_per_usd": null
+        "profiles": {}
       },
       "conversion_adjustment": {
+        "authenticated": true,
         "defined": true,
-        "rate": 0.0
+        "rate": 0.007
       },
       "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
       "metadata": {
@@ -185,5 +269,6 @@
     }
   },
   "methodology_id": "stage4c-economic-analysis-v2",
+  "null_session_cost_profile": "overall",
   "schema_version": "stage4c-ftmo-cost-profile-v2"
 }

@@ -60,6 +60,7 @@ def _stats(rows: list[tuple[float, float, bool, bool]]) -> dict[str, float | int
         "max_pips": max(spreads),
         "sample_count": len(rows),
         "mean_mid": sum(x[1] for x in rows) / len(rows),
+        "mean_inverse_mid": sum(1 / x[1] for x in rows) / len(rows),
         "negative_spread_rows_raw": sum(x[2] for x in rows),
         "zero_spread_rows_raw": sum(x[3] for x in rows),
     }
@@ -103,10 +104,70 @@ def inspect_csv(instrument: str, path: Path) -> tuple[dict[str, Any], dict[str, 
     return provenance, profiles
 
 
-def build_profile(inputs: dict[str, Path]) -> dict[str, Any]:
+def _conversion_profiles(
+    instrument: str,
+    reference_profiles: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Build authenticated session conversions without discovering references."""
+    meta = FX_INSTRUMENTS[instrument]
+    if meta.quote_currency == "USD":
+        return {
+            key: {"authenticated": True, "quote_currency_per_usd": 1.0}
+            for key in ("overall", "asia", "london", "new_york")
+        }
+    reference_symbol = f"USD{meta.quote_currency}"
+    reciprocal = False
+    if meta.quote_currency == "GBP":
+        reference_symbol, reciprocal = "GBPUSD", True
+    source = reference_profiles.get(reference_symbol)
+    if source is None:
+        return {}
+    profiles = {}
+    for key, values in source.items():
+        profiles[key] = {
+            "authenticated": True,
+            "quote_currency_per_usd": (
+                float(values["mean_inverse_mid"])
+                if reciprocal
+                else float(values["mean_mid"])
+            ),
+            "reference_instrument": reference_symbol,
+            "method": "mean_reciprocal_mid" if reciprocal else "mean_mid",
+        }
+    return profiles
+
+
+def build_profile(
+    inputs: dict[str, Path],
+    reference_inputs: dict[str, Path] | None = None,
+    *,
+    non_usd_adjustment_rate: float | None = None,
+) -> dict[str, Any]:
+    """Build from only the supplied spread and conversion-reference CSV paths."""
+    reference_inputs = reference_inputs or {}
+    allowed_references = {"USDJPY", "USDCAD", "USDCHF", "GBPUSD"}
+    unsupported = set(reference_inputs) - allowed_references
+    if unsupported:
+        raise ValueError(f"unsupported conversion reference: {sorted(unsupported)}")
+    if non_usd_adjustment_rate is not None and not (
+        math.isfinite(non_usd_adjustment_rate) and 0 <= non_usd_adjustment_rate < 1
+    ):
+        raise ValueError("non-USD adjustment rate must be finite and in [0, 1)")
+    reference_profiles = {
+        symbol: inspect_csv(symbol, path)[1]
+        for symbol, path in sorted(reference_inputs.items())
+    }
+    inspected = {
+        instrument: inspect_csv(instrument, path)
+        for instrument, path in sorted(inputs.items())
+    }
+    for instrument, (_, profiles) in inspected.items():
+        if FX_INSTRUMENTS[instrument].base_currency == "USD":
+            reference_profiles.setdefault(instrument, profiles)
     result: dict[str, Any] = {
         "schema_version": PROFILE_SCHEMA,
         "account_currency": "USD",
+        "null_session_cost_profile": "overall",
         "commission_usd_round_turn": 5.0,
         "cost_scenarios": {
             "spread_statistic": list(SPREAD_STATISTICS),
@@ -114,8 +175,10 @@ def build_profile(inputs: dict[str, Path]) -> dict[str, Any]:
         },
         "instruments": {},
     }
-    for instrument, path in sorted(inputs.items()):
-        provenance, profiles = inspect_csv(instrument, path)
+    for instrument, (provenance, profiles) in inspected.items():
+        conversion_profiles = _conversion_profiles(instrument, reference_profiles)
+        quote_is_usd = FX_INSTRUMENTS[instrument].quote_currency == "USD"
+        adjustment_defined = quote_is_usd or non_usd_adjustment_rate is not None
         result["instruments"][instrument] = {
             "metadata": FX_INSTRUMENTS[instrument].__dict__
             if hasattr(FX_INSTRUMENTS[instrument], "__dict__")
@@ -131,10 +194,13 @@ def build_profile(inputs: dict[str, Path]) -> dict[str, Any]:
                 for name, values in profiles.items()
             },
             "commission_conversion": {
-                "authenticated": False,
-                "quote_currency_per_usd": None,
+                "profiles": conversion_profiles,
             },
-            "conversion_adjustment": {"defined": False, "rate": None},
+            "conversion_adjustment": {
+                "authenticated": adjustment_defined,
+                "defined": adjustment_defined,
+                "rate": 0.0 if quote_is_usd else non_usd_adjustment_rate,
+            },
         }
     return result
 
@@ -144,6 +210,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--input", action="append", required=True, metavar="INSTRUMENT=CSV"
     )
+    parser.add_argument(
+        "--non-usd-adjustment-rate",
+        type=float,
+        help="explicit authenticated cTrader rate, currently 0.007 when applicable",
+    )
+    parser.add_argument(
+        "--conversion-reference",
+        action="append",
+        default=[],
+        metavar="INSTRUMENT=CSV",
+        help="explicit authenticated USDJPY/USDCAD/USDCHF/GBPUSD reference",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     inputs: dict[str, Path] = {}
@@ -152,8 +230,23 @@ def main(argv: list[str] | None = None) -> int:
         if not separator or instrument not in FX_INSTRUMENTS or instrument in inputs:
             parser.error("each --input must be a unique supported INSTRUMENT=CSV")
         inputs[instrument] = Path(raw_path)
+    references: dict[str, Path] = {}
+    for item in args.conversion_reference:
+        instrument, separator, raw_path = item.partition("=")
+        if not separator or instrument in references:
+            parser.error("each conversion reference must be a unique INSTRUMENT=CSV")
+        references[instrument] = Path(raw_path)
     args.output.write_text(
-        json.dumps(build_profile(inputs), sort_keys=True, indent=2) + "\n",
+        json.dumps(
+            build_profile(
+                inputs,
+                references,
+                non_usd_adjustment_rate=args.non_usd_adjustment_rate,
+            ),
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return 0
