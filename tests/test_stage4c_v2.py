@@ -17,6 +17,7 @@ from mr_lab.stage4c_v2 import (
     EconomicAnalysisError,
     ResearchOutcome,
     analyze,
+    bootstrap_summary,
     break_even_additional_slippage,
     calendar_month_block_bootstrap,
     scenarios,
@@ -197,6 +198,25 @@ def test_scenarios_bootstrap_and_event_weighting():
     )
     assert floor["label"] == COST_FLOOR_LABEL
     assert report["cost_floor"]["net_mean_pips"] == floor["mean_net_pips"]
+
+
+def test_bootstrap_summary_uses_same_replicates_and_frozen_type7_percentiles():
+    summary = bootstrap_summary((0.0, 10.0, 20.0, 30.0), seed=41)
+    assert summary | {"p2_5": 0.75, "p97_5": 29.25} == {
+        "replicates": 4,
+        "seed": 41,
+        "bootstrap_mean": 15.0,
+        "p2_5": 0.75,
+        "median": 15.0,
+        "p97_5": 29.25,
+        "lower_2_5pct_gt_zero": True,
+    }
+    assert summary["p2_5"] == pytest.approx(0.75)
+    assert summary["p97_5"] == pytest.approx(29.25)
+    rows = [event(exit=1.1001), event(exit=1.1003)]
+    report = analyze(rows, bootstrap_replicates=17, seed=123)
+    replicates = report["bootstrap_event_weighted_mean_pips"]
+    assert report["bootstrap_summary"] == bootstrap_summary(replicates, seed=123)
 
 
 def test_diagnostic_labels_do_not_select_cost_session():

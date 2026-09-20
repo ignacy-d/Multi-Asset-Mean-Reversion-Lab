@@ -323,6 +323,40 @@ def calendar_month_block_bootstrap(
     )
 
 
+def bootstrap_summary(
+    values: Sequence[float], *, seed: int
+) -> dict[str, int | float | bool]:
+    """Summarize replicates using frozen Hyndman-Fan type-7 percentiles.
+
+    For probability ``p``, the zero-based fractional rank is ``(n - 1) * p``;
+    values at the surrounding ranks are linearly interpolated.  This is stated
+    here explicitly so library defaults cannot silently alter the methodology.
+    """
+    if not values:
+        raise EconomicAnalysisError("bootstrap summary requires replicates")
+    ordered = sorted(_finite(value, "bootstrap replicate") for value in values)
+
+    def percentile(probability: float) -> float:
+        rank = (len(ordered) - 1) * probability
+        lower = math.floor(rank)
+        upper = math.ceil(rank)
+        if lower == upper:
+            return ordered[lower]
+        weight = rank - lower
+        return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+    lower = percentile(0.025)
+    return {
+        "replicates": len(ordered),
+        "seed": seed,
+        "bootstrap_mean": statistics.fmean(ordered),
+        "p2_5": lower,
+        "median": percentile(0.5),
+        "p97_5": percentile(0.975),
+        "lower_2_5pct_gt_zero": lower > 0,
+    }
+
+
 def analyze(
     outcomes: Sequence[ResearchOutcome],
     profile: CostProfileV2 | None = None,
@@ -336,6 +370,9 @@ def analyze(
     bps = [item.gross_signed_bps_return for item in outcomes]
     months = Counter((x.timestamp.year, x.timestamp.month) for x in outcomes)
     instruments = Counter(x.instrument for x in outcomes)
+    bootstrap_values = calendar_month_block_bootstrap(
+        outcomes, replicates=bootstrap_replicates, seed=seed
+    )
     result: dict[str, Any] = {
         "methodology_id": METHODOLOGY_ID,
         "n": len(outcomes),
@@ -357,9 +394,8 @@ def analyze(
             "largest_month_fraction": max(months.values()) / len(outcomes),
             "largest_instrument_fraction": max(instruments.values()) / len(outcomes),
         },
-        "bootstrap_event_weighted_mean_pips": calendar_month_block_bootstrap(
-            outcomes, replicates=bootstrap_replicates, seed=seed
-        ),
+        "bootstrap_event_weighted_mean_pips": bootstrap_values,
+        "bootstrap_summary": bootstrap_summary(bootstrap_values, seed=seed),
         "cost_floor": {
             "label": COST_FLOOR_LABEL,
             "net_mean_pips": None,
