@@ -49,7 +49,12 @@ RELATIONSHIPS = (
 
 @dataclass(frozen=True, slots=True)
 class LeadLagParameters:
-    """Frozen v1 signal parameters, exposed explicitly for provenance."""
+    """Frozen v1 signal parameters, exposed explicitly for provenance.
+
+    This public specification is intentionally not a tuning surface. A changed
+    value describes a different study and must not emit events carrying the
+    ``RV-LEADLAG-2024-v1`` identity.
+    """
 
     lookback_returns: int = 288
     shock_threshold: float = 2.0
@@ -57,14 +62,18 @@ class LeadLagParameters:
     cooldown: timedelta = timedelta(minutes=15)
 
     def __post_init__(self) -> None:
-        if self.lookback_returns < 2:
-            raise ValueError("lookback_returns must support sample variance")
-        if self.shock_threshold <= 0:
-            raise ValueError("shock_threshold must be positive")
-        if not 0 <= self.max_laggard_ratio <= 1:
-            raise ValueError("max_laggard_ratio must be in [0, 1]")
-        if self.cooldown < timedelta(0):
-            raise ValueError("cooldown cannot be negative")
+        expected = (288, 2.0, 0.50, timedelta(minutes=15))
+        actual = (
+            self.lookback_returns,
+            self.shock_threshold,
+            self.max_laggard_ratio,
+            self.cooldown,
+        )
+        if actual != expected:
+            raise ValueError(
+                "RV-LEADLAG-2024-v1 parameters are frozen at lookback_returns=288, "
+                "shock_threshold=2.0, max_laggard_ratio=0.50, cooldown=15 minutes"
+            )
 
 
 DEFAULT_PARAMETERS = LeadLagParameters()
@@ -190,7 +199,7 @@ def _event_id(
     identity = "|".join(
         (STUDY_ID, relationship_id, timestamp.isoformat(), leader, laggard)
     )
-    return hashlib.sha256(identity.encode("ascii")).hexdigest()
+    return f"sha256:{hashlib.sha256(identity.encode('ascii')).hexdigest()}"
 
 
 def detect_leadlag_events(
@@ -203,6 +212,8 @@ def detect_leadlag_events(
     intervals are never filled, and a return spanning a missing bar is invalid.
     Cooldown is maintained independently for each relationship.
     """
+    if parameters != DEFAULT_PARAMETERS:
+        raise ValueError("detect_leadlag_events is bound to the frozen v1 parameters")
     by_instrument = _validated_bars(bars)
     events: list[LeadLagEvent] = []
     for relationship in RELATIONSHIPS:

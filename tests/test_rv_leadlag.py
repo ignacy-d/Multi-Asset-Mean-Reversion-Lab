@@ -58,6 +58,8 @@ def test_positive_event_contract_thresholds_and_order_invariance() -> None:
     assert event.direction == 1
     assert event.z_ratio < 0.5
     assert event.event_id == reversed_event.event_id
+    assert event.event_id.startswith("sha256:")
+    assert len(event.event_id) == len("sha256:") + 64
     assert event.leader_z_bin == "2.50 <= |z| < 3.00"
 
 
@@ -166,6 +168,28 @@ def test_module_has_no_empirical_io_or_economic_integration() -> None:
         assert forbidden not in source
 
 
-def test_parameters_validate() -> None:
-    with pytest.raises(ValueError):
-        LeadLagParameters(lookback_returns=1)
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"lookback_returns": 287},
+        {"lookback_returns": 289},
+        {"shock_threshold": 1.999},
+        {"shock_threshold": 2.001},
+        {"max_laggard_ratio": 0.49},
+        {"max_laggard_ratio": 0.51},
+        {"cooldown": timedelta(minutes=14)},
+        {"cooldown": timedelta(minutes=16)},
+    ],
+)
+def test_frozen_v1_parameters_reject_methodology_drift(
+    change: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="parameters are frozen"):
+        LeadLagParameters(**change)  # type: ignore[arg-type]
+
+
+def test_detector_rejects_a_tampered_parameter_instance() -> None:
+    parameters = LeadLagParameters()
+    object.__setattr__(parameters, "lookback_returns", 287)
+    with pytest.raises(ValueError, match="bound to the frozen v1"):
+        detect_leadlag_events(_input(), parameters)
