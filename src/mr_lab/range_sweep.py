@@ -15,7 +15,15 @@ from hashlib import sha256
 from zoneinfo import ZoneInfo
 
 from mr_lab.data import Bar, DataContractError, Timeframe, validate_dataset
-from mr_lab.sessions import DEFAULT_SESSION_SPEC, SessionSpec, TimeWindow, classify_bar
+from mr_lab.sessions import DEFAULT_SESSION_SPEC, TimeWindow, classify_bar
+
+STUDY_ID = "RANGE-SWEEP-2024-v1"
+SCIENTIFIC_STATUS = "2024_DISCOVERY_NOT_CONFIRMATION"
+
+_M5 = Timeframe("5m")
+_FX_TIMEZONE = "America/New_York"
+_FX_DAY_BOUNDARY = time(17)
+_ASIA_SESSION_NAME = "asia"
 
 
 class ReferenceFamily(Enum):
@@ -49,6 +57,7 @@ class StructuralReference:
     instrument: str
     price: float
     valid_at: datetime
+    expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,12 +85,8 @@ class RangeSweepEvent:
 
 @dataclass(frozen=True, slots=True)
 class RangeSweepConfig:
-    """Configuration for reference construction and optional pip diagnostics."""
+    """Optional diagnostic metadata; v1 methodology itself is frozen."""
 
-    session_spec: SessionSpec = DEFAULT_SESSION_SPEC
-    asia_session_name: str = "asia"
-    fx_timezone: str = "America/New_York"
-    fx_day_boundary: time = time(17)
     pip_sizes: Mapping[str, float] | None = None
 
 
@@ -93,27 +98,25 @@ def _window_bounds(local_day: date, window: TimeWindow) -> tuple[datetime, datet
     return start.astimezone(UTC), end.astimezone(UTC)
 
 
-def _fx_bounds(
-    timestamp: datetime, config: RangeSweepConfig
-) -> tuple[datetime, datetime]:
-    timezone = ZoneInfo(config.fx_timezone)
+def _fx_bounds(timestamp: datetime) -> tuple[datetime, datetime]:
+    timezone = ZoneInfo(_FX_TIMEZONE)
     local = timestamp.astimezone(timezone)
-    boundary = datetime.combine(local.date(), config.fx_day_boundary, timezone)
+    boundary = datetime.combine(local.date(), _FX_DAY_BOUNDARY, timezone)
     if local < boundary:
         boundary = datetime.combine(
-            local.date() - timedelta(days=1), config.fx_day_boundary, timezone
+            local.date() - timedelta(days=1), _FX_DAY_BOUNDARY, timezone
         )
     end = datetime.combine(
-        boundary.date() + timedelta(days=1), config.fx_day_boundary, timezone
+        boundary.date() + timedelta(days=1), _FX_DAY_BOUNDARY, timezone
     )
     return boundary.astimezone(UTC), end.astimezone(UTC)
 
 
-def _asia_window(config: RangeSweepConfig) -> TimeWindow:
+def _asia_window() -> TimeWindow:
     matches = tuple(
         window
-        for window in config.session_spec.major_sessions
-        if window.name == config.asia_session_name
+        for window in DEFAULT_SESSION_SPEC.major_sessions
+        if window.name == _ASIA_SESSION_NAME
     )
     if len(matches) != 1:
         raise ValueError("asia_session_name must identify exactly one major session")
@@ -129,13 +132,45 @@ def _asia_bounds(timestamp: datetime, window: TimeWindow) -> tuple[datetime, dat
     return start, end
 
 
-def _references(
-    bars: tuple[Bar, ...], config: RangeSweepConfig
-) -> tuple[StructuralReference, ...]:
-    asia = _asia_window(config)
+def _is_provider_padding(bar: Bar) -> bool:
+    """Apply the repository's zero-activity, flat-OHLC padding policy."""
+    return bar.volume == 0 and bar.open == bar.high == bar.low == bar.close
+
+
+def _next_fx_boundary(end: datetime) -> datetime:
+    timezone = ZoneInfo(_FX_TIMEZONE)
+    local_end = end.astimezone(timezone)
+    return datetime.combine(
+        local_end.date() + timedelta(days=1), _FX_DAY_BOUNDARY, timezone
+    ).astimezone(UTC)
+
+
+def _next_asia_start(end: datetime, window: TimeWindow) -> datetime:
+    local_end = end.astimezone(ZoneInfo(window.timezone))
+    start, _ = _window_bounds(local_end.date() + timedelta(days=1), window)
+    return start
+
+
+def _is_complete_interval(
+    components: list[Bar], start: datetime, end: datetime
+) -> bool:
+    expected = (end - start) // _M5.duration
+    if len(components) != expected:
+        return False
+    return all(
+        bar.open_time == start + index * _M5.duration
+        and bar.close_time == start + (index + 1) * _M5.duration
+        and bar.available_at <= end
+        and not _is_provider_padding(bar)
+        for index, bar in enumerate(components)
+    )
+
+
+def _references(bars: tuple[Bar, ...]) -> tuple[StructuralReference, ...]:
+    asia = _asia_window()
     grouped: dict[tuple[ReferenceFamily, datetime, datetime], list[Bar]] = {}
     for bar in bars:
-        fx_start, fx_end = _fx_bounds(bar.open_time, config)
+        fx_start, fx_end = _fx_bounds(bar.open_time)
         if bar.open_time >= fx_start and bar.close_time <= fx_end:
             grouped.setdefault(
                 (ReferenceFamily.PREVIOUS_FX_DAY, fx_start, fx_end), []
@@ -150,18 +185,27 @@ def _references(
 
     references: list[StructuralReference] = []
     for (family, start, end), components in grouped.items():
-        # Delayed observations unavailable at finalization cannot revise a level.
-        known = tuple(bar for bar in components if bar.available_at <= end)
-        if not known:
+        if not _is_complete_interval(components, start, end):
             continue
         instance = f"{start.isoformat()}/{end.isoformat()}"
+        expires_at = (
+            _next_fx_boundary(end)
+            if family is ReferenceFamily.PREVIOUS_FX_DAY
+            else _next_asia_start(end, asia)
+        )
         for side, price in (
-            (ReferenceSide.HIGH, max(bar.high for bar in known)),
-            (ReferenceSide.LOW, min(bar.low for bar in known)),
+            (ReferenceSide.HIGH, max(bar.high for bar in components)),
+            (ReferenceSide.LOW, min(bar.low for bar in components)),
         ):
             references.append(
                 StructuralReference(
-                    family, instance, side, known[0].instrument, price, end
+                    family,
+                    instance,
+                    side,
+                    components[0].instrument,
+                    price,
+                    end,
+                    expires_at,
                 )
             )
     return tuple(
@@ -175,6 +219,7 @@ def _references(
 def _event_id(reference: StructuralReference, signal_timestamp: datetime) -> str:
     identity = "|".join(
         (
+            STUDY_ID,
             reference.family.value,
             reference.instance,
             reference.side.value,
@@ -197,17 +242,20 @@ def range_sweep_events(
     effective = config or RangeSweepConfig()
     report = validate_dataset(list(bars))
     observations = report.bars
-    if any(bar.timeframe != Timeframe("5m") for bar in observations):
+    if any(bar.timeframe != _M5 for bar in observations):
         raise DataContractError("range sweep signals require canonical 5m bars")
-    references = _references(observations, effective)
+    references = _references(observations)
     consumed: set[tuple[ReferenceFamily, str, ReferenceSide, str]] = set()
     events: list[RangeSweepEvent] = []
     for bar in observations:
         latest: dict[tuple[ReferenceFamily, ReferenceSide], StructuralReference] = {}
         for reference in references:
-            if reference.valid_at <= bar.open_time:
+            if (
+                reference.valid_at <= bar.open_time
+                and reference.valid_at <= bar.available_at < reference.expires_at
+            ):
                 latest[(reference.family, reference.side)] = reference
-        classification = classify_bar(bar, effective.session_spec)
+        classification = classify_bar(bar, DEFAULT_SESSION_SPEC)
         labels = (*classification.active_sessions, *classification.active_named_windows)
         for reference in latest.values():
             key = (
@@ -232,14 +280,14 @@ def range_sweep_events(
             pip_size = (effective.pip_sizes or {}).get(bar.instrument)
             events.append(
                 RangeSweepEvent(
-                    event_id=_event_id(reference, bar.close_time),
+                    event_id=_event_id(reference, bar.available_at),
                     reference_family=reference.family,
                     reference_instance=reference.instance,
                     reference_side=reference.side,
                     reference_price=reference.price,
                     signal_direction=direction,
                     instrument=bar.instrument,
-                    signal_timestamp=bar.close_time,
+                    signal_timestamp=bar.available_at,
                     open=bar.open,
                     high=bar.high,
                     low=bar.low,
@@ -247,7 +295,7 @@ def range_sweep_events(
                     overshoot_raw_price=overshoot,
                     overshoot_pips=None if pip_size is None else overshoot / pip_size,
                     minutes_since_reference_valid=(
-                        bar.close_time - reference.valid_at
+                        bar.available_at - reference.valid_at
                     ).total_seconds()
                     / 60,
                     session_labels=labels,
@@ -258,6 +306,8 @@ def range_sweep_events(
 
 
 __all__ = [
+    "SCIENTIFIC_STATUS",
+    "STUDY_ID",
     "RangeSweepConfig",
     "RangeSweepEvent",
     "ReferenceFamily",
