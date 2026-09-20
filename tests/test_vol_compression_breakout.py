@@ -79,6 +79,35 @@ def test_prior_only_four_return_rv_and_breakout_bar_excluded() -> None:
     assert event.rv_p20_prior == 0.0
 
 
+def test_rejects_mislabeled_ten_minute_bar() -> None:
+    bar = make_bar(0)
+    malformed = replace(
+        bar,
+        close_time=bar.open_time + timedelta(minutes=10),
+        available_at=bar.open_time + timedelta(minutes=10),
+    )
+
+    with pytest.raises(ValueError, match="span exactly 15 minutes"):
+        generate_events([malformed])
+
+
+def test_rejects_non_m15_aligned_bar() -> None:
+    bar = make_bar(0)
+    malformed = replace(
+        bar,
+        open_time=bar.open_time + timedelta(minutes=1),
+        close_time=bar.close_time + timedelta(minutes=1),
+        available_at=bar.available_at + timedelta(minutes=1),
+    )
+
+    with pytest.raises(ValueError, match="epoch-aligned"):
+        generate_events([malformed])
+
+
+def test_accepts_aligned_m15_bar() -> None:
+    assert generate_events([make_bar(0)]) == ()
+
+
 def test_requires_exactly_1920_prior_states_and_excludes_current_state() -> None:
     bars = first_eligible_history()
     assert generate_events([*bars[:-1], breakout(1924)]) == ()
@@ -154,6 +183,17 @@ def test_cooldown_is_exactly_60_minutes() -> None:
     ]
 
 
+def test_gap_breaks_current_state_continuity_but_keeps_prior_valid_states() -> None:
+    bars = first_eligible_history()
+    # Skip index 1925. The gap bar itself cannot use the pre-gap state. After
+    # five new contiguous bars, the existing 1920 valid reference states apply.
+    bars.extend(make_bar(index) for index in range(1926, 1931))
+    candidate = breakout(1931)
+
+    events = generate_events([*bars, candidate])
+    assert [event.timestamp for event in events] == [candidate.available_at]
+
+
 def test_independent_instruments_and_deterministic_identity() -> None:
     eur = [*first_eligible_history(), breakout()]
     gbp = [make_bar(i, instrument="GBPUSD") for i in range(1925)] + [
@@ -164,6 +204,8 @@ def test_independent_instruments_and_deterministic_identity() -> None:
     events = generate_events(interleaved)
     assert {event.instrument for event in events} == {"EURUSD", "GBPUSD"}
     assert events[0].event_id == generate_events(eur)[0].event_id
+    assert events[0].event_id.startswith("sha256:")
+    assert len(events[0].event_id.removeprefix("sha256:")) == 64
     assert events[0].study_id == STUDY_ID
 
 

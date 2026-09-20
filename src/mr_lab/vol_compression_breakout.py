@@ -108,7 +108,26 @@ def _event_id(bar: Bar, direction: str) -> str:
     identity = "|".join(
         (STUDY_ID, bar.instrument, bar.open_time.isoformat(), direction)
     )
-    return sha256(identity.encode("utf-8")).hexdigest()
+    return f"sha256:{sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def _validate_canonical_m15(bar: Bar, expected_timeframe: Timeframe) -> None:
+    """Reject bars whose declared M15 semantics do not match their timestamps."""
+
+    if bar.timeframe != expected_timeframe:
+        raise ValueError("all input bars must be canonical M15 bars")
+    for name in ("open_time", "close_time", "available_at"):
+        timestamp = getattr(bar, name)
+        if timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
+            raise ValueError(f"{name} must be a timezone-aware UTC timestamp")
+    if bar.close_time - bar.open_time != timedelta(minutes=15):
+        raise ValueError("M15 bars must span exactly 15 minutes")
+    if (
+        bar.open_time.minute % 15 != 0
+        or bar.open_time.second != 0
+        or bar.open_time.microsecond != 0
+    ):
+        raise ValueError("M15 bar open_time must be epoch-aligned")
 
 
 def generate_events(
@@ -137,8 +156,7 @@ def generate_events(
     last_available_at: datetime | None = None
 
     for bar in bars:
-        if bar.timeframe != config.timeframe:
-            raise ValueError("all input bars must be canonical M15 bars")
+        _validate_canonical_m15(bar, config.timeframe)
         if last_available_at is not None and bar.available_at < last_available_at:
             raise ValueError("bars must be nondecreasing by available_at")
         last_available_at = bar.available_at
