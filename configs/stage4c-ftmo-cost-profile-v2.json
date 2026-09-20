@@ -1,0 +1,274 @@
+{
+  "account_currency": "USD",
+  "commission_usd_round_turn": 5.0,
+  "cost_scenarios": {
+    "headline_floor": {
+      "label": "COST_FLOOR_ONLY_NOT_LIVE_EXPECTANCY",
+      "slippage_round_turn_pips": 0.0,
+      "spread_statistic": "mean"
+    },
+    "slippage_round_turn_pips": [
+      0.0,
+      0.1,
+      0.25,
+      0.5
+    ],
+    "spread_statistic": [
+      "mean",
+      "p75",
+      "p90",
+      "p95"
+    ]
+  },
+  "instruments": {
+    "AUDJPY": {
+      "commission_conversion": {
+        "profiles": {}
+      },
+      "conversion_adjustment": {
+        "authenticated": true,
+        "defined": true,
+        "rate": 0.007
+      },
+      "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
+      "metadata": {
+        "base_currency": "AUD",
+        "pip_size": 0.01,
+        "quote_currency": "JPY",
+        "standard_lot_size": 100000
+      },
+      "spread_profiles": {}
+    },
+    "AUDUSD": {
+      "commission_conversion": {
+        "profiles": {
+          "asia": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "london": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "new_york": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "overall": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          }
+        }
+      },
+      "conversion_adjustment": {
+        "authenticated": true,
+        "defined": true,
+        "rate": 0.0
+      },
+      "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
+      "metadata": {
+        "base_currency": "AUD",
+        "pip_size": 0.0001,
+        "quote_currency": "USD",
+        "standard_lot_size": 100000
+      },
+      "spread_profiles": {}
+    },
+    "EURGBP": {
+      "commission_conversion": {
+        "profiles": {}
+      },
+      "conversion_adjustment": {
+        "authenticated": true,
+        "defined": true,
+        "rate": 0.007
+      },
+      "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
+      "metadata": {
+        "base_currency": "EUR",
+        "pip_size": 0.0001,
+        "quote_currency": "GBP",
+        "standard_lot_size": 100000
+      },
+      "spread_profiles": {}
+    },
+    "EURUSD": {
+      "commission_conversion": {
+        "profiles": {
+          "asia": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "london": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "new_york": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "overall": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          }
+        }
+      },
+      "conversion_adjustment": {
+        "authenticated": true,
+        "defined": true,
+        "rate": 0.0
+      },
+      "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
+      "metadata": {
+        "base_currency": "EUR",
+        "pip_size": 0.0001,
+        "quote_currency": "USD",
+        "standard_lot_size": 100000
+      },
+      "spread_profiles": {}
+    },
+    "GBPUSD": {
+      "commission_conversion": {
+        "profiles": {
+          "asia": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "london": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "new_york": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "overall": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          }
+        }
+      },
+      "conversion_adjustment": {
+        "authenticated": true,
+        "defined": true,
+        "rate": 0.0
+      },
+      "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
+      "metadata": {
+        "base_currency": "GBP",
+        "pip_size": 0.0001,
+        "quote_currency": "USD",
+        "standard_lot_size": 100000
+      },
+      "spread_profiles": {}
+    },
+    "NZDUSD": {
+      "commission_conversion": {
+        "profiles": {
+          "asia": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "london": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "new_york": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          },
+          "overall": {
+            "authenticated": true,
+            "method": "account_currency_identity",
+            "quote_currency_per_usd": 1.0
+          }
+        }
+      },
+      "conversion_adjustment": {
+        "authenticated": true,
+        "defined": true,
+        "rate": 0.0
+      },
+      "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
+      "metadata": {
+        "base_currency": "NZD",
+        "pip_size": 0.0001,
+        "quote_currency": "USD",
+        "standard_lot_size": 100000
+      },
+      "spread_profiles": {}
+    },
+    "USDCAD": {
+      "commission_conversion": {
+        "profiles": {}
+      },
+      "conversion_adjustment": {
+        "authenticated": true,
+        "defined": true,
+        "rate": 0.007
+      },
+      "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
+      "metadata": {
+        "base_currency": "USD",
+        "pip_size": 0.0001,
+        "quote_currency": "CAD",
+        "standard_lot_size": 100000
+      },
+      "spread_profiles": {}
+    },
+    "USDCHF": {
+      "commission_conversion": {
+        "profiles": {}
+      },
+      "conversion_adjustment": {
+        "authenticated": true,
+        "defined": true,
+        "rate": 0.007
+      },
+      "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
+      "metadata": {
+        "base_currency": "USD",
+        "pip_size": 0.0001,
+        "quote_currency": "CHF",
+        "standard_lot_size": 100000
+      },
+      "spread_profiles": {}
+    },
+    "USDJPY": {
+      "commission_conversion": {
+        "profiles": {}
+      },
+      "conversion_adjustment": {
+        "authenticated": true,
+        "defined": true,
+        "rate": 0.007
+      },
+      "coverage_note": "Template only; populate solely from authenticated explicit inputs.",
+      "metadata": {
+        "base_currency": "USD",
+        "pip_size": 0.01,
+        "quote_currency": "JPY",
+        "standard_lot_size": 100000
+      },
+      "spread_profiles": {}
+    }
+  },
+  "methodology_id": "stage4c-economic-analysis-v2",
+  "null_session_cost_profile": "overall",
+  "schema_version": "stage4c-ftmo-cost-profile-v2"
+}
