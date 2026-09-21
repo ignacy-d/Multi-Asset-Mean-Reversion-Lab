@@ -14,11 +14,13 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import tempfile
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +28,9 @@ from mr_lab.data.models import Bar, Timeframe
 from mr_lab.providers.dukascopy_range import load_offline_corpus
 from mr_lab.providers.fx_universe_2024 import FxUniverseError, validate_registry
 from mr_lab.sessions import DEFAULT_SESSION_SPEC, classify_timestamp
-from mr_lab.stage4c_v2 import CostProfileV2, ResearchOutcome, analyze
+from mr_lab.stage4c_v2 import METHODOLOGY_ID, CostProfileV2, ResearchOutcome, analyze
 from mr_lab.vol_compression_breakout import (
+    SCIENTIFIC_STATUS,
     STUDY_ID,
     VolCompressionEvent,
     generate_events,
@@ -50,7 +53,33 @@ PRIMARY_HORIZON = 30
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 20240920
 DEFAULT_REGISTRY = Path("configs/fx-universe-2024-registry-v1.json")
+DEFAULT_COST_PROFILE = Path("configs/stage4c-ftmo-cost-profile-v2.json")
 DEFAULT_OUTPUT = Path("results/vol-compression-breakout-2024-v1")
+
+FROZEN_METHODOLOGY = {
+    "signal_timeframe": "M15",
+    "rv_prior_return_count": 4,
+    "rv_prior_state_count": 1920,
+    "compression_percentile": 0.20,
+    "percentile_method": "Hyndman-Fan-Type-7",
+    "box": "prior-four-M15-bars",
+    "breakout": "strict-close",
+    "cooldown_minutes": 60,
+    "primary_horizon_minutes": PRIMARY_HORIZON,
+    "secondary_horizon_minutes": [15, 60],
+    "bootstrap_replicates": BOOTSTRAP_REPLICATES,
+    "bootstrap_seed": BOOTSTRAP_SEED,
+    "gross_discovery_threshold_pips": 1.0,
+    "volume_policy": "diagnostic-only",
+}
+
+
+def _identity(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+FROZEN_METHODOLOGY_ID = _identity(FROZEN_METHODOLOGY)
 
 
 class VolCompressionRunnerError(ValueError):
@@ -127,8 +156,11 @@ def authenticate_corpus(entry: Mapping[str, Any]) -> Path:
     for field in ("corpus_id", "assembled_dataset_id", "instrument"):
         if manifest.get(field) != entry[field]:
             raise VolCompressionRunnerError(f"corpus manifest mismatch: {field}")
-    if "2025" in json.dumps(manifest, sort_keys=True):
-        raise VolCompressionRunnerError("sealed-year reference in corpus manifest")
+    if (
+        manifest.get("requested_start_date") != "2024-01-01"
+        or manifest.get("requested_end_date") != "2024-12-31"
+    ):
+        raise VolCompressionRunnerError("corpus manifest is outside exact 2024 bounds")
     return corpus
 
 
@@ -136,11 +168,17 @@ def is_provider_padding(bar: Bar) -> bool:
     return bar.volume == 0 and bar.open == bar.high == bar.low == bar.close
 
 
-def invalid_m1_reason(bar: Bar) -> str | None:
+def invalid_m1_reason(bar: Bar, expected_instrument: str) -> str | None:
+    if bar.instrument != expected_instrument:
+        return "instrument_mismatch"
     if bar.timeframe != Timeframe("1m"):
         return "invalid_timeframe"
     if bar.close_time - bar.open_time != timedelta(minutes=1):
         return "invalid_duration"
+    for field in ("open_time", "close_time", "available_at"):
+        timestamp = getattr(bar, field)
+        if timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
+            return "invalid_utc"
     if is_provider_padding(bar):
         return "provider_padding"
     prices = (bar.open, bar.high, bar.low, bar.close)
@@ -149,7 +187,9 @@ def invalid_m1_reason(bar: Bar) -> str | None:
     return None
 
 
-def canonical_m15_bars(bars: Iterable[Bar]) -> tuple[tuple[Bar, ...], dict[str, int]]:
+def canonical_m15_bars(
+    bars: Iterable[Bar], expected_instrument: str
+) -> tuple[tuple[Bar, ...], dict[str, int]]:
     """Aggregate only exact, contiguous groups of fifteen valid M1 observations."""
     groups: dict[datetime, list[Bar]] = defaultdict(list)
     audit: Counter[str] = Counter()
@@ -168,23 +208,25 @@ def canonical_m15_bars(bars: Iterable[Bar]) -> tuple[tuple[Bar, ...], dict[str, 
         ):
             audit["missing_observation"] += 1
             continue
-        reasons = [invalid_m1_reason(item) for item in window]
+        reasons = [invalid_m1_reason(item, expected_instrument) for item in window]
         reason = next((item for item in reasons if item is not None), None)
         if reason is not None:
             audit[reason] += 1
             continue
         first, last = window[0], window[-1]
         volumes = [item.volume for item in window]
-        volume = sum(item for item in volumes if item is not None)
+        volume: float | None = sum(item for item in volumes if item is not None)
         if all(item is None for item in volumes):
             volume = None
+        close_time = start + timedelta(minutes=15)
+        available_at = max(close_time, *(item.available_at for item in window))
         result.append(
             Bar(
                 instrument=first.instrument,
                 timeframe=Timeframe("15m"),
                 open_time=start,
-                close_time=start + timedelta(minutes=15),
-                available_at=start + timedelta(minutes=15),
+                close_time=close_time,
+                available_at=available_at,
                 open=first.open,
                 high=max(item.high for item in window),
                 low=min(item.low for item in window),
@@ -195,6 +237,13 @@ def canonical_m15_bars(bars: Iterable[Bar]) -> tuple[tuple[Bar, ...], dict[str, 
             )
         )
     audit["valid_m15"] = len(result)
+    if any(
+        current.available_at > following.available_at
+        for current, following in pairwise(result)
+    ):
+        raise VolCompressionRunnerError(
+            "delayed M1 creates M15 availability ordering ambiguity"
+        )
     return tuple(result), dict(sorted(audit.items()))
 
 
@@ -238,7 +287,7 @@ def construct_outcomes(
         if reason is not None or exit_bar is None:
             continue
         direction = 1 if event.direction == "LONG" else -1
-        signed_raw = direction * (exit_bar.close / entry.open - 1.0)
+        signed_log_return = direction * math.log(exit_bar.close / entry.open)
         outcomes[horizon] = ResearchOutcome(
             study_id=STUDY_ID,
             event_id=event.event_id,
@@ -250,7 +299,7 @@ def construct_outcomes(
             exit_timestamp=exit_time,
             exit_price=exit_bar.close,
             horizon_minutes=horizon,
-            gross_signed_bps_return=signed_raw * 10_000,
+            gross_signed_bps_return=signed_log_return * 10_000,
             cost_profile_session=session,
             session_labels=active,
             metadata={"diagnostic_regime": regime},
@@ -284,6 +333,7 @@ def summarize(
     events: Sequence[VolCompressionEvent],
     outcomes: Mapping[int, Sequence[ResearchOutcome]],
     profile: CostProfileV2 | None,
+    provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     horizons: dict[str, Any] = {}
     for horizon in HORIZONS:
@@ -307,6 +357,10 @@ def summarize(
     rv_counts = Counter(_rv_bucket(event) for event in events)
     return {
         "study_id": STUDY_ID,
+        "scientific_status": SCIENTIFIC_STATUS,
+        "frozen_methodology_id": FROZEN_METHODOLOGY_ID,
+        "stage4c_methodology_id": METHODOLOGY_ID,
+        "provenance": dict(provenance or {}),
         "primary_horizon": "H30",
         "bootstrap": {
             "replicates": BOOTSTRAP_REPLICATES,
@@ -333,6 +387,18 @@ def _json_bytes(value: object) -> bytes:
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
     ).encode()
+
+
+def _git_revision() -> str | None:
+    """Return the checked-out code revision without making it a run precondition."""
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    revision = completed.stdout.strip()
+    return revision if completed.returncode == 0 and len(revision) == 40 else None
 
 
 def _event_record(
@@ -383,7 +449,7 @@ def _write_artifacts(
 def run(
     registry_path: Path = DEFAULT_REGISTRY,
     output_dir: Path = DEFAULT_OUTPUT,
-    cost_profile_path: Path | None = None,
+    cost_profile_path: Path = DEFAULT_COST_PROFILE,
 ) -> dict[str, Any]:
     if output_dir.exists():
         raise FileExistsError(f"refusing to overwrite output: {output_dir}")
@@ -396,9 +462,15 @@ def run(
         entry = registry["instruments"][instrument]
         corpus = authenticate_corpus(entry)
         m1 = tuple(load_offline_corpus(corpus).bars)
-        m15, aggregation_audit = canonical_m15_bars(m1)
+        if any(bar.instrument != instrument for bar in m1):
+            raise VolCompressionRunnerError(
+                f"loaded bar instrument does not match registry: {instrument}"
+            )
+        m15, aggregation_audit = canonical_m15_bars(m1, instrument)
         events = generate_events(m15)
         corpus_audit[instrument] = {
+            "corpus_id": entry["corpus_id"],
+            "assembled_dataset_id": entry["assembled_dataset_id"],
             "manifest_sha256": entry["manifest_sha256"],
             "aggregation": aggregation_audit,
         }
@@ -418,18 +490,28 @@ def run(
     )
     all_events = [all_events[i] for i in order]
     records = [records[i] for i in order]
-    profile = CostProfileV2.load(cost_profile_path) if cost_profile_path else None
-    summary = summarize(all_events, all_outcomes, profile)
-    audit = {
+    profile = CostProfileV2.load(cost_profile_path)
+    provenance = {
         "study_id": STUDY_ID,
+        "scientific_status": SCIENTIFIC_STATUS,
         "registry_path": str(registry_path),
         "registry_sha256": _sha256(registry_path),
         "registry_id": registry["registry_id"],
         "session_spec_id": DEFAULT_SESSION_SPEC.session_spec_id,
+        "cost_profile_path": str(cost_profile_path),
+        "cost_profile_sha256": _sha256(cost_profile_path),
         "corpora": corpus_audit,
+        "frozen_methodology": FROZEN_METHODOLOGY,
+        "frozen_methodology_id": FROZEN_METHODOLOGY_ID,
+        "stage4c_methodology_id": METHODOLOGY_ID,
+        "runner_source_sha256": _sha256(Path(__file__)),
+        "git_code_revision": _git_revision(),
+    }
+    summary = summarize(all_events, all_outcomes, profile, provenance)
+    audit = {
+        **provenance,
         "execution_policy": "exact-M1-no-forward-search",
         "horizons_minutes": list(HORIZONS),
-        "cost_profile_path": str(cost_profile_path) if cost_profile_path else None,
     }
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(
@@ -448,7 +530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--cost-profile", type=Path)
+    parser.add_argument("--cost-profile", type=Path, default=DEFAULT_COST_PROFILE)
     args = parser.parse_args(argv)
     run(args.registry, args.output_dir, args.cost_profile)
     return 0

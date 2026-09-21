@@ -10,8 +10,6 @@ fi
 args=(
   --registry configs/fx-universe-2024-registry-v1.json
   --output-dir "${1:-results/vol-compression-breakout-2024-v1}"
+  --cost-profile "${2:-configs/stage4c-ftmo-cost-profile-v2.json}"
 )
-if [[ $# -eq 2 ]]; then
-  args+=(--cost-profile "$2")
-fi
 uv run mr-lab-vol-compression-breakout-2024 "${args[@]}"
