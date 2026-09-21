@@ -37,8 +37,6 @@ mr-lab-pca-stage0-2024 = "mr_lab.pca_stage0_runner:main"
 mr-lab-pca-stage0-postprocess = "mr_lab.pca_stage0_postprocess:main"
 mr-lab-pca-rv-quality-2024 = "mr_lab.pca_rv_quality_2024:main"
 mr-lab-pca-multik-quality-2024 = "mr_lab.pca_multik_quality_2024:main"
-mr-lab-vol-compression-breakout-2024 = "mr_lab.vol_compression_breakout_runner:main"
-
 [dependency-groups]
 dev = [
     "pytest>=8.3,<9",
