@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
@@ -39,13 +40,12 @@ HORIZONS = (5, 15, 30, 60)
 PRIMARY_HORIZON = 15
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 20240920
+DISCOVERY_MIN_N = 200
+DISCOVERY_MIN_MEAN_GROSS_PIPS = 1.0
 ACTIVITY_POLICY = "volume == 0 AND open == high == low == close"
 REGISTRY_ID = "sha256:16288d516f88d58e243864ef2c8a572f639bc92f7b623412939faff298a9eab2"
 REGISTRY_FILE_SHA256 = (
     "sha256:61d1876ebe12224ac5c668a1b61c8ffb7b080859395d02f237e13f452b254850"
-)
-COST_PROFILE_FILE_SHA256 = (
-    "sha256:bab7cea933329aba5182ed05364414828277bf74046af3cf4ebf539cb8323316"
 )
 METHODOLOGY = {
     "study_id": STUDY_ID,
@@ -63,6 +63,11 @@ METHODOLOGY = {
         "replicates": BOOTSTRAP_REPLICATES,
         "seed": BOOTSTRAP_SEED,
         "blocks": "whole-calendar-month",
+    },
+    "discovery_screen": {
+        "minimum_n_per_relationship": DISCOVERY_MIN_N,
+        "minimum_mean_h15_gross_pips": DISCOVERY_MIN_MEAN_GROSS_PIPS,
+        "calendar_month_bootstrap_p2_5_strictly_greater_than": 0.0,
     },
     "session_spec_id": DEFAULT_SESSION_SPEC.session_spec_id,
 }
@@ -293,11 +298,14 @@ def execute_event(
 
 
 def _screen(analysis: dict[str, Any], cost_available: bool) -> list[str]:
-    labels = [
+    labels = []
+    if analysis["n"] < DISCOVERY_MIN_N:
+        labels.append("INSUFFICIENT_N_FOR_DISCOVERY_SCREEN")
+    labels.append(
         "PASSES_GROSS_1PIP_DISCOVERY_SCREEN"
-        if analysis["gross_pips"]["mean"] >= 1.0
+        if analysis["gross_pips"]["mean"] >= DISCOVERY_MIN_MEAN_GROSS_PIPS
         else "FAILS_GROSS_1PIP_SCREEN"
-    ]
+    )
     floor = analysis["cost_floor"]["net_mean_pips"]
     if not cost_available or floor is None:
         labels.append("BLOCKED_MISSING_COST_PROFILE")
@@ -350,19 +358,26 @@ def economic_summary(
                 "bootstrap_summary": None,
                 "calendar_month_breadth": 0,
                 "cost_floor": None,
-                "screen_labels": ["FAILS_GROSS_1PIP_SCREEN"],
+                "screen_labels": [
+                    "INSUFFICIENT_N_FOR_DISCOVERY_SCREEN",
+                    "FAILS_GROSS_1PIP_SCREEN",
+                ],
             }
     passing = [
         segments[f"relationship:{name}"]
         for name in relationships
         if segments[f"relationship:{name}"]["n"]
     ]
-    family = None
-    if not any(
-        x["gross_pips"]["mean"] >= 1.0 and x["bootstrap_summary"]["p2_5"] > 0
-        for x in passing
-    ):
-        family = "PARK_NO_ECONOMICALLY_LARGE_V1_EFFECT"
+    family = (
+        "CONTINUE_RV_LEADLAG_V1_DISCOVERY"
+        if any(
+            x["n"] >= DISCOVERY_MIN_N
+            and x["gross_pips"]["mean"] >= DISCOVERY_MIN_MEAN_GROSS_PIPS
+            and x["bootstrap_summary"]["p2_5"] > 0
+            for x in passing
+        )
+        else "PARK_NO_ECONOMICALLY_LARGE_V1_EFFECT"
+    )
     return {"primary_horizon": "H15", "segments": segments, "family_status": family}
 
 
@@ -390,9 +405,9 @@ def write_outputs(
     summary: Mapping[str, Any],
     audit: Mapping[str, Any],
 ) -> None:
-    """Atomically publish all deterministic artifacts, refusing any overwrite."""
+    """Publish the complete result directory with one atomic sibling rename."""
     names = ("events.jsonl.gz", "summary.json", "execution-audit.json")
-    if any((output_dir / name).exists() for name in names):
+    if output_dir.exists():
         raise LeadLagRunnerError("refusing to overwrite empirical artifacts")
     encoded_summary = (
         json.dumps(summary, indent=2, sort_keys=True, default=str).encode() + b"\n"
@@ -409,26 +424,49 @@ def write_outputs(
         encoded_summary,
         json.dumps(final_audit, indent=2, sort_keys=True, default=str).encode() + b"\n",
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    temporary: list[tuple[Path, Path]] = []
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent)
+    )
     try:
         for name, payload in zip(names, payloads, strict=True):
-            fd, raw_path = tempfile.mkstemp(prefix=f".{name}.", dir=output_dir)
-            temp = Path(raw_path)
-            with os.fdopen(fd, "wb") as stream:
+            with (temporary / name).open("xb") as stream:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            temporary.append((temp, output_dir / name))
-        for temp, target in temporary:
-            os.replace(temp, target)
+        directory_fd = os.open(temporary, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        os.rename(temporary, output_dir)
+        parent_fd = os.open(output_dir.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     finally:
-        for temp, _ in temporary:
-            temp.unlink(missing_ok=True)
+        if temporary.exists():
+            shutil.rmtree(temporary)
 
 
-def run(output_dir: Path = OUTPUT_DIR) -> dict[str, Any]:
+def load_cost_profile(path: Path) -> tuple[CostProfileV2, str]:
+    """Load one explicit v2 profile path and return its exact byte identity."""
+    if not isinstance(path, Path):
+        raise LeadLagRunnerError("cost profile must be an explicit path")
+    try:
+        raw = path.read_bytes()
+        profile = CostProfileV2.load(path)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise LeadLagRunnerError("invalid explicit Stage4C-v2 cost profile") from exc
+    return profile, _sha(raw)
+
+
+def run(
+    output_dir: Path = OUTPUT_DIR, cost_profile_path: Path = COST_PROFILE_PATH
+) -> dict[str, Any]:
     registry = load_registry()
+    profile, cost_profile_sha256 = load_cost_profile(cost_profile_path)
     entries = registry["instruments"]
     assert isinstance(entries, dict)
     datasets = {}
@@ -446,16 +484,16 @@ def run(output_dir: Path = OUTPUT_DIR) -> dict[str, Any]:
         record, event_outcome_rows = execute_event(event, prepared)
         records.append(record)
         outcomes.extend(event_outcome_rows)
-    cost_profile_raw = COST_PROFILE_PATH.read_bytes()
-    if _sha(cost_profile_raw) != COST_PROFILE_FILE_SHA256:
-        raise LeadLagRunnerError("authenticated cost-profile identity mismatch")
-    profile = CostProfileV2.load(COST_PROFILE_PATH)
     summary = {
         "study_id": STUDY_ID,
         "methodology_id": METHODOLOGY_ID,
         "registry_id": registry["registry_id"],
         "event_count": len(events),
         "activity_counts": prepared.activity_counts,
+        "provenance": {
+            "cost_profile_path": str(cost_profile_path),
+            "cost_profile_sha256": cost_profile_sha256,
+        },
         "economic_analysis": economic_summary(outcomes, profile),
     }
     audit = {
@@ -465,7 +503,8 @@ def run(output_dir: Path = OUTPUT_DIR) -> dict[str, Any]:
         "dataset_ids": {
             name: entries[name]["assembled_dataset_id"] for name in INSTRUMENTS
         },
-        "cost_profile_sha256": _sha(COST_PROFILE_PATH.read_bytes()),
+        "cost_profile_path": str(cost_profile_path),
+        "cost_profile_sha256": cost_profile_sha256,
         "runner_source_sha256": _sha(Path(__file__).read_bytes()),
         "code_revision": _code_revision(),
     }
@@ -476,8 +515,15 @@ def run(output_dir: Path = OUTPUT_DIR) -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--cost-profile", type=Path, default=COST_PROFILE_PATH)
     args = parser.parse_args(argv)
-    print(json.dumps(run(args.output_dir)["economic_analysis"]["family_status"]))
+    print(
+        json.dumps(
+            run(args.output_dir, args.cost_profile)["economic_analysis"][
+                "family_status"
+            ]
+        )
+    )
     return 0
 
 
