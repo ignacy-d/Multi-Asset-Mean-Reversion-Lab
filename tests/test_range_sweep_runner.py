@@ -1,3 +1,6 @@
+import hashlib
+import json
+import math
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -13,6 +16,7 @@ from mr_lab.range_sweep_runner import (
     DECISION_CONTINUE,
     DECISION_PARK,
     RangeSweepRunnerError,
+    _artifact_payloads,
     aggregate_m1_to_m5,
     cost_profile_session,
     discovery_decision,
@@ -110,6 +114,10 @@ def test_exact_execution_horizons_and_arithmetic(direction, expected_sign) -> No
     outcome = to_research_outcome(record, 15)
     expected = expected_sign * (bars[14].close - bars[0].open) / 0.0001
     assert outcome.gross_pips == pytest.approx(expected)
+    expected_log = expected_sign * math.log(bars[14].close / bars[0].open)
+    assert record["h15_signed_log_return"] == pytest.approx(expected_log)
+    assert record["h15_gross_signed_bps_return"] == pytest.approx(expected_log * 10_000)
+    assert outcome.gross_signed_bps_return == pytest.approx(expected_log * 10_000)
 
 
 def test_execution_never_searches_forward_for_entry() -> None:
@@ -161,3 +169,76 @@ def test_aggregation_rejects_mixed_instruments() -> None:
     )
     with pytest.raises(RangeSweepRunnerError, match="one instrument"):
         aggregate_m1_to_m5([bar(0), other])
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"instrument": "GBPUSD"}, "instrument_mismatch"),
+        ({"timeframe": Timeframe("5m")}, "invalid_timeframe"),
+        (
+            {
+                "close_time": datetime(2024, 1, 2, 0, 2, tzinfo=UTC),
+                "available_at": datetime(2024, 1, 2, 0, 2, tzinfo=UTC),
+            },
+            "invalid_duration",
+        ),
+        ({"open": 0.0, "low": 0.0}, "invalid_open_price"),
+    ],
+)
+def test_entry_bar_requires_exact_m1_contract(change, reason) -> None:
+    source = bar(0)
+    values = {
+        "instrument": source.instrument,
+        "timeframe": source.timeframe,
+        "open_time": source.open_time,
+        "close_time": source.close_time,
+        "available_at": source.available_at,
+        "open": source.open,
+        "high": source.high,
+        "low": source.low,
+        "close": source.close,
+        "price_basis": source.price_basis,
+        "volume": source.volume,
+        "volume_semantics": source.volume_semantics,
+    }
+    values.update(change)
+    invalid = Bar(**values)
+    timestamp = invalid.open_time
+    record = execute_event(event(timestamp, SignalDirection.LONG), [invalid])
+    assert record["entry_incomplete_reason"] == reason
+
+
+def test_exit_bar_requires_matching_instrument_and_m1_contract() -> None:
+    entry = bar(0)
+    source = bar(14)
+    wrong_instrument = Bar(
+        "GBPUSD",
+        source.timeframe,
+        source.open_time,
+        source.close_time,
+        source.available_at,
+        source.open,
+        source.high,
+        source.low,
+        source.close,
+        source.price_basis,
+        source.volume,
+        source.volume_semantics,
+    )
+    record = execute_event(
+        event(entry.open_time, SignalDirection.LONG), [entry, wrong_instrument]
+    )
+    assert record["h15_incomplete_reason"] == "instrument_mismatch"
+
+
+def test_artifact_payloads_record_non_recursive_hashes_deterministically() -> None:
+    first = _artifact_payloads([{"event": 1}], {"summary": 2}, {"audit": 3})
+    second = _artifact_payloads([{"event": 1}], {"summary": 2}, {"audit": 3})
+    assert first == second
+    audit = json.loads(first[2])
+    assert audit["artifact_sha256"] == {
+        "events.jsonl.gz": "sha256:" + hashlib.sha256(first[0]).hexdigest(),
+        "summary.json": "sha256:" + hashlib.sha256(first[1]).hexdigest(),
+    }
+    assert "execution-audit.json" not in audit["artifact_sha256"]

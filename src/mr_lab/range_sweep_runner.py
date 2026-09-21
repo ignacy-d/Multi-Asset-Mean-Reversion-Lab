@@ -162,9 +162,21 @@ def aggregate_m1_to_m5(bars: Sequence[Bar]) -> tuple[tuple[Bar, ...], Aggregatio
     return tuple(result), audit
 
 
-def _price_reason(bar: Bar | None, field: str) -> str | None:
+def _execution_price_reason(bar: Bar | None, field: str, instrument: str) -> str | None:
+    """Validate one exact execution bar without accepting a substitute."""
     if bar is None:
         return "missing_exact_bar"
+    if bar.instrument != instrument:
+        return "instrument_mismatch"
+    if bar.timeframe != Timeframe("1m"):
+        return "invalid_timeframe"
+    if bar.close_time - bar.open_time != timedelta(minutes=1):
+        return "invalid_duration"
+    if any(
+        timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(timestamp)
+        for timestamp in (bar.open_time, bar.close_time, bar.available_at)
+    ):
+        return "non_utc_timestamp"
     if is_provider_padding(bar):
         return "provider_padding"
     value = getattr(bar, field)
@@ -184,7 +196,7 @@ def execute_event(event: RangeSweepEvent, m1_bars: Sequence[Bar]) -> dict[str, A
     opens = {bar.open_time: bar for bar in m1_bars}
     closes = {bar.close_time: bar for bar in m1_bars}
     entry = opens.get(event.signal_timestamp)
-    entry_reason = _price_reason(entry, "open")
+    entry_reason = _execution_price_reason(entry, "open", event.instrument)
     classification = classify_timestamp(event.signal_timestamp, DEFAULT_SESSION_SPEC)
     record: dict[str, Any] = {
         "event_id": event.event_id,
@@ -216,12 +228,14 @@ def execute_event(event: RangeSweepEvent, m1_bars: Sequence[Bar]) -> dict[str, A
         target = event.signal_timestamp + timedelta(minutes=horizon)
         exit_bar = closes.get(target)
         reason = (
-            "entry_incomplete" if entry_reason else _price_reason(exit_bar, "close")
+            "entry_incomplete"
+            if entry_reason
+            else _execution_price_reason(exit_bar, "close", event.instrument)
         )
         complete = reason is None
         exit_price = exit_bar.close if complete and exit_bar is not None else None
-        gross_bps = (
-            direction * (exit_price / entry.open - 1) * 10_000
+        signed_log_return = (
+            direction * math.log(exit_price / entry.open)
             if complete and entry is not None and exit_price is not None
             else None
         )
@@ -231,7 +245,12 @@ def execute_event(event: RangeSweepEvent, m1_bars: Sequence[Bar]) -> dict[str, A
                 f"h{horizon}_complete": complete,
                 f"h{horizon}_incomplete_reason": reason,
                 f"h{horizon}_exit_price": exit_price,
-                f"h{horizon}_gross_signed_bps_return": gross_bps,
+                f"h{horizon}_signed_log_return": signed_log_return,
+                f"h{horizon}_gross_signed_bps_return": (
+                    signed_log_return * 10_000
+                    if signed_log_return is not None
+                    else None
+                ),
             }
         )
     return record
@@ -331,6 +350,27 @@ def _git_revision() -> str:
         return "unavailable"
 
 
+def _pretty_json(value: object) -> bytes:
+    return json.dumps(value, indent=2, sort_keys=True).encode() + b"\n"
+
+
+def _artifact_payloads(
+    records: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+    audit: Mapping[str, Any],
+) -> tuple[bytes, bytes, bytes]:
+    """Serialize deterministic artifacts and bind non-recursive identities."""
+    event_lines = b"".join(_canonical(record) + b"\n" for record in records)
+    events_payload = gzip.compress(event_lines, mtime=0)
+    summary_payload = _pretty_json(summary)
+    audit_with_hashes = dict(audit)
+    audit_with_hashes["artifact_sha256"] = {
+        "events.jsonl.gz": _sha_bytes(events_payload),
+        "summary.json": _sha_bytes(summary_payload),
+    }
+    return events_payload, summary_payload, _pretty_json(audit_with_hashes)
+
+
 def run(
     *,
     output_dir: Path = DEFAULT_OUTPUT,
@@ -380,11 +420,11 @@ def run(
             raise RangeSweepRunnerError(
                 "corpus contains wrong instrument or non-2024 data"
             )
-        m5, audit = aggregate_m1_to_m5(bars)
+        m5, m5_audit = aggregate_m1_to_m5(bars)
         pip_size = FX_INSTRUMENTS[instrument].pip_size
         events = range_sweep_events(m5, RangeSweepConfig({instrument: pip_size}))
         all_records.extend(execute_event(event, bars) for event in events)
-        aggregation[instrument] = asdict(audit)
+        aggregation[instrument] = asdict(m5_audit)
         corpus_identities[instrument] = {
             "corpus_id": entry["corpus_id"],
             "assembled_dataset_id": entry["assembled_dataset_id"],
@@ -428,7 +468,7 @@ def run(
             "corpora": corpus_identities,
         },
     }
-    audit = {
+    execution_audit: dict[str, Any] = {
         "study_id": STUDY_ID,
         "instruments": list(INSTRUMENTS),
         "aggregation": aggregation,
@@ -457,14 +497,12 @@ def run(
         tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent)
     )
     try:
-        lines = b"".join(_canonical(record) + b"\n" for record in all_records)
-        (temporary / "events.jsonl.gz").write_bytes(gzip.compress(lines, mtime=0))
-        (temporary / "summary.json").write_bytes(
-            json.dumps(summary, indent=2, sort_keys=True).encode() + b"\n"
+        events_payload, summary_payload, audit_payload = _artifact_payloads(
+            all_records, summary, execution_audit
         )
-        (temporary / "execution-audit.json").write_bytes(
-            json.dumps(audit, indent=2, sort_keys=True).encode() + b"\n"
-        )
+        (temporary / "events.jsonl.gz").write_bytes(events_payload)
+        (temporary / "summary.json").write_bytes(summary_payload)
+        (temporary / "execution-audit.json").write_bytes(audit_payload)
         os.rename(temporary, output_dir)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
