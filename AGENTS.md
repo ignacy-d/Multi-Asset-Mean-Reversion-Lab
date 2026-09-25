@@ -1,5 +1,22 @@
 # Working rules
 
+## Non-negotiable research controls
+
+- **Never access sealed 2025 market data before the explicitly authorized OOS
+  gate.** Do not list, search, read, copy, hash, summarize, or otherwise inspect
+  it. Validate proposed paths and manifest metadata before opening data files.
+- Do not tune parameters or select a historical maximum. Preserve the frozen
+  methodology and regime interpretation; any intentional methodology change
+  requires a separately versioned, preregistered decision record.
+- Bind research inputs and outputs to concrete identities and SHA-256
+  commitments. Produce deterministic ordering and fail closed on missing,
+  malformed, duplicate, or provenance-incompatible inputs.
+- Add focused tests for research invariants and run appropriate checks before
+  proposing a change. Never merge automatically.
+- GitHub Actions workflows are historical/verification orchestration, not a
+  production-compute platform. Do not trigger Actions for production research;
+  use reviewed local runners and preserve their audits.
+
 - Inspect existing code and instructions before modifying anything; preserve
   working behavior from earlier project stages.
 - Keep instruments, timeframes, sessions, strategies, thresholds, holding
