@@ -1,5 +1,111 @@
 # Multi-Asset Mean Reversion Lab
 
+A Python research-engineering project for building **reproducible, auditable analytical workflows** from external market data.
+
+The project started from a simple question — whether mean-reversion behaviour can be evaluated systematically across multiple FX instruments — and evolved into a reusable data and research pipeline. The emphasis is not on presenting a trading result, but on the process: **collecting data, validating it, standardising it, defining repeatable research rules, running comparable analyses and preserving provenance.**
+
+> **Portfolio context:** This repository is an independent research project built from public market-data sources. It contains no employer, client or proprietary business data.
+
+## What this project demonstrates
+
+- **Data acquisition and validation** — ingestion of external historical data with explicit provenance, integrity checks and failure handling.
+- **Data standardisation** — canonical schemas, UTC timestamps, consistent instrument metadata and deterministic resampling.
+- **Repeatable analytical workflows** — parameterised research stages instead of one-off manual analysis.
+- **Multi-source / multi-asset thinking** — comparable processing across EURUSD, GBPUSD, USDJPY, AUDUSD and AUDJPY.
+- **Research discipline** — frozen discovery periods, protected out-of-sample data, explicit assumptions and avoidance of post-hoc result selection.
+- **Automation** — GitHub Actions workflows for acquisition, validation and repeatable research runs.
+- **Auditability** — deterministic identities, hashes, manifests and reproducible outputs.
+
+## From raw data to decision-ready output
+
+```text
+Public market-data source
+        ↓
+Acquisition + provenance
+        ↓
+Validation and canonicalisation
+        ↓
+Multi-day / multi-asset dataset assembly
+        ↓
+Feature & session construction
+        ↓
+Predefined research hypotheses
+        ↓
+Comparable experiment outputs
+        ↓
+Diagnostics / reporting / prioritisation
+```
+
+The same general pattern is transferable beyond financial markets: gather fragmented external information, validate and structure it, apply explicit qualification rules, and turn the process into something that can be rerun and improved rather than rebuilt manually each time.
+
+## Why I built it
+
+I wanted a research process that could answer questions across many instruments without manually repeating the same analysis for every market.
+
+That required solving several practical problems:
+
+1. obtaining and validating external data;
+2. normalising it into a consistent internal representation;
+3. separating data logic from research assumptions;
+4. making experiments reproducible across instruments and timeframes;
+5. preventing accidental look-ahead and post-hoc optimisation;
+6. producing outputs that can be audited and compared later.
+
+The result is a growing research framework rather than a single notebook or backtest.
+
+## Technology
+
+- **Python 3.12**
+- Git / GitHub
+- GitHub Actions
+- deterministic JSON / CSV / Markdown outputs
+- SQLite for selected intermediate analytical workloads
+- public Dukascopy historical market data
+- automated tests, Ruff and locked environments via `uv`
+
+## Current scope
+
+The current research universe covers:
+
+- EURUSD
+- GBPUSD
+- USDJPY
+- AUDUSD
+- AUDJPY
+
+The framework includes canonical market-data handling, session classification, VWAP and Bollinger benchmark families, event-path diagnostics, execution-aware research stages and cross-asset discovery tooling.
+
+The project deliberately separates **research evidence from claims of an exploitable edge**. Results are treated as hypotheses to validate rather than conclusions to market.
+
+## Reproducibility
+
+The repository is designed so that research logic and data provenance remain explicit.
+
+Examples include:
+
+- immutable dataset and research-spec identities;
+- SHA-256-based provenance;
+- explicit discovery and future holdout periods;
+- point-in-time availability rules;
+- deterministic report generation;
+- failure on incomplete or inconsistent inputs instead of silently filling gaps.
+
+## Quick start
+
+Python 3.12+ and `uv` are required.
+
+```bash
+uv sync --dev
+uv run pytest
+uv run ruff check .
+```
+
+## Technical documentation
+
+The sections below document the research methodology, stage boundaries and implementation details in depth.
+
+---
+
 ## Frozen Stage 4 discovery atlas
 
 `mr-lab-stage4-discovery-atlas` creates a descriptive family-level atlas from
