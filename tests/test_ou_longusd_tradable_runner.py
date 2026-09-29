@@ -12,19 +12,25 @@ from mr_lab.ou_longusd_tradable_runner import (
     METHODOLOGY_ID,
     Component,
     EnsembleSignal,
+    ExactM1Index,
     OuTradableError,
+    _bootstrap,
+    cost_scenario_pips,
     ensemble_components,
     execute_signal,
     geometry,
     lifecycle_deadline,
+    load_preregistration,
     ou_eligible,
     portfolio,
     required_direction,
     safe_london_end,
     scope_for,
+    summarize,
 )
 from mr_lab.pca_stage0_runner import REGISTRY, Stage0Error, load_registry
 from mr_lab.research import Direction
+from mr_lab.stage4c_v2 import bootstrap_summary, net_pips
 
 
 def component(
@@ -157,6 +163,34 @@ def test_adverse_first_same_minute():
         s, (bar("EURUSD", s.timestamp, 1.011, 1.016, 0.999, 1.0),), "PRIMARY"
     )
     assert trade["executed"] and {x["reason"] for x in trade["tranches"]} == {"stop"}
+    assert trade["mfe_pips_certain"] == 0
+
+
+def test_padding_is_omitted_and_only_required_timestamp_fails():
+    padding_time = datetime(2024, 1, 2, 16, 43, tzinfo=UTC)
+    padding = Bar(
+        "EURUSD",
+        Timeframe("1m"),
+        padding_time,
+        padding_time + timedelta(minutes=1),
+        padding_time + timedelta(minutes=1),
+        1.01,
+        1.01,
+        1.01,
+        1.01,
+        PriceBasis.BID,
+        0.0,
+        VolumeSemantics.TICK,
+    )
+    valid_time = padding_time + timedelta(minutes=1)
+    valid = bar("EURUSD", valid_time, 1.011, 1.012, 1.010, 1.0105)
+    index = ExactM1Index.build("EURUSD", (padding, valid))
+    assert padding_time not in index.by_open
+    assert valid_time in index.by_open
+    blocked = execute_signal(signal(timestamp=padding_time), index, "PRIMARY")
+    assert blocked["incomplete_reason"] == "provider_padding_at_exact_entry"
+    executed = execute_signal(signal(timestamp=valid_time), index, "PRIMARY")
+    assert executed["executed"]
 
 
 def test_exact_deadline_close_no_forward_substitution():
@@ -235,6 +269,86 @@ def test_deterministic_identity():
     votes = (component(), component(family="vwap", lookback=40, e0=0.999))
     assert ensemble_components(votes) == ensemble_components(tuple(reversed(votes)))
     assert METHODOLOGY_ID.startswith("sha256:")
+
+
+def test_bootstrap_uses_stage4c_type7_summary(monkeypatch):
+    import mr_lab.ou_longusd_tradable_runner as runner
+
+    monkeypatch.setattr(runner, "BOOTSTRAP_REPLICATES", 4)
+    rows = [
+        {"entry_timestamp": "2024-01-02T00:00:00+00:00", "gross_r": 0.0},
+        {"entry_timestamp": "2024-02-02T00:00:00+00:00", "gross_r": 10.0},
+    ]
+    # Seeded month draws yield the runner replicates; Stage4C owns Type-7 interpolation.
+    result = _bootstrap(rows, "gross_r")
+    from random import Random
+
+    rng = Random(runner.BOOTSTRAP_SEED)
+    months = ((0.0,), (10.0,))
+    replicates = [
+        sum(value for block in rng.choices(months, k=2) for value in block) / 2
+        for _ in range(4)
+    ]
+    assert result == bootstrap_summary(replicates, seed=runner.BOOTSTRAP_SEED)
+
+
+def test_cost_overlay_delegates_exact_stage4c_formula():
+    values = (4.0, 0.7, 0.25, 0.31, 0.02)
+    assert cost_scenario_pips(*values) == net_pips(*values)
+    assert cost_scenario_pips(*values) != (4.0 - 0.7 - 0.25 - 0.31) * 0.98
+
+
+def test_trade_level_exit_rates_and_net_summaries():
+    base = {
+        "instrument": "EURUSD",
+        "entry_timestamp": "2024-01-02T10:00:00+00:00",
+        "gross_r": 1.0,
+        "gross_pips": 2.0,
+        "holding_minutes": 10,
+        "mfe_pips_certain": 3.0,
+        "mae_pips_certain": 1.0,
+        "cost_status": "AUTHENTICATED_COST_OVERLAY_AVAILABLE",
+        "net_pips_cost_scenarios": {"mean/slippage_0": 1.25},
+    }
+    rows = [
+        base
+        | {
+            "tranches": [
+                {"reason": "tp1"},
+                {"reason": "tp2"},
+                {"reason": "deadline"},
+            ]
+        },
+        base
+        | {
+            "tranches": [
+                {"reason": "tp1"},
+                {"reason": "stop"},
+                {"reason": "stop"},
+            ]
+        },
+    ]
+    report = summarize(rows)
+    assert report["tp1_trade_hit_rate"] == 1.0
+    assert report["tp2_trade_hit_rate"] == 0.5
+    assert report["tp3_trade_hit_rate"] == 0.0
+    assert report["any_stop_trade_rate"] == 0.5
+    assert report["any_deadline_trade_rate"] == 0.5
+    assert report["stop_tranche_exit_fraction"] == pytest.approx(2 / 6)
+    assert report["net_scenario_summaries"]["mean/slippage_0"]["mean_net_pips"] == 1.25
+
+
+def test_preregistration_identity_is_frozen(tmp_path, monkeypatch):
+    import mr_lab.ou_longusd_tradable_runner as runner
+
+    value, identity = load_preregistration()
+    assert value["bollinger"] == "NOT_EMITTED_IN_V1"
+    assert identity.startswith("sha256:")
+    tampered = tmp_path / "prereg.json"
+    tampered.write_text(json.dumps(value | {"headline": "changed"}))
+    monkeypatch.setattr(runner, "PREREGISTRATION", tampered)
+    with pytest.raises(OuTradableError, match="identity mismatch"):
+        load_preregistration()
 
 
 def test_registry_is_exact_explicit_authenticated_contract(tmp_path):

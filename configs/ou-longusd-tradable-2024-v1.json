@@ -42,7 +42,7 @@
     "robustness": "min(180_minutes,floor_two_thirds_safe_remaining)"
   },
   "portfolio_modes": ["UNCONSTRAINED", "ONE_PER_INSTRUMENT"],
-  "bollinger": "diagnostic_only_never_eligibility",
+  "bollinger": "NOT_EMITTED_IN_V1",
   "bootstrap": {"unit": "whole_calendar_month", "replicates": 10000, "seed": 20241024},
   "headline": "PRIMARY/ONE_PER_INSTRUMENT/CORE_LONG_USD",
   "continuation_screen": {

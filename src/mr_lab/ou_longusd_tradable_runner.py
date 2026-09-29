@@ -38,13 +38,25 @@ from mr_lab.research import Direction
 from mr_lab.sessions import DEFAULT_SESSION_SPEC, classify_timestamp
 from mr_lab.stage4b import SignalState, deduplicate_states, pip_size
 from mr_lab.stage4b_runner import assemble_signal_states
-from mr_lab.stage4c_v2 import AVAILABLE, SLIPPAGES, SPREAD_STATISTICS, CostProfileV2
+from mr_lab.stage4c_v2 import (
+    AVAILABLE,
+    SLIPPAGES,
+    SPREAD_STATISTICS,
+    CostProfileV2,
+    bootstrap_summary,
+    net_pips,
+)
 
 STUDY_ID = "OU-LONGUSD-TRADABLE-2024-v1"
 SCIENTIFIC_STATUS = "2024_FOLLOW_UP_DISCOVERY_NOT_CONFIRMATION"
 REGISTRY = Path("configs/fx-universe-2024-registry-v1.json")
 DEFAULT_COST_PROFILE = Path("configs/stage4c-ftmo-cost-profile-v2.json")
 DEFAULT_OUTPUT = Path("results/ou-longusd-tradable-2024-v1")
+PREREGISTRATION = Path("configs/ou-longusd-tradable-2024-v1.json")
+# Canonical identity; updating the preregistration requires an explicit code change.
+EXPECTED_PREREGISTRATION_SHA = (
+    "sha256:80711d366d4a8cc97835fe384161185cc3e92537a6120f4c739b912165c3b82a"
+)
 CORE_DIRECTIONS: Mapping[str, Direction] = {
     "AUDUSD": Direction.SHORT,
     "EURUSD": Direction.SHORT,
@@ -161,20 +173,28 @@ class EnsembleSignal:
 class ExactM1Index:
     by_open: Mapping[datetime, Bar]
     by_close: Mapping[datetime, Bar]
+    padding_open_times: frozenset[datetime]
+    padding_close_times: frozenset[datetime]
 
     @classmethod
     def build(cls, instrument: str, bars: Sequence[Bar]) -> ExactM1Index:
         by_open: dict[datetime, Bar] = {}
         by_close: dict[datetime, Bar] = {}
+        padding_open = set()
+        padding_close = set()
         for bar in bars:
             reason = _bar_reason(bar, instrument, bar.open_time)
+            if reason == "entry_provider_padding":
+                padding_open.add(bar.open_time)
+                padding_close.add(bar.close_time)
+                continue
             if reason is not None:
                 raise OuTradableError(f"invalid authenticated M1 corpus: {reason}")
             if bar.open_time in by_open or bar.close_time in by_close:
                 raise OuTradableError("ambiguous duplicate M1 data")
             by_open[bar.open_time] = bar
             by_close[bar.close_time] = bar
-        return cls(by_open, by_close)
+        return cls(by_open, by_close, frozenset(padding_open), frozenset(padding_close))
 
 
 def scope_for(instrument: str) -> str:
@@ -332,6 +352,8 @@ def execute_signal(
     close_index = index.by_close
     entry_bar = indexed.get(signal.timestamp)
     reason = _bar_reason(entry_bar, signal.instrument, signal.timestamp)
+    if signal.timestamp in index.padding_open_times:
+        reason = "provider_padding_at_exact_entry"
     base = {
         "signal_id": signal.signal_id,
         "instrument": signal.instrument,
@@ -367,6 +389,8 @@ def execute_signal(
         ts = signal.timestamp + timedelta(minutes=minute)
         bar = indexed.get(ts)
         invalid = _bar_reason(bar, signal.instrument, ts)
+        if ts in index.padding_open_times:
+            invalid = "provider_padding"
         if invalid is not None:
             return base | {"incomplete_reason": f"invalid_m1_path:{invalid}"}
         assert bar is not None
@@ -378,7 +402,6 @@ def execute_signal(
             -direction * (bar.high - entry_bar.open),
             -direction * (bar.low - entry_bar.open),
         )
-        mfe, mae = max(mfe, favorable), max(mae, adverse)
         stop_hit = bar.low <= stop if direction == 1 else bar.high >= stop
         hits = {
             i
@@ -388,6 +411,8 @@ def execute_signal(
         # Adverse first: if both boundaries occur in a minute every still-open
         # tranche is stopped, including one whose target also occurred.
         if stop_hit:
+            # Only the adverse barrier is certain in an adverse-first exit bar.
+            mae = max(mae, max(0.0, -direction * (stop - entry_bar.open)))
             for i in tuple(open_tranches):
                 exits[i] = {
                     "tranche": i + 1,
@@ -401,6 +426,8 @@ def execute_signal(
                 open_tranches.remove(i)
         else:
             for i in sorted(hits):
+                # Only reached target barriers are certain before the exit.
+                mfe = max(mfe, max(0.0, direction * (targets[i] - entry_bar.open)))
                 exits[i] = {
                     "tranche": i + 1,
                     "reason": f"tp{i + 1}",
@@ -411,6 +438,9 @@ def execute_signal(
                     ),
                 }
                 open_tranches.remove(i)
+            if not hits:
+                # A non-exit bar is fully experienced and its extrema are certain.
+                mfe, mae = max(mfe, favorable), max(mae, adverse)
         if not open_tranches:
             break
     if open_tranches:
@@ -419,7 +449,12 @@ def execute_signal(
             deadline_bar, signal.instrument, deadline - timedelta(minutes=1)
         )
         if invalid is not None or deadline_bar is None:
-            return base | {"incomplete_reason": "missing_exact_deadline_m1_close"}
+            reason = (
+                "provider_padding_at_exact_deadline"
+                if deadline in index.padding_close_times
+                else "missing_exact_deadline_m1_close"
+            )
+            return base | {"incomplete_reason": reason}
         for i in tuple(open_tranches):
             exits[i] = {
                 "tranche": i + 1,
@@ -458,8 +493,8 @@ def execute_signal(
         "holding_minutes": int(
             (exit_timestamp - signal.timestamp).total_seconds() / 60
         ),
-        "mfe_pips": mfe / pip_size(signal.instrument),
-        "mae_pips": mae / pip_size(signal.instrument),
+        "mfe_pips_certain": mfe / pip_size(signal.instrument),
+        "mae_pips_certain": mae / pip_size(signal.instrument),
     }
 
 
@@ -523,7 +558,7 @@ def portfolio(
 
 def _bootstrap(
     trades: Sequence[Mapping[str, Any]], field: str
-) -> dict[str, float | None]:
+) -> dict[str, int | float | bool | None]:
     by_month: dict[str, list[float]] = defaultdict(list)
     for trade in trades:
         by_month[trade["entry_timestamp"][:7]].append(float(trade[field]))
@@ -539,12 +574,18 @@ def _bootstrap(
             for value in by_month[random.choice(months)]
         ]
         values.append(statistics.fmean(sample))
-    values.sort()
-    return {
-        "p2_5": values[int(0.025 * (len(values) - 1))],
-        "median": values[len(values) // 2],
-        "p97_5": values[int(0.975 * (len(values) - 1))],
-    }
+    return bootstrap_summary(values, seed=BOOTSTRAP_SEED)
+
+
+def cost_scenario_pips(
+    gross: float,
+    spread: float,
+    slippage: float,
+    commission: float,
+    adjustment_rate: float,
+) -> float:
+    """Delegate the frozen economic formula to Stage4C-v2."""
+    return net_pips(gross, spread, slippage, commission, adjustment_rate)
 
 
 def summarize(trades: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -567,6 +608,18 @@ def summarize(trades: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         monthly[x["entry_timestamp"][:7]].append(x)
         instruments[x["instrument"]].append(x)
     pf = sum(winners) / abs(sum(losers)) if losers else (math.inf if winners else None)
+    cost_statuses = Counter(x.get("cost_status", "NOT_EVALUATED") for x in rows)
+    net_scenarios: dict[str, dict[str, float | int]] = {}
+    if cost_statuses == Counter({AVAILABLE: n}):
+        scenario_names = sorted(rows[0].get("net_pips_cost_scenarios", {}))
+        for name in scenario_names:
+            values = [x["net_pips_cost_scenarios"][name] for x in rows]
+            net_scenarios[name] = {
+                "n": n,
+                "mean_net_pips": statistics.fmean(values),
+                "median_net_pips": statistics.median(values),
+                "win_rate": sum(x > 0 for x in values) / n,
+            }
     return {
         "executed_trade_count": n,
         "trades_per_calendar_month": {k: len(v) for k, v in sorted(monthly.items())},
@@ -578,16 +631,30 @@ def summarize(trades: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "profit_factor_r": pf,
         "average_winner_r": statistics.fmean(winners) if winners else None,
         "average_loser_r": statistics.fmean(losers) if losers else None,
-        **{f"tp{i}_hit_rate": reasons[f"tp{i}"] / (3 * n) for i in range(1, 4)},
-        "stop_hit_rate": reasons["stop"] / (3 * n),
-        "deadline_exit_rate": reasons["deadline"] / (3 * n),
+        **{
+            f"tp{i}_trade_hit_rate": sum(
+                trade["tranches"][i - 1]["reason"] == f"tp{i}" for trade in rows
+            )
+            / n
+            for i in range(1, 4)
+        },
+        "any_stop_trade_rate": sum(
+            any(x["reason"] == "stop" for x in trade["tranches"]) for trade in rows
+        )
+        / n,
+        "any_deadline_trade_rate": sum(
+            any(x["reason"] == "deadline" for x in trade["tranches"]) for trade in rows
+        )
+        / n,
+        "stop_tranche_exit_fraction": reasons["stop"] / (3 * n),
+        "deadline_tranche_exit_fraction": reasons["deadline"] / (3 * n),
         "mean_holding_minutes": statistics.fmean(x["holding_minutes"] for x in rows),
         "median_holding_minutes": statistics.median(x["holding_minutes"] for x in rows),
         "p90_holding_minutes": sorted(x["holding_minutes"] for x in rows)[
             math.ceil(0.9 * n) - 1
         ],
-        "mean_mfe_pips": statistics.fmean(x["mfe_pips"] for x in rows),
-        "mean_mae_pips": statistics.fmean(x["mae_pips"] for x in rows),
+        "mean_mfe_pips_certain": statistics.fmean(x["mfe_pips_certain"] for x in rows),
+        "mean_mae_pips_certain": statistics.fmean(x["mae_pips_certain"] for x in rows),
         "instrument_breakdown": {
             k: {
                 "n": len(v),
@@ -614,6 +681,8 @@ def summarize(trades: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         / len(instruments),
         "bootstrap_mean_gross_r": _bootstrap(rows, "gross_r"),
         "bootstrap_mean_gross_pips": _bootstrap(rows, "gross_pips"),
+        "cost_status_counts": dict(sorted(cost_statuses.items())),
+        "net_scenario_summaries": net_scenarios,
     }
 
 
@@ -696,6 +765,29 @@ def _gzip_jsonl(rows: Sequence[Mapping[str, Any]]) -> bytes:
     return gzip.compress(b"".join(_json(x) for x in rows), mtime=0)
 
 
+def load_preregistration() -> tuple[dict[str, Any], str]:
+    """Load the sole frozen preregistration and verify its canonical identity."""
+    try:
+        value = json.loads(PREREGISTRATION.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OuTradableError("missing or malformed frozen preregistration") from exc
+    if not isinstance(value, dict):
+        raise OuTradableError("frozen preregistration must be a JSON object")
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    identity = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    if identity != EXPECTED_PREREGISTRATION_SHA:
+        raise OuTradableError("frozen preregistration identity mismatch")
+    if (
+        value.get("study_id") != STUDY_ID
+        or value.get("scientific_status") != SCIENTIFIC_STATUS
+        or value.get("authorized_registry") != str(REGISTRY)
+    ):
+        raise OuTradableError("frozen preregistration contract mismatch")
+    return value, identity
+
+
 def run(
     output_dir: Path = DEFAULT_OUTPUT, cost_profile: Path = DEFAULT_COST_PROFILE
 ) -> dict[str, Any]:
@@ -704,6 +796,7 @@ def run(
         raise OuTradableError(
             "refusing to overwrite existing empirical output directory"
         )
+    _preregistration, preregistration_sha = load_preregistration()
     registry = load_registry(REGISTRY)
     states = []
     bars_by_instrument = {}
@@ -766,11 +859,14 @@ def run(
                         row["instrument"], session_key, statistic
                     )
                     for slippage in SLIPPAGES:
-                        raw_net = row["gross_pips"] - spread - commission - slippage
                         row["net_pips_cost_scenarios"][
                             f"{statistic}/slippage_{slippage:g}"
-                        ] = raw_net * (
-                            1 - adjustment if raw_net > 0 else 1 + adjustment
+                        ] = cost_scenario_pips(
+                            row["gross_pips"],
+                            spread,
+                            slippage,
+                            commission,
+                            adjustment,
                         )
     reports = {}
     audits = {}
@@ -824,11 +920,13 @@ def run(
         "methodology_id": METHODOLOGY_ID,
         "raw_component_candidate_count": len(components),
         "unique_ensemble_signal_count": len(signals),
+        "bollinger_diagnostics_status": "NOT_EMITTED_IN_V1",
         "reports": reports,
         "headline_decision": decision(headline),
         "cost_profile_status": "AVAILABLE" if profile else "MISSING",
         "provenance": {
             "registry_id": registry["registry_id"],
+            "preregistration_sha": preregistration_sha,
             "registry_sha": "sha256:"
             + hashlib.sha256(REGISTRY.read_bytes()).hexdigest(),
             "corpora": provenance,
