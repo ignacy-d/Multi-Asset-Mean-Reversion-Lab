@@ -1,0 +1,60 @@
+{
+  "study_id": "OU-LONGUSD-TRADABLE-2024-v1",
+  "scientific_status": "2024_FOLLOW_UP_DISCOVERY_NOT_CONFIRMATION",
+  "authorized_registry": "configs/fx-universe-2024-registry-v1.json",
+  "core_long_usd": {
+    "AUDUSD": "SHORT",
+    "EURUSD": "SHORT",
+    "GBPUSD": "SHORT",
+    "NZDUSD": "SHORT",
+    "USDCAD": "LONG",
+    "USDCHF": "LONG",
+    "USDJPY": "LONG"
+  },
+  "auxiliary": {"EURGBP": "SHORT"},
+  "excluded": ["AUDJPY"],
+  "signal": {
+    "timeframe": "15m",
+    "session": "london",
+    "benchmark_families": ["vwap", "vwap-canonical-m1"],
+    "lookbacks": [20, 40],
+    "union_key": ["instrument", "exact_timestamp", "required_direction"],
+    "ensemble_e0": "deterministic_median",
+    "vote_count_use": "diagnostic_only"
+  },
+  "ou": {
+    "transition_window": 128,
+    "directional_score": {"operator": ">", "value": 1.5},
+    "half_life_minutes": {"operator": "<=", "value": 120}
+  },
+  "execution": {
+    "entry": "exact_signal_timestamp_m1_open",
+    "no_forward_substitution": true,
+    "take_profit_fractions": [0.5, 0.75, 1.0],
+    "equal_tranche_weights": [0.3333333333333333, 0.3333333333333333, 0.3333333333333333],
+    "shared_stop_fraction": 0.5,
+    "same_minute_ambiguity": "adverse_first",
+    "dynamic_exit_rules": false
+  },
+  "lifecycle": {
+    "safe_london_end": "configured_session_end_minus_15_minutes",
+    "primary": "min(180_minutes,safe_london_end-entry)",
+    "robustness": "min(180_minutes,floor_two_thirds_safe_remaining)"
+  },
+  "portfolio_modes": ["UNCONSTRAINED", "ONE_PER_INSTRUMENT"],
+  "bollinger": "NOT_EMITTED_IN_V1",
+  "bootstrap": {"unit": "whole_calendar_month", "replicates": 10000, "seed": 20241024},
+  "headline": "PRIMARY/ONE_PER_INSTRUMENT/CORE_LONG_USD",
+  "continuation_screen": {
+    "executed_trades_minimum": 200,
+    "mean_gross_r_minimum": 0.1,
+    "mean_gross_r_bootstrap_p2_5": ">0"
+  },
+  "decision_labels": [
+    "CONTINUE_OU_LONGUSD_TRADABLE_V1",
+    "PARK_OU_LONGUSD_TRADABLE_V1",
+    "INCONCLUSIVE_OU_LONGUSD_TRADABLE_V1"
+  ],
+  "cost_profile": "configs/stage4c-ftmo-cost-profile-v2.json",
+  "output_policy": "atomic_refuse_overwrite_deterministic_gzip"
+}
