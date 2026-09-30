@@ -1,0 +1,804 @@
+{
+  "schema_version": "strategy-family-registry-v1",
+  "schema_path": "configs/strategy-family-registry-schema-v1.json",
+  "governance": {
+    "history_policy": "APPEND_ONLY_NO_SILENT_REPLACEMENT",
+    "global_ranking": false,
+    "authoritative_final_selection": false,
+    "next_intended_validation_dataset": "Independent 2023 replication for London candidates"
+  },
+  "allowed_statuses": [
+    "STRONG_CANDIDATE",
+    "POSITIVE_CANDIDATE",
+    "BORDERLINE",
+    "FAILED_AFTER_COSTS",
+    "PARK",
+    "INDEPENDENT_REPLICATION_PENDING",
+    "LOCAL_ARTIFACT_AUDIT_PENDING",
+    "NOT_ASSESSED",
+    "LOCAL_ARTIFACT_VERIFIED",
+    "PARTIAL_LOCAL_ARTIFACT_VERIFICATION",
+    "LOCAL_DERIVED_AUDIT_PENDING",
+    "BLOCKED_MISSING_AUTHENTICATED_COST_PROFILE"
+  ],
+  "families": [
+    {
+      "family_id": "FROZEN_STAGE4B_OU_LONDON",
+      "session": "LONDON",
+      "alpha_methodology_id": "STAGE4B_OU_LONDON_ALPHA_V1",
+      "execution_methodology_id": "STAGE4B_IMMEDIATE_GRID_EXECUTION_V1",
+      "alpha_rules": {
+        "timeframe": "M15",
+        "benchmark_families": [
+          "VWAP",
+          "CANONICAL_M1_VWAP"
+        ],
+        "lookbacks": [
+          20,
+          40
+        ],
+        "ou_window": 128,
+        "directional_score": {
+          "operator": ">",
+          "value": 1.5
+        },
+        "half_life_minutes": {
+          "operator": "<=",
+          "value": 120
+        }
+      },
+      "execution_rules": {
+        "entry": "IMMEDIATE",
+        "take_profit_d0": [
+          0.75,
+          1.0
+        ],
+        "stop_loss_d0": [
+          0.25,
+          0.5
+        ],
+        "time_stop_minutes": [
+          60,
+          120
+        ],
+        "signal_definition_count": 4,
+        "exit_policy_count": 8,
+        "cell_count": 32
+      },
+      "research_interpretation": "Parameter-family/plateau study, not one selected best cell.",
+      "scientific_status": "INDEPENDENT_REPLICATION_PENDING",
+      "replaces_family_id": null,
+      "instruments": [
+        {
+          "family_id": "FROZEN_STAGE4B_OU_LONDON",
+          "session": "LONDON",
+          "alpha_methodology_id": "STAGE4B_OU_LONDON_ALPHA_V1",
+          "execution_methodology_id": "STAGE4B_IMMEDIATE_GRID_EXECUTION_V1",
+          "instrument": "GBPUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "STRONG_CANDIDATE",
+          "net_status": "STRONG_CANDIDATE",
+          "cost_robustness": {
+            "p90_spread_plus_slippage_0_25_pip": {
+              "net_positive_cells": 32,
+              "total_cells": 32
+            },
+            "p95_spread_plus_slippage_0_5_pip": {
+              "net_positive_cells": 30,
+              "total_cells": 32
+            }
+          },
+          "evidence_source": "Externally remembered/local historical result supplied for registry; not repo-authenticated evidence",
+          "evidence_verification_status": "LOCAL_ARTIFACT_AUDIT_PENDING",
+          "replication_status": "INDEPENDENT_REPLICATION_PENDING",
+          "notes": "Broad cost robustness is retained from external/local historical evidence; the exact later cost-artifact path and SHA-256 remain unresolved.",
+          "evidence_artifacts": []
+        },
+        {
+          "family_id": "FROZEN_STAGE4B_OU_LONDON",
+          "session": "LONDON",
+          "alpha_methodology_id": "STAGE4B_OU_LONDON_ALPHA_V1",
+          "execution_methodology_id": "STAGE4B_IMMEDIATE_GRID_EXECUTION_V1",
+          "instrument": "EURUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "STRONG_CANDIDATE",
+          "net_status": "STRONG_CANDIDATE",
+          "cost_robustness": {
+            "status": "LOCAL_ARTIFACT_VERIFIED"
+          },
+          "evidence_source": "Locally verified Stage4B OU comparison artifact",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "INDEPENDENT_REPLICATION_PENDING",
+          "notes": "Exact gross and net evidence verified against the registered local artifact.",
+          "metrics": {
+            "n": 1744,
+            "gross_mean_pips": 2.5050991279178576,
+            "gross_profit_factor": 1.912617583725004,
+            "net_mean_pips": 1.9027037769178576,
+            "net_profit_factor": 1.6192167733226863
+          },
+          "evidence_artifacts": [
+            {
+              "path": "results/replay-mr-ou-costs-9pair/output/comparison.json",
+              "sha256": "e6159a9c7c2579a322c2ce6b2145a7cb27c0d608768c19126e971a6c10cc9534",
+              "supports": "verified instrument-level gross and net comparison values where authenticated costs were available"
+            }
+          ]
+        },
+        {
+          "family_id": "FROZEN_STAGE4B_OU_LONDON",
+          "session": "LONDON",
+          "alpha_methodology_id": "STAGE4B_OU_LONDON_ALPHA_V1",
+          "execution_methodology_id": "STAGE4B_IMMEDIATE_GRID_EXECUTION_V1",
+          "instrument": "AUDUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "BORDERLINE",
+          "net_status": "BORDERLINE",
+          "cost_robustness": {
+            "status": "LOCAL_ARTIFACT_VERIFIED"
+          },
+          "evidence_source": "Locally verified Stage4B OU comparison artifact",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "INDEPENDENT_REPLICATION_PENDING",
+          "notes": "Exact gross and net evidence verified against the registered local artifact.",
+          "metrics": {
+            "n": 1928,
+            "gross_mean_pips": 1.0386241225879727,
+            "gross_profit_factor": 1.3841994889575748,
+            "net_mean_pips": 0.2079646295879726,
+            "net_profit_factor": 1.0648334364069283
+          },
+          "evidence_artifacts": [
+            {
+              "path": "results/replay-mr-ou-costs-9pair/output/comparison.json",
+              "sha256": "e6159a9c7c2579a322c2ce6b2145a7cb27c0d608768c19126e971a6c10cc9534",
+              "supports": "verified instrument-level gross and net comparison values where authenticated costs were available"
+            }
+          ]
+        },
+        {
+          "family_id": "FROZEN_STAGE4B_OU_LONDON",
+          "session": "LONDON",
+          "alpha_methodology_id": "STAGE4B_OU_LONDON_ALPHA_V1",
+          "execution_methodology_id": "STAGE4B_IMMEDIATE_GRID_EXECUTION_V1",
+          "instrument": "EURGBP",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; locally verified Stage4B comparison artifact",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "NOT_ASSESSED",
+          "cost_robustness": {
+            "status": "BLOCKED_MISSING_AUTHENTICATED_COST_PROFILE"
+          },
+          "evidence_source": "Locally verified Stage4B OU comparison artifact (gross evidence only)",
+          "evidence_artifacts": [
+            {
+              "path": "results/replay-mr-ou-costs-9pair/output/comparison.json",
+              "sha256": "e6159a9c7c2579a322c2ce6b2145a7cb27c0d608768c19126e971a6c10cc9534",
+              "supports": "verified EURGBP gross comparison values; net evidence unavailable because the replay was blocked by a missing authenticated cost profile"
+            }
+          ],
+          "evidence_verification_status": "PARTIAL_LOCAL_ARTIFACT_VERIFICATION",
+          "replication_status": "NOT_ASSESSED",
+          "notes": "Gross evidence is verified. Net evidence is unavailable and must not be inferred from another execution family.",
+          "metrics": {
+            "n": 1752,
+            "gross_mean_pips": 1.0147090047974772,
+            "gross_profit_factor": 1.6472815356652868
+          }
+        }
+      ]
+    },
+    {
+      "family_id": "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+      "session": "LONDON",
+      "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_LONDON_ALPHA",
+      "execution_methodology_id": "OU_LONGUSD_TRADABLE_LONDON_E0_M1_OPEN_V1",
+      "alpha_rules": {
+        "inherits_exact_frozen_rules_from": "configs/ou-longusd-tradable-2024-v1.json"
+      },
+      "execution_rules": {
+        "ensemble": "E0_DETERMINISTIC_MEDIAN",
+        "entry": "EXACT_M1_OPEN",
+        "take_profit_d0": [
+          0.5,
+          0.75,
+          1.0
+        ],
+        "tranche_weights": [
+          "1/3",
+          "1/3",
+          "1/3"
+        ],
+        "shared_stop_loss_d0": 0.5,
+        "max_primary_lifecycle_minutes": 180,
+        "headline_portfolio_mode": "ONE_PER_INSTRUMENT",
+        "cost_overlay": "configs/stage4c-ftmo-cost-profile-v2.json"
+      },
+      "research_interpretation": "Instrument-specific evidence; no global family ranking and no inference that 16/16 instruments are the only valid family.",
+      "scientific_status": "INDEPENDENT_REPLICATION_PENDING",
+      "replaces_family_id": null,
+      "instruments": [
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+          "session": "LONDON",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_LONDON_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_LONDON_E0_M1_OPEN_V1",
+          "instrument": "AUDUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "STRONG_CANDIDATE",
+          "net_status": "STRONG_CANDIDATE",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 16,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified London Tradable summary, net overlay, and 16-scenario robustness artifacts",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "INDEPENDENT_REPLICATION_PENDING",
+          "notes": "EURUSD remains economically positive; 16/16 survival does not uniquely select a family.",
+          "metrics": {
+            "primary_n": 57,
+            "gross_mean_pips": 2.476228,
+            "mean_spread_zero_slippage_net_mean_pips": 1.587568,
+            "net_mean_r": 0.115445,
+            "net_profit_factor": 1.243402
+          },
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "27a28e219d287046bb577ed41b3d29fd7e701efb4578b779ba720ec9f985bc5b",
+              "supports": "London Tradable summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "6d20134ad516cb1dbac05737f50b46a2dde2824baa75595c9935310269df8cd1",
+              "supports": "London net overlay summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "77d201558ca733cf607dcc333bea37b2f0db1938310d62b62794421338bf5a87",
+              "supports": "London 16-scenario robustness; local path not supplied to the registry"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+          "session": "LONDON",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_LONDON_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_LONDON_E0_M1_OPEN_V1",
+          "instrument": "EURUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "POSITIVE_CANDIDATE",
+          "net_status": "POSITIVE_CANDIDATE",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 14,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified London Tradable summary, net overlay, and 16-scenario robustness artifacts",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "INDEPENDENT_REPLICATION_PENDING",
+          "notes": "EURUSD remains economically positive; 16/16 survival does not uniquely select a family.",
+          "metrics": {
+            "primary_n": 63,
+            "gross_mean_pips": 1.708389,
+            "mean_spread_zero_slippage_net_mean_pips": 1.061738,
+            "net_mean_r": 0.088364,
+            "net_profit_factor": 1.185056
+          },
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "27a28e219d287046bb577ed41b3d29fd7e701efb4578b779ba720ec9f985bc5b",
+              "supports": "London Tradable summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "6d20134ad516cb1dbac05737f50b46a2dde2824baa75595c9935310269df8cd1",
+              "supports": "London net overlay summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "77d201558ca733cf607dcc333bea37b2f0db1938310d62b62794421338bf5a87",
+              "supports": "London 16-scenario robustness; local path not supplied to the registry"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+          "session": "LONDON",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_LONDON_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_LONDON_E0_M1_OPEN_V1",
+          "instrument": "GBPUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "STRONG_CANDIDATE",
+          "net_status": "STRONG_CANDIDATE",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 16,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified London Tradable summary, net overlay, and 16-scenario robustness artifacts",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "INDEPENDENT_REPLICATION_PENDING",
+          "notes": "EURUSD remains economically positive; 16/16 survival does not uniquely select a family.",
+          "metrics": {
+            "primary_n": 53,
+            "gross_mean_pips": 3.576473,
+            "mean_spread_zero_slippage_net_mean_pips": 2.532102,
+            "net_mean_r": 0.111953,
+            "net_profit_factor": 1.231721
+          },
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "27a28e219d287046bb577ed41b3d29fd7e701efb4578b779ba720ec9f985bc5b",
+              "supports": "London Tradable summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "6d20134ad516cb1dbac05737f50b46a2dde2824baa75595c9935310269df8cd1",
+              "supports": "London net overlay summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "77d201558ca733cf607dcc333bea37b2f0db1938310d62b62794421338bf5a87",
+              "supports": "London 16-scenario robustness; local path not supplied to the registry"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+          "session": "LONDON",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_LONDON_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_LONDON_E0_M1_OPEN_V1",
+          "instrument": "NZDUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified London Tradable summary, net overlay, and 16-scenario robustness artifacts",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "PARK",
+          "notes": "EURGBP is auxiliary; all others are core long-USD instruments.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "27a28e219d287046bb577ed41b3d29fd7e701efb4578b779ba720ec9f985bc5b",
+              "supports": "London Tradable summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "6d20134ad516cb1dbac05737f50b46a2dde2824baa75595c9935310269df8cd1",
+              "supports": "London net overlay summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "77d201558ca733cf607dcc333bea37b2f0db1938310d62b62794421338bf5a87",
+              "supports": "London 16-scenario robustness; local path not supplied to the registry"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+          "session": "LONDON",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_LONDON_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_LONDON_E0_M1_OPEN_V1",
+          "instrument": "USDCAD",
+          "direction": "LONG",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified London Tradable summary, net overlay, and 16-scenario robustness artifacts",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "PARK",
+          "notes": "EURGBP is auxiliary; all others are core long-USD instruments.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "27a28e219d287046bb577ed41b3d29fd7e701efb4578b779ba720ec9f985bc5b",
+              "supports": "London Tradable summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "6d20134ad516cb1dbac05737f50b46a2dde2824baa75595c9935310269df8cd1",
+              "supports": "London net overlay summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "77d201558ca733cf607dcc333bea37b2f0db1938310d62b62794421338bf5a87",
+              "supports": "London 16-scenario robustness; local path not supplied to the registry"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+          "session": "LONDON",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_LONDON_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_LONDON_E0_M1_OPEN_V1",
+          "instrument": "USDCHF",
+          "direction": "LONG",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified London Tradable summary, net overlay, and 16-scenario robustness artifacts",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "PARK",
+          "notes": "EURGBP is auxiliary; all others are core long-USD instruments.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "27a28e219d287046bb577ed41b3d29fd7e701efb4578b779ba720ec9f985bc5b",
+              "supports": "London Tradable summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "6d20134ad516cb1dbac05737f50b46a2dde2824baa75595c9935310269df8cd1",
+              "supports": "London net overlay summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "77d201558ca733cf607dcc333bea37b2f0db1938310d62b62794421338bf5a87",
+              "supports": "London 16-scenario robustness; local path not supplied to the registry"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+          "session": "LONDON",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_LONDON_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_LONDON_E0_M1_OPEN_V1",
+          "instrument": "USDJPY",
+          "direction": "LONG",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified London Tradable summary, net overlay, and 16-scenario robustness artifacts",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "PARK",
+          "notes": "EURGBP is auxiliary; all others are core long-USD instruments.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "27a28e219d287046bb577ed41b3d29fd7e701efb4578b779ba720ec9f985bc5b",
+              "supports": "London Tradable summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "6d20134ad516cb1dbac05737f50b46a2dde2824baa75595c9935310269df8cd1",
+              "supports": "London net overlay summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "77d201558ca733cf607dcc333bea37b2f0db1938310d62b62794421338bf5a87",
+              "supports": "London 16-scenario robustness; local path not supplied to the registry"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+          "session": "LONDON",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_LONDON_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_LONDON_E0_M1_OPEN_V1",
+          "instrument": "EURGBP",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified London Tradable summary, net overlay, and 16-scenario robustness artifacts",
+          "evidence_verification_status": "LOCAL_ARTIFACT_VERIFIED",
+          "replication_status": "PARK",
+          "notes": "EURGBP is auxiliary; all others are core long-USD instruments.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "27a28e219d287046bb577ed41b3d29fd7e701efb4578b779ba720ec9f985bc5b",
+              "supports": "London Tradable summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "6d20134ad516cb1dbac05737f50b46a2dde2824baa75595c9935310269df8cd1",
+              "supports": "London net overlay summary; local path not supplied to the registry"
+            },
+            {
+              "path": null,
+              "sha256": "77d201558ca733cf607dcc333bea37b2f0db1938310d62b62794421338bf5a87",
+              "supports": "London 16-scenario robustness; local path not supplied to the registry"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "family_id": "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1",
+      "session": "NEW_YORK",
+      "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_NEW_YORK_ALPHA",
+      "execution_methodology_id": "OU_LONGUSD_TRADABLE_NEW_YORK_E0_M1_OPEN_V1",
+      "alpha_rules": {
+        "inherits_exact_frozen_rules_from": "configs/ou-longusd-tradable-2024-ny-v1.json"
+      },
+      "execution_rules": {
+        "inherits_tradable_execution_family_from": "configs/ou-longusd-tradable-2024-ny-v1.json",
+        "cost_overlay": "configs/stage4c-ftmo-cost-profile-v2.json"
+      },
+      "research_interpretation": "Current New York Tradable family does not survive authenticated execution costs; do not tune it further on 2024.",
+      "scientific_status": "PARK",
+      "aggregate_headline": {
+        "n": 380,
+        "gross_mean_pips": 0.569269,
+        "gross_mean_r": 0.035543,
+        "gross_profit_factor": 1.073596,
+        "mean_spread_zero_slippage_net_mean_pips": -0.514506,
+        "negative_cost_scenarios": 16,
+        "total_cost_scenarios": 16
+      },
+      "replaces_family_id": null,
+      "instruments": [
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1",
+          "session": "NEW_YORK",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_NEW_YORK_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_NEW_YORK_E0_M1_OPEN_V1",
+          "instrument": "AUDUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified New York summary plus an unpersisted local derived per-instrument net audit",
+          "evidence_verification_status": "LOCAL_DERIVED_AUDIT_PENDING",
+          "replication_status": "PARK",
+          "notes": "No PRIMARY cost scenario survived; park rather than tune further on 2024. The registered summary hash does not authenticate the per-instrument net decomposition; that derived audit remains pending a persisted artifact.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "d22ab9c731969b852ed518632acc67a1bf69678e3bcd072d4eb6ddad47e3e155",
+              "supports": "New York summary and values contained in it; does not authenticate the local per-instrument net decomposition"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1",
+          "session": "NEW_YORK",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_NEW_YORK_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_NEW_YORK_E0_M1_OPEN_V1",
+          "instrument": "EURUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified New York summary plus an unpersisted local derived per-instrument net audit",
+          "evidence_verification_status": "LOCAL_DERIVED_AUDIT_PENDING",
+          "replication_status": "PARK",
+          "notes": "No PRIMARY cost scenario survived; park rather than tune further on 2024. The registered summary hash does not authenticate the per-instrument net decomposition; that derived audit remains pending a persisted artifact.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "d22ab9c731969b852ed518632acc67a1bf69678e3bcd072d4eb6ddad47e3e155",
+              "supports": "New York summary and values contained in it; does not authenticate the local per-instrument net decomposition"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1",
+          "session": "NEW_YORK",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_NEW_YORK_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_NEW_YORK_E0_M1_OPEN_V1",
+          "instrument": "GBPUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified New York summary plus an unpersisted local derived per-instrument net audit",
+          "evidence_verification_status": "LOCAL_DERIVED_AUDIT_PENDING",
+          "replication_status": "PARK",
+          "notes": "No PRIMARY cost scenario survived; park rather than tune further on 2024. Gross diagnostics are recorded but do not promote candidacy. The registered summary hash does not authenticate the per-instrument net decomposition; that derived audit remains pending a persisted artifact.",
+          "metrics": {
+            "gross_mean_pips": 1.077,
+            "gross_mean_r": 0.0827,
+            "gross_profit_factor": 1.195,
+            "net_floor_mean_pips": 0.032,
+            "net_mean_r": -0.0553,
+            "net_profit_factor": 0.889
+          },
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "d22ab9c731969b852ed518632acc67a1bf69678e3bcd072d4eb6ddad47e3e155",
+              "supports": "New York summary and values contained in it; does not authenticate the local per-instrument net decomposition"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1",
+          "session": "NEW_YORK",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_NEW_YORK_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_NEW_YORK_E0_M1_OPEN_V1",
+          "instrument": "NZDUSD",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified New York summary plus an unpersisted local derived per-instrument net audit",
+          "evidence_verification_status": "LOCAL_DERIVED_AUDIT_PENDING",
+          "replication_status": "PARK",
+          "notes": "No PRIMARY cost scenario survived; park rather than tune further on 2024. The registered summary hash does not authenticate the per-instrument net decomposition; that derived audit remains pending a persisted artifact.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "d22ab9c731969b852ed518632acc67a1bf69678e3bcd072d4eb6ddad47e3e155",
+              "supports": "New York summary and values contained in it; does not authenticate the local per-instrument net decomposition"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1",
+          "session": "NEW_YORK",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_NEW_YORK_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_NEW_YORK_E0_M1_OPEN_V1",
+          "instrument": "USDCAD",
+          "direction": "LONG",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified New York summary plus an unpersisted local derived per-instrument net audit",
+          "evidence_verification_status": "LOCAL_DERIVED_AUDIT_PENDING",
+          "replication_status": "PARK",
+          "notes": "No PRIMARY cost scenario survived; park rather than tune further on 2024. The registered summary hash does not authenticate the per-instrument net decomposition; that derived audit remains pending a persisted artifact.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "d22ab9c731969b852ed518632acc67a1bf69678e3bcd072d4eb6ddad47e3e155",
+              "supports": "New York summary and values contained in it; does not authenticate the local per-instrument net decomposition"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1",
+          "session": "NEW_YORK",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_NEW_YORK_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_NEW_YORK_E0_M1_OPEN_V1",
+          "instrument": "USDCHF",
+          "direction": "LONG",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified New York summary plus an unpersisted local derived per-instrument net audit",
+          "evidence_verification_status": "LOCAL_DERIVED_AUDIT_PENDING",
+          "replication_status": "PARK",
+          "notes": "No PRIMARY cost scenario survived; park rather than tune further on 2024. The registered summary hash does not authenticate the per-instrument net decomposition; that derived audit remains pending a persisted artifact.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "d22ab9c731969b852ed518632acc67a1bf69678e3bcd072d4eb6ddad47e3e155",
+              "supports": "New York summary and values contained in it; does not authenticate the local per-instrument net decomposition"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1",
+          "session": "NEW_YORK",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_NEW_YORK_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_NEW_YORK_E0_M1_OPEN_V1",
+          "instrument": "USDJPY",
+          "direction": "LONG",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified New York summary plus an unpersisted local derived per-instrument net audit",
+          "evidence_verification_status": "LOCAL_DERIVED_AUDIT_PENDING",
+          "replication_status": "PARK",
+          "notes": "No PRIMARY cost scenario survived; park rather than tune further on 2024. Gross diagnostics are recorded but do not promote candidacy. The registered summary hash does not authenticate the per-instrument net decomposition; that derived audit remains pending a persisted artifact.",
+          "metrics": {
+            "gross_mean_pips": 2.366,
+            "gross_mean_r": 0.1587,
+            "gross_profit_factor": 1.375,
+            "net_floor_mean_pips": 0.933,
+            "net_mean_r": -0.0151,
+            "net_profit_factor": 0.971
+          },
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "d22ab9c731969b852ed518632acc67a1bf69678e3bcd072d4eb6ddad47e3e155",
+              "supports": "New York summary and values contained in it; does not authenticate the local per-instrument net decomposition"
+            }
+          ]
+        },
+        {
+          "family_id": "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1",
+          "session": "NEW_YORK",
+          "alpha_methodology_id": "OU_LONGUSD_TRADABLE_2024_V1_FROZEN_NEW_YORK_ALPHA",
+          "execution_methodology_id": "OU_LONGUSD_TRADABLE_NEW_YORK_E0_M1_OPEN_V1",
+          "instrument": "EURGBP",
+          "direction": "SHORT",
+          "discovery_dataset": "2024 authenticated development/discovery dataset; exact evidence artifact identity pending audit",
+          "gross_status": "NOT_ASSESSED",
+          "net_status": "FAILED_AFTER_COSTS",
+          "cost_robustness": {
+            "primary_cost_scenarios_survived": 0,
+            "primary_cost_scenarios_total": 16,
+            "cost_overlay": "authenticated Stage4C-v2 profile"
+          },
+          "evidence_source": "Locally verified New York summary plus an unpersisted local derived per-instrument net audit",
+          "evidence_verification_status": "LOCAL_DERIVED_AUDIT_PENDING",
+          "replication_status": "PARK",
+          "notes": "No PRIMARY cost scenario survived; park rather than tune further on 2024. The registered summary hash does not authenticate the per-instrument net decomposition; that derived audit remains pending a persisted artifact.",
+          "evidence_artifacts": [
+            {
+              "path": null,
+              "sha256": "d22ab9c731969b852ed518632acc67a1bf69678e3bcd072d4eb6ddad47e3e155",
+              "supports": "New York summary and values contained in it; does not authenticate the local per-instrument net decomposition"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "non_authoritative_selection_notice": "PR #106 / OU-LONGUSD-NET-CORE-v2 is not authoritative final family selection while the strategy-family audit remains unresolved."
+}
