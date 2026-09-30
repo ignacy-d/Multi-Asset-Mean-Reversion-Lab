@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-asset-mean-reversion-lab.invalid/schemas/strategy-family-registry-v1.json",
+  "title": "Strategy Family Registry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "governance",
+    "allowed_statuses",
+    "families",
+    "schema_path",
+    "non_authoritative_selection_notice"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "strategy-family-registry-v1"
+    },
+    "governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "history_policy",
+        "global_ranking",
+        "authoritative_final_selection",
+        "next_intended_validation_dataset"
+      ],
+      "properties": {
+        "history_policy": {
+          "const": "APPEND_ONLY_NO_SILENT_REPLACEMENT"
+        },
+        "global_ranking": {
+          "const": false
+        },
+        "authoritative_final_selection": {
+          "const": false
+        },
+        "next_intended_validation_dataset": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "allowed_statuses": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "STRONG_CANDIDATE",
+          "POSITIVE_CANDIDATE",
+          "BORDERLINE",
+          "FAILED_AFTER_COSTS",
+          "PARK",
+          "INDEPENDENT_REPLICATION_PENDING",
+          "LOCAL_ARTIFACT_AUDIT_PENDING",
+          "NOT_ASSESSED"
+        ]
+      }
+    },
+    "families": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/family"
+      }
+    },
+    "schema_path": {
+      "const": "configs/strategy-family-registry-schema-v1.json"
+    },
+    "non_authoritative_selection_notice": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "$defs": {
+    "family": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family_id",
+        "session",
+        "alpha_methodology_id",
+        "execution_methodology_id",
+        "alpha_rules",
+        "execution_rules",
+        "research_interpretation",
+        "scientific_status",
+        "replaces_family_id",
+        "instruments"
+      ],
+      "properties": {
+        "family_id": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]+$"
+        },
+        "session": {
+          "enum": [
+            "LONDON",
+            "NEW_YORK"
+          ]
+        },
+        "alpha_methodology_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "execution_methodology_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "alpha_rules": {
+          "type": "object"
+        },
+        "execution_rules": {
+          "type": "object"
+        },
+        "research_interpretation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scientific_status": {
+          "type": "string"
+        },
+        "replaces_family_id": {
+          "type": "null"
+        },
+        "instruments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/instrument"
+          }
+        },
+        "aggregate_headline": {
+          "type": "object"
+        }
+      }
+    },
+    "instrument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family_id",
+        "session",
+        "alpha_methodology_id",
+        "execution_methodology_id",
+        "instrument",
+        "direction",
+        "discovery_dataset",
+        "gross_status",
+        "net_status",
+        "cost_robustness",
+        "evidence_source",
+        "evidence_artifact_sha256",
+        "evidence_verification_status",
+        "replication_status",
+        "notes"
+      ],
+      "properties": {
+        "family_id": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        },
+        "alpha_methodology_id": {
+          "type": "string"
+        },
+        "execution_methodology_id": {
+          "type": "string"
+        },
+        "instrument": {
+          "type": "string",
+          "pattern": "^[A-Z]{6}$"
+        },
+        "direction": {
+          "enum": [
+            "LONG",
+            "SHORT"
+          ]
+        },
+        "discovery_dataset": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gross_status": {
+          "type": "string"
+        },
+        "net_status": {
+          "type": "string"
+        },
+        "cost_robustness": {
+          "type": "object"
+        },
+        "evidence_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_artifact_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "evidence_verification_status": {
+          "type": "string"
+        },
+        "replication_status": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        },
+        "metrics": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}
