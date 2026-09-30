@@ -138,6 +138,22 @@ def test_payload_and_manifest_hash_mismatches_fail_closed(tmp_path: Path) -> Non
         corpus.authenticate_corpus(tmp_path / "AUDUSD", "AUDUSD")
 
 
+def test_provenance_byte_mutation_fails_authentication(tmp_path: Path) -> None:
+    acquire_synthetic(tmp_path, "AUDUSD")
+    provenance = tmp_path / "AUDUSD" / "AUDUSD-2023-01-03-M1-BID.json"
+    provenance.write_bytes(provenance.read_bytes() + b"\n")
+    with pytest.raises(corpus.OuReplicationCorpusError, match="identity mismatch"):
+        corpus.authenticate_corpus(tmp_path / "AUDUSD", "AUDUSD")
+
+
+def test_absence_evidence_byte_mutation_fails_authentication(tmp_path: Path) -> None:
+    acquire_synthetic(tmp_path, "EURUSD")
+    evidence = tmp_path / "EURUSD" / "EURUSD-2023-02-01-M1-BID.absent.json"
+    evidence.write_bytes(evidence.read_bytes() + b"\n")
+    with pytest.raises(corpus.OuReplicationCorpusError, match="identity mismatch"):
+        corpus.authenticate_corpus(tmp_path / "EURUSD", "EURUSD")
+
+
 def test_missing_and_corrupt_components_fail_closed(tmp_path: Path) -> None:
     acquire_synthetic(tmp_path, "EURUSD")
     missing = tmp_path / "EURUSD" / "EURUSD-2023-02-01-M1-BID.absent.json"
@@ -156,6 +172,11 @@ def test_registry_is_exact_and_deterministic(tmp_path: Path) -> None:
     assert output.read_bytes() == first
     registry = json.loads(first)
     assert tuple(registry["instruments"]) == corpus.AUTHORIZED_INSTRUMENTS
+    assert all(
+        entry["manifest_sha256"].startswith("sha256:")
+        and len(entry["manifest_sha256"]) == 71
+        for entry in registry["instruments"].values()
+    )
     assert all(
         entry["authentication_status"] == "authenticated"
         for entry in registry["instruments"].values()

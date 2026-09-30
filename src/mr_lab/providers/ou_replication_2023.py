@@ -145,15 +145,30 @@ def _read_absence(root: Path, instrument: str, day: date) -> bool:
 
 
 def _manifest(
-    instrument: str, payloads: list[DailyPayload], absent: list[date]
+    root: Path,
+    instrument: str,
+    payloads: list[DailyPayload],
+    absent: list[date],
 ) -> dict[str, object]:
     dataset = assemble_daily_payloads(payloads)
     components = [
         {
             "requested_day": item.requested_day.isoformat(),
-            "raw_sha256": hashlib.sha256(item.payload).hexdigest(),
+            "raw_sha256": _sha(item.payload),
+            "provenance_sha256": _sha(
+                _paths(root, instrument, item.requested_day)[1].read_bytes()
+            ),
         }
         for item in sorted(payloads, key=lambda item: item.requested_day)
+    ]
+    absence_components = [
+        {
+            "requested_day": day.isoformat(),
+            "absence_evidence_sha256": _sha(
+                _paths(root, instrument, day)[2].read_bytes()
+            ),
+        }
+        for day in sorted(absent)
     ]
     body: dict[str, object] = {
         "corpus_schema_version": CORPUS_SCHEMA_VERSION,
@@ -168,6 +183,7 @@ def _manifest(
         "components": components,
         "successful_component_dates": [item["requested_day"] for item in components],
         "confirmed_absent_dates": [day.isoformat() for day in sorted(absent)],
+        "absence_components": absence_components,
         "assembled_dataset_id": dataset.metadata.dataset_id,
     }
     return {"corpus_id": _sha(_json(body).encode()), **body}
@@ -242,7 +258,7 @@ def acquire_corpus(
                 payloads.append(item)
         if delay_seconds and index != len(days) - 1:
             sleeper(delay_seconds)
-    manifest = _manifest(symbol, payloads, absent)
+    manifest = _manifest(corpus_dir, symbol, payloads, absent)
     if len(payloads) + len(absent) != 365:
         raise OuReplicationCorpusError(
             "daily evidence does not partition calendar year 2023"
@@ -273,7 +289,7 @@ def authenticate_corpus(corpus_dir: Path, instrument: str) -> AcquisitionResult:
             absent.append(day)
         else:
             raise OuReplicationCorpusError(f"missing authenticated component for {day}")
-    rebuilt = _manifest(symbol, payloads, absent)
+    rebuilt = _manifest(corpus_dir, symbol, payloads, absent)
     if stored != rebuilt:
         raise OuReplicationCorpusError(
             "manifest or assembled dataset identity mismatch"
@@ -303,7 +319,7 @@ def build_registry(root: Path, output_path: Path) -> Path:
             "corpus_path": str(corpus_path),
             "corpus_id": result.corpus_id,
             "assembled_dataset_id": result.assembled_dataset_id,
-            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "manifest_sha256": _sha(manifest_bytes),
             "verification_status": "authenticated",
             "authentication_status": "authenticated",
         }
