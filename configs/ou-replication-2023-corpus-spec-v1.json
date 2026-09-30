@@ -1,0 +1,13 @@
+{
+  "authorized_instruments": ["AUDUSD", "EURUSD", "GBPUSD"],
+  "corpus_schema_version": "ou-replication-2023-corpus-v1",
+  "native_timeframe": "M1",
+  "price_basis": "BID",
+  "provider": "Dukascopy",
+  "purpose": ["frozen Stage4B OU London family replication", "OU-LONGUSD-TRADABLE London family replication"],
+  "registry_schema_version": "ou-replication-2023-registry-v1",
+  "requested_end_date": "2023-12-31",
+  "requested_start_date": "2023-01-01",
+  "source_timezone": "UTC",
+  "spec_version": "ou-replication-2023-corpus-spec-v1"
+}
