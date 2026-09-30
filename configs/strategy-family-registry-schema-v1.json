@@ -53,7 +53,11 @@
           "PARK",
           "INDEPENDENT_REPLICATION_PENDING",
           "LOCAL_ARTIFACT_AUDIT_PENDING",
-          "NOT_ASSESSED"
+          "NOT_ASSESSED",
+          "LOCAL_ARTIFACT_VERIFIED",
+          "PARTIAL_LOCAL_ARTIFACT_VERIFICATION",
+          "LOCAL_DERIVED_AUDIT_PENDING",
+          "BLOCKED_MISSING_AUTHENTICATED_COST_PROFILE"
         ]
       }
     },
@@ -150,7 +154,7 @@
         "net_status",
         "cost_robustness",
         "evidence_source",
-        "evidence_artifact_sha256",
+        "evidence_artifacts",
         "evidence_verification_status",
         "replication_status",
         "notes"
@@ -195,13 +199,6 @@
           "type": "string",
           "minLength": 1
         },
-        "evidence_artifact_sha256": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "pattern": "^[0-9a-f]{64}$"
-        },
         "evidence_verification_status": {
           "type": "string"
         },
@@ -213,6 +210,35 @@
         },
         "metrics": {
           "type": "object"
+        },
+        "evidence_artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "sha256",
+              "supports"
+            ],
+            "properties": {
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "supports": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
         }
       }
     }

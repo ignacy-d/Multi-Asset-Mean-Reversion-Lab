@@ -44,3 +44,24 @@ including negative findings. Supply an artifact SHA-256 only after verifying the
 exact evidence artifact; then update the evidence verification status without
 rewriting the historical methodology. Changes to the status vocabulary require
 an explicit schema and test update.
+
+## Completed local artifact audit
+
+Evidence is now represented as an `evidence_artifacts` array because an
+instrument can depend on a study summary, net overlay, and robustness artifact.
+Each entry records its path when supplied, SHA-256, and the exact evidence it
+supports. A `null` path means the hash is known but its local path was not
+supplied; it is not a fabricated location.
+
+The Stage4B comparison locally verifies EURUSD and AUDUSD gross and net values.
+It verifies only gross evidence for EURGBP because that replay was
+`BLOCKED_MISSING_AUTHENTICATED_COST_PROFILE`; EURGBP net evidence remains
+`NOT_ASSESSED` and is not borrowed from the Tradable execution family. The
+later GBPUSD cost-artifact identity remains unresolved even though the retained
+32-cell robustness counts are known.
+
+Independent 2023 replication is pending for exactly AUDUSD, EURUSD, and GBPUSD
+in each of the two London families. Failed London instruments and every parked
+New York instrument are excluded from that replication set. The New York
+summary hash does not by itself authenticate the locally derived per-instrument
+net decomposition, which remains pending a persisted artifact.

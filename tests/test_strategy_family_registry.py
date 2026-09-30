@@ -17,7 +17,7 @@ REQUIRED_INSTRUMENT_FIELDS = {
     "net_status",
     "cost_robustness",
     "evidence_source",
-    "evidence_artifact_sha256",
+    "evidence_artifacts",
     "evidence_verification_status",
     "replication_status",
     "notes",
@@ -52,8 +52,11 @@ def test_registry_schema_contract_and_instrument_integrity() -> None:
             assert row["session"] == family["session"]
             assert row["alpha_methodology_id"] == family["alpha_methodology_id"]
             assert row["execution_methodology_id"] == family["execution_methodology_id"]
-            digest = row["evidence_artifact_sha256"]
-            assert digest is None or re.fullmatch(r"[0-9a-f]{64}", digest)
+            for artifact in row["evidence_artifacts"]:
+                assert artifact.keys() == {"path", "sha256", "supports"}
+                assert artifact["path"] is None or artifact["path"]
+                assert re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"])
+                assert artifact["supports"]
 
 
 def test_family_ids_are_unique_and_required_history_is_preserved() -> None:
@@ -85,6 +88,16 @@ def test_status_values_are_allowed() -> None:
             assert status is None or status in allowed
 
 
+def test_failed_after_costs_is_never_a_gross_status() -> None:
+    registry = load_registry()
+
+    assert all(
+        row["gross_status"] != "FAILED_AFTER_COSTS"
+        for family in registry["families"]
+        for row in family["instruments"]
+    )
+
+
 def test_new_family_cannot_silently_replace_existing_family() -> None:
     registry = load_registry()
 
@@ -100,16 +113,41 @@ def test_new_family_cannot_silently_replace_existing_family() -> None:
     assert len(execution_ids) == len(registry["families"])
 
 
-def test_london_candidates_target_independent_2023_replication() -> None:
+def test_exact_candidates_target_independent_2023_replication() -> None:
     registry = load_registry()
     assert registry["governance"]["next_intended_validation_dataset"] == (
         "Independent 2023 replication for London candidates"
     )
-    london = [
-        family for family in registry["families"] if family["session"] == "LONDON"
-    ]
-    assert all(
-        row["replication_status"] == "INDEPENDENT_REPLICATION_PENDING"
-        for family in london
+    actual = {
+        (family["family_id"], row["instrument"])
+        for family in registry["families"]
         for row in family["instruments"]
+        if row["replication_status"] == "INDEPENDENT_REPLICATION_PENDING"
+    }
+    expected = {
+        (family_id, instrument)
+        for family_id in {
+            "FROZEN_STAGE4B_OU_LONDON",
+            "OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+        }
+        for instrument in {"AUDUSD", "EURUSD", "GBPUSD"}
+    }
+    assert actual == expected
+
+
+def test_audited_stage4b_evidence_and_gross_only_eurgbp() -> None:
+    registry = load_registry()
+    family = next(
+        item
+        for item in registry["families"]
+        if item["family_id"] == "FROZEN_STAGE4B_OU_LONDON"
     )
+    rows = {row["instrument"]: row for row in family["instruments"]}
+
+    assert rows["EURUSD"]["evidence_verification_status"] == "LOCAL_ARTIFACT_VERIFIED"
+    assert rows["AUDUSD"]["evidence_verification_status"] == "LOCAL_ARTIFACT_VERIFIED"
+    assert rows["EURGBP"]["net_status"] == "NOT_ASSESSED"
+    assert rows["EURGBP"]["cost_robustness"]["status"] == (
+        "BLOCKED_MISSING_AUTHENTICATED_COST_PROFILE"
+    )
+    assert "net_mean_pips" not in rows["EURGBP"]["metrics"]
