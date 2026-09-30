@@ -1,0 +1,180 @@
+{
+  "registry_id": "OU-LONGUSD-2024-CANDIDATE-REGISTRY-v2",
+  "scientific_status": "2024_POST_COST_CANDIDATES_NOT_CONFIRMATION",
+  "purpose": "Register distinct candidates for independent 2023 replication without selecting a universal final core.",
+  "governance_only": true,
+  "empirical_outputs_created": [],
+  "families": {
+    "FROZEN_STAGE4B_OU_LONDON": {
+      "role": "INDEPENDENT_REPLICATION_CANDIDATE_FAMILY",
+      "methodology": {
+        "session": "london",
+        "timeframe": "15m",
+        "benchmark_families": ["vwap", "vwap-canonical-m1"],
+        "lookbacks": [20, 40],
+        "signal_definition_count": 4,
+        "ou_transition_window": 128,
+        "directional_score": {"operator": ">", "value": 1.5},
+        "half_life_minutes": {"operator": "<=", "value": 120},
+        "execution_grid": {
+          "entry": "immediate",
+          "take_profit_d0_fractions": [0.75, 1.0],
+          "stop_loss_d0_fractions": [0.25, 0.5],
+          "time_stop_minutes": [60, 120],
+          "exit_policy_count": 8,
+          "total_cells": 32
+        }
+      },
+      "replacement_policy": "MUST_NOT_BE_REPLACED_BY_OU_LONGUSD_TRADABLE_LONDON_2024_V1",
+      "authenticated_historical_comparison": {
+        "artifact": "results/replay-mr-ou-costs-9pair/output/comparison.json",
+        "sha256": "e6159a9c7c2579a322c2ce6b2145a7cb27c0d608768c19126e971a6c10cc9534",
+        "artifact_cost_status": "BLOCKED_MISSING_AUTHENTICATED_COST_PROFILE",
+        "evidence": {
+          "EURUSD": {
+            "n": 1744,
+            "gross_mean_pips": 2.5050991279178576,
+            "gross_profit_factor": 1.912617583725004,
+            "net_mean_pips": 1.9027037769178576,
+            "net_profit_factor": 1.6192167733226863,
+            "status": "STRONG_CANDIDATE"
+          },
+          "AUDUSD": {
+            "n": 1928,
+            "gross_mean_pips": 1.0386241225879727,
+            "gross_profit_factor": 1.3841994889575748,
+            "net_mean_pips": 0.2079646295879726,
+            "net_profit_factor": 1.0648334364069283,
+            "status": "BORDERLINE_OR_WEAKER_CANDIDATE"
+          },
+          "GBPUSD": {
+            "n": 1704,
+            "gross_mean_pips": 2.891443054563074,
+            "gross_profit_factor": 1.8046990416472857,
+            "net_mean_pips": null,
+            "net_profit_factor": null,
+            "net_evidence_status": "UNAVAILABLE_IN_NINE_PAIR_COMPARISON",
+            "later_authenticated_ftmo_cost_evidence": {
+              "status": "LOCAL_COST_ARTIFACT_REFERENCE_PENDING_HASH",
+              "p90_spread_plus_0_25_pip_slippage": "32/32_FROZEN_CELLS_NET_POSITIVE",
+              "p95_spread_plus_0_5_pip_slippage": "30/32_FROZEN_CELLS_NET_POSITIVE"
+            },
+            "status": "STRONG_CANDIDATE"
+          },
+          "EURGBP": {
+            "n": 1752,
+            "gross_mean_pips": 1.0147090047974772,
+            "gross_profit_factor": 1.6472815356652868,
+            "net_mean_pips": null,
+            "net_profit_factor": null,
+            "net_evidence_status": "UNAVAILABLE_IN_OLD_REPLAY",
+            "later_tradable_cost_evidence": "POOR_ECONOMIC_PERFORMANCE",
+            "replication_set_status": "HISTORICAL_EVIDENCE_ONLY_NOT_PROMOTED"
+          }
+        }
+      }
+    },
+    "OU_LONGUSD_TRADABLE_LONDON_2024_V1": {
+      "role": "INDEPENDENT_REPLICATION_CANDIDATE_FAMILY",
+      "parent_study_id": "OU-LONGUSD-TRADABLE-2024-v1",
+      "methodology": {
+        "signal": {
+          "timeframe": "15m",
+          "session": "london",
+          "benchmark_families": ["vwap", "vwap-canonical-m1"],
+          "lookbacks": [20, 40],
+          "union_key": ["instrument", "exact_timestamp", "required_direction"],
+          "ensemble_e0": "deterministic_median",
+          "vote_count_use": "diagnostic_only"
+        },
+        "ou": {
+          "transition_window": 128,
+          "directional_score": {"operator": ">", "value": 1.5},
+          "half_life_minutes": {"operator": "<=", "value": 120}
+        },
+        "execution": {
+          "entry": "exact_signal_timestamp_m1_open",
+          "no_forward_substitution": true,
+          "take_profit_fractions": [0.5, 0.75, 1.0],
+          "equal_tranche_weights": [0.3333333333333333, 0.3333333333333333, 0.3333333333333333],
+          "shared_stop_fraction": 0.5,
+          "same_minute_ambiguity": "adverse_first",
+          "dynamic_exit_rules": false
+        },
+        "lifecycle": {
+          "safe_london_end": "configured_session_end_minus_15_minutes",
+          "primary": "min(180_minutes,safe_london_end-entry)",
+          "robustness": "min(180_minutes,floor_two_thirds_safe_remaining)"
+        }
+      },
+      "authenticated_post_cost_evidence": {
+        "AUDUSD": {
+          "n": 57,
+          "gross_mean_pips": 2.476228,
+          "net_mean_pips": 1.587568,
+          "net_mean_r": 0.115445,
+          "net_profit_factor": 1.243402,
+          "cost_scenario_survival": "16/16",
+          "status": "STRONG_CANDIDATE"
+        },
+        "EURUSD": {
+          "n": 63,
+          "gross_mean_pips": 1.708389,
+          "net_mean_pips": 1.061738,
+          "net_mean_r": 0.088364,
+          "net_profit_factor": 1.185056,
+          "individual_cost_scenario_survival": "14/16",
+          "status": "POSITIVE_CANDIDATE"
+        },
+        "GBPUSD": {
+          "n": 53,
+          "gross_mean_pips": 3.576473,
+          "net_mean_pips": 2.532102,
+          "net_mean_r": 0.111953,
+          "net_profit_factor": 1.231721,
+          "cost_scenario_survival": "16/16",
+          "status": "STRONG_CANDIDATE"
+        }
+      },
+      "strict2_diagnostic": {
+        "label": "STRICT2_DIAGNOSTIC",
+        "instruments": ["AUDUSD", "GBPUSD"],
+        "interpretation": "DIAGNOSTIC_SUBSET_NOT_AUTHORITATIVE_FINAL_STRATEGY_SELECTION"
+      }
+    },
+    "OU_LONGUSD_TRADABLE_NEW_YORK_2024_V1": {
+      "role": "PARK_AFTER_COSTS",
+      "aggregate": {
+        "n": 380,
+        "gross_mean_pips": 0.5692691392410932,
+        "gross_mean_r": 0.03554320218194217,
+        "gross_profit_factor": 1.0735964691002262,
+        "mean_spread_zero_slippage_mean_net_pips": -0.5145061463643333
+      },
+      "individual_cost_scenario_survival": {
+        "AUDUSD": "0/16",
+        "EURUSD": "0/16",
+        "GBPUSD": "0/16",
+        "NZDUSD": "0/16",
+        "USDCAD": "0/16",
+        "USDCHF": "0/16",
+        "USDJPY": "0/16",
+        "EURGBP": "0/16"
+      },
+      "further_2024_tuning_authorized": false
+    }
+  },
+  "independent_replication": {
+    "dataset": 2023,
+    "status": "INDEPENDENT_REPLICATION",
+    "instruments": ["AUDUSD", "EURUSD", "GBPUSD"],
+    "families": [
+      "FROZEN_STAGE4B_OU_LONDON",
+      "OU_LONGUSD_TRADABLE_LONDON_2024_V1"
+    ],
+    "choose_family_before_replication": false,
+    "optimization_authorized": false,
+    "new_parameter_selection_authorized": false,
+    "corpus_and_registry": "SEPARATELY_AUTHENTICATED_HISTORICAL_PRICE_CORPUS_AND_REGISTRY_REQUIRED"
+  }
+}
